@@ -52,7 +52,9 @@ TapStep::TapStep(int sampleRate, IPipelineStep* tapStep)
     , sampleRate_(sampleRate)
     , endingTapThread_(false)
     , tapThreadInput_(sampleRate * 0.25f)
-    , consecutiveDrops_(0)
+    , unreportedDroppedSamples_(0)
+    , unreportedDrops_(0)
+    , dropping_(false)
     , samplesDropped_(0)
 {
     tapThread_ = std::thread([&]() {
@@ -79,12 +81,14 @@ TapStep::TapStep(int sampleRate, IPipelineStep* tapStep)
         while (!endingTapThread_)
         {
             processBufferedBlocks();
+            reportDrops_();
             sem_.wait();
         }
 
         // Hand over whatever arrived before we were told to stop, so that
         // e.g. a recording doesn't lose its last moments.
         processBufferedBlocks();
+        reportDrops_();
 
         delete[] fifoInput;
     });
@@ -96,9 +100,34 @@ TapStep::~TapStep()
     sem_.signal();
     tapThread_.join();
 
-    if (consecutiveDrops_ > 0)
+    if (dropping_)
     {
-        log_warn("Tap FIFO was still full when stopped; tap is missing %d samples", samplesDropped_);
+        log_warn("Tap was still dropping samples when stopped; tap is missing %d samples", samplesDropped_);
+    }
+}
+
+// Says when samples start being dropped and (with how many were lost) when
+// that stops. Called by the tap thread each time it's caught up with what
+// was written, i.e. once per call to execute() that woke it.
+void TapStep::reportDrops_()
+{
+    int drops = unreportedDrops_.exchange(0, std::memory_order_acq_rel);
+    int samples = unreportedDroppedSamples_.exchange(0, std::memory_order_acq_rel);
+
+    if (drops > 0)
+    {
+        if (!dropping_)
+        {
+            log_warn("Tap FIFO full, dropping samples (%d so far)", samples);
+            dropping_ = true;
+        }
+        samplesDropped_ += samples;
+    }
+    else if (dropping_)
+    {
+        log_warn("Tap FIFO drops ended; tap is missing %d samples", samplesDropped_);
+        dropping_ = false;
+        samplesDropped_ = 0;
     }
 }
 
@@ -140,27 +169,15 @@ short* TapStep::execute(short* inputSamples, int numInputSamples, int* numOutput
 
     // write() is all-or-nothing, so a full FIFO means the tapped step never sees those
     // samples. We can't wait for the tap thread to catch up (this is the audio path), but
-    // whatever the tap produces (e.g. a recording) is now missing audio, so say so rather
-    // than dropping it quietly. The tap thread is exactly what gets starved first when the
-    // machine is loaded.
+    // whatever the tap produces (e.g. a recording) is now missing audio, so it gets said
+    // rather than dropped quietly. Not from here, though: logging isn't real-time safe
+    // (its first use on a thread allocates memory, for one). The tap thread reports what's
+    // counted here when it next runs; being what gets starved first when the machine is
+    // loaded, that may be a little while.
     if (samplesDropped > 0)
     {
-        if (consecutiveDrops_ == 0)
-        {
-            FREEDV_BEGIN_VERIFIED_SAFE
-            log_warn("Tap FIFO full, dropping %d samples (free=%d)", samplesDropped, tapThreadInput_.numFree());
-            FREEDV_END_VERIFIED_SAFE
-        }
-        consecutiveDrops_++;
-        samplesDropped_ += samplesDropped;
-    }
-    else if (consecutiveDrops_ > 0)
-    {
-        FREEDV_BEGIN_VERIFIED_SAFE
-        log_warn("Tap FIFO drops ended after %d call(s); tap is missing %d samples", consecutiveDrops_, samplesDropped_);
-        FREEDV_END_VERIFIED_SAFE
-        consecutiveDrops_ = 0;
-        samplesDropped_ = 0;
+        unreportedDroppedSamples_.fetch_add(samplesDropped, std::memory_order_acq_rel);
+        unreportedDrops_.fetch_add(1, std::memory_order_acq_rel);
     }
  
     return inputSamples;
