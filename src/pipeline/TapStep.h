@@ -60,6 +60,10 @@ private:
     std::atomic<bool> endingTapThread_;
     GenericFIFO<short> tapThreadInput_;
     Semaphore sem_;
+
+    // For reporting samples that didn't fit in tapThreadInput_. Only touched by execute().
+    int consecutiveDrops_;
+    int samplesDropped_;
 };
 
 #endif // AUDIO_PIPELINE__TAP_STEP_H
