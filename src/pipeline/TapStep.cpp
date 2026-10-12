@@ -67,16 +67,24 @@ TapStep::TapStep(int sampleRate, IPipelineStep* tapStep)
         pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
 #endif // defined(__APPLE__)
 
-        while (!endingTapThread_)
-        {
+        auto processBufferedBlocks = [&]() {
             while (tapThreadInput_.numUsed() >= SAMPLE_RATE_AT_10MS)
             {
                 int temp = 0;
                 tapThreadInput_.read(fifoInput, SAMPLE_RATE_AT_10MS);
                 tapStep_->execute(fifoInput, SAMPLE_RATE_AT_10MS, &temp);
             }
+        };
+
+        while (!endingTapThread_)
+        {
+            processBufferedBlocks();
             sem_.wait();
         }
+
+        // Hand over whatever arrived before we were told to stop, so that
+        // e.g. a recording doesn't lose its last moments.
+        processBufferedBlocks();
 
         delete[] fifoInput;
     });
@@ -120,10 +128,14 @@ short* TapStep::execute(short* inputSamples, int numInputSamples, int* numOutput
         }
         tmpInputSamples += samplesToRead;
         numInputSamples -= samplesToRead;
-        if (tapThreadInput_.numUsed() > (100 * sampleRate_ / 1000))
-        {
-            sem_.signal();
-        }
+    }
+
+    // Wake the tap thread as soon as there's a block for it to process. The
+    // longer it's left asleep, the less room there is for what arrives before
+    // it actually gets to run.
+    if (tapThreadInput_.numUsed() >= sampleRate_ / 100)
+    {
+        sem_.signal();
     }
 
     // write() is all-or-nothing, so a full FIFO means the tapped step never sees those
