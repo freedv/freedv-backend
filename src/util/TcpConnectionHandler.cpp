@@ -628,7 +628,11 @@ next_fd:
                 {
                     // Set hostname for SSL negotiation
                     SSL_set_tlsext_host_name(ssl_.load(std::memory_order_relaxed), host_.c_str());
+#if defined(OPENSSL_USE_VER_4_DEPRECATED_FNS)
+                    if (!SSL_set1_dnsname(ssl_.load(std::memory_order_relaxed), host_.c_str())) 
+#else
                     if (!SSL_set1_host(ssl_.load(std::memory_order_relaxed), host_.c_str())) 
+#endif // defined(OPENSSL_USE_VER_4_DEPRECATED_FNS)
                     {
                         auto errStr = GetSSLError_();
                         log_warn("Unable to assign hostname for certificate validation: %s", errStr.c_str());
