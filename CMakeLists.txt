@@ -69,6 +69,15 @@ if(NOT DISABLE_TLS_SUPPORT)
             if (OPENSSL_USABLE)
                 message(STATUS "Using OpenSSL for TLS support.")
                 include_directories(${OPENSSL_INCLUDE_DIR})
+
+		# OpenSSL deprecates certain symbols after 4.0, but the suggested
+		# replacements don't exist in LibreSSL. This ensures we use the old
+		# calls in that case.
+		string(REPLACE "." ";" OpenSSL_VERSION_COMPONENTS ${OpenSSL_VERSION})
+		list(GET OpenSSL_VERSION_COMPONENTS 0 VERSION_MAJOR)
+		if (VERSION_MAJOR GREATER 3)
+                    add_definitions(-DOPENSSL_USE_VER_4_DEPRECATED_FNS)
+                endif()
             else()
                 message(STATUS "OpenSSL is not usable, ignoring found library")
                 set(OpenSSL_FOUND 0)
