@@ -60,6 +60,18 @@ private:
     std::atomic<bool> endingTapThread_;
     GenericFIFO<short> tapThreadInput_;
     Semaphore sem_;
+
+    // For reporting samples that didn't fit in tapThreadInput_. execute() only
+    // counts them, as it's on the audio path and logging isn't real-time safe;
+    // the tap thread does the reporting.
+    std::atomic<int> unreportedDroppedSamples_;
+    std::atomic<int> unreportedDrops_;
+
+    // Only touched by the tap thread (and the destructor, once it's finished).
+    bool dropping_;
+    int samplesDropped_;
+
+    void reportDrops_();
 };
 
 #endif // AUDIO_PIPELINE__TAP_STEP_H

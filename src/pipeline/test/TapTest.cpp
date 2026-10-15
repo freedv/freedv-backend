@@ -1,8 +1,8 @@
 // Tests for TapStep: the audio passes through untouched, the tapped step
 // receives the same audio (in order) on TapStep's own thread, a tapped step
 // that falls behind loses whole 10 ms blocks rather than stalling the caller
-// (it runs on the real-time audio path), and destruction joins the thread and
-// frees the tapped step.
+// (it runs on the real-time audio path), and destruction hands over what's
+// still buffered, joins the thread and frees the tapped step.
 
 #include <atomic>
 #include <chrono>
@@ -27,14 +27,21 @@ constexpr int BLOCK = SAMPLE_RATE / 100; // TapStep hands the tap 10 ms at a tim
 class RecordingStep : public IPipelineStep
 {
 public:
-    RecordingStep(std::chrono::milliseconds delayPerCall = 0ms, std::atomic<bool>* destroyed = nullptr)
+    RecordingStep(
+        std::chrono::milliseconds delayPerCall = 0ms, std::atomic<bool>* destroyed = nullptr,
+        std::vector<short>* samplesAtDestruction = nullptr)
         : delayPerCall_(delayPerCall)
         , destroyed_(destroyed)
+        , samplesAtDestruction_(samplesAtDestruction)
     {
     }
 
     virtual ~RecordingStep()
     {
+        if (samplesAtDestruction_ != nullptr)
+        {
+            *samplesAtDestruction_ = samples_;
+        }
         if (destroyed_ != nullptr)
         {
             *destroyed_ = true;
@@ -79,6 +86,7 @@ public:
 private:
     std::chrono::milliseconds delayPerCall_;
     std::atomic<bool>* destroyed_;
+    std::vector<short>* samplesAtDestruction_;
     std::mutex mutex_;
     std::condition_variable cv_;
     std::vector<short> samples_;
@@ -140,11 +148,10 @@ bool tapReceivesAudioInOrder()
         std::this_thread::sleep_for(2ms);
     }
 
-    // The tap thread is only woken once more than 100 ms is buffered, so the
-    // last <= 100 ms (plus a partial block) may still be waiting.
-    const size_t expectAtLeast = SAMPLE_RATE - SAMPLE_RATE / 10 - BLOCK;
+    // The tap thread is woken for every whole block, so all of it arrives.
+    const size_t expectAtLeast = SAMPLE_RATE;
     auto got = recorder->waitForSamples(expectAtLeast, 5s);
-    if (got.size() < expectAtLeast)
+    if (got.size() != expectAtLeast)
     {
         std::cerr << "[tap got only " << got.size() << " of " << SAMPLE_RATE << " samples]...";
         return false;
@@ -226,6 +233,60 @@ bool slowTapDropsWholeBlocksWithoutBlocking()
     return true;
 }
 
+// Feeds `count` samples to a TapStep in one go and destroys it straight away.
+// Returns what the tap had been given by the time it was itself destroyed.
+std::vector<short> tapOutputForBurst(int count, std::chrono::milliseconds delayPerCall = 0ms)
+{
+    std::vector<short> got;
+    {
+        TapStep tapStep(SAMPLE_RATE, new RecordingStep(delayPerCall, nullptr, &got));
+        auto input = makeRamp(count);
+        int outputSamples = 0;
+        tapStep.execute(input.data(), input.size(), &outputSamples);
+    }
+    return got;
+}
+
+bool isRampOfLength(std::vector<short> const& got, int expected)
+{
+    if (got.size() != (size_t)expected)
+    {
+        std::cerr << "[tap got " << got.size() << " samples, expected " << expected << "]...";
+        return false;
+    }
+    for (size_t i = 0; i < got.size(); i++)
+    {
+        if (got[i] != (short)i)
+        {
+            std::cerr << "[tap sample " << i << " is " << got[i] << "]...";
+            return false;
+        }
+    }
+    return true;
+}
+
+bool burstThatFitsInBufferIsNotLost()
+{
+    // Audio doesn't always arrive at a steady pace (e.g. after the caller has
+    // itself been held up). Whatever fits in TapStep's 250 ms buffer must
+    // reach the tap however late the tap thread gets to run -- here, possibly
+    // not until TapStep is destroyed -- even if the tap is slow.
+    const int burst = 24 * BLOCK; // 240 ms
+    return
+        isRampOfLength(tapOutputForBurst(burst), burst) &&
+        isRampOfLength(tapOutputForBurst(burst, 2ms), burst);
+}
+
+bool destructionHandsOverWholeBlocksOnly()
+{
+    // The tap is only ever given whole 10 ms blocks, so a partial block left
+    // over at destruction isn't handed over.
+    return
+        isRampOfLength(tapOutputForBurst(BLOCK), BLOCK) &&
+        isRampOfLength(tapOutputForBurst(3 * BLOCK + BLOCK / 2), 3 * BLOCK) &&
+        isRampOfLength(tapOutputForBurst(BLOCK / 2), 0);
+}
+
 bool destructionJoinsAndFreesTap()
 {
     // Destroying a TapStep with audio still buffered (and its thread possibly
@@ -252,6 +313,8 @@ int main()
     TEST_CASE(passThroughUnchanged);
     TEST_CASE(tapReceivesAudioInOrder);
     TEST_CASE(slowTapDropsWholeBlocksWithoutBlocking);
+    TEST_CASE(burstThatFitsInBufferIsNotLost);
+    TEST_CASE(destructionHandsOverWholeBlocksOnly);
     TEST_CASE(destructionJoinsAndFreesTap);
     return 0;
 }

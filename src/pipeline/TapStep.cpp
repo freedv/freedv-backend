@@ -43,6 +43,7 @@
 #endif // defined(__APPLE__)
 
 #include "../os/os_interface.h"
+#include "../util/logging/ulog.h"
 
 using namespace std::chrono_literals;
 
@@ -51,6 +52,10 @@ TapStep::TapStep(int sampleRate, IPipelineStep* tapStep)
     , sampleRate_(sampleRate)
     , endingTapThread_(false)
     , tapThreadInput_(sampleRate * 0.25f)
+    , unreportedDroppedSamples_(0)
+    , unreportedDrops_(0)
+    , dropping_(false)
+    , samplesDropped_(0)
 {
     tapThread_ = std::thread([&]() {
         const int SAMPLE_RATE_AT_10MS = sampleRate_ / 100;
@@ -64,16 +69,26 @@ TapStep::TapStep(int sampleRate, IPipelineStep* tapStep)
         pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
 #endif // defined(__APPLE__)
 
-        while (!endingTapThread_)
-        {
+        auto processBufferedBlocks = [&]() {
             while (tapThreadInput_.numUsed() >= SAMPLE_RATE_AT_10MS)
             {
                 int temp = 0;
                 tapThreadInput_.read(fifoInput, SAMPLE_RATE_AT_10MS);
                 tapStep_->execute(fifoInput, SAMPLE_RATE_AT_10MS, &temp);
             }
+        };
+
+        while (!endingTapThread_)
+        {
+            processBufferedBlocks();
+            reportDrops_();
             sem_.wait();
         }
+
+        // Hand over whatever arrived before we were told to stop, so that
+        // e.g. a recording doesn't lose its last moments.
+        processBufferedBlocks();
+        reportDrops_();
 
         delete[] fifoInput;
     });
@@ -84,6 +99,36 @@ TapStep::~TapStep()
     endingTapThread_ = true;
     sem_.signal();
     tapThread_.join();
+
+    if (dropping_)
+    {
+        log_warn("Tap was still dropping samples when stopped; tap is missing %d samples", samplesDropped_);
+    }
+}
+
+// Says when samples start being dropped and (with how many were lost) when
+// that stops. Called by the tap thread each time it's caught up with what
+// was written, i.e. once per call to execute() that woke it.
+void TapStep::reportDrops_()
+{
+    int drops = unreportedDrops_.exchange(0, std::memory_order_acq_rel);
+    int samples = unreportedDroppedSamples_.exchange(0, std::memory_order_acq_rel);
+
+    if (drops > 0)
+    {
+        if (!dropping_)
+        {
+            log_warn("Tap FIFO full, dropping samples (%d so far)", samples);
+            dropping_ = true;
+        }
+        samplesDropped_ += samples;
+    }
+    else if (dropping_)
+    {
+        log_warn("Tap FIFO drops ended; tap is missing %d samples", samplesDropped_);
+        dropping_ = false;
+        samplesDropped_ = 0;
+    }
 }
 
 int TapStep::getInputSampleRate() const FREEDV_NONBLOCKING
@@ -102,16 +147,37 @@ short* TapStep::execute(short* inputSamples, int numInputSamples, int* numOutput
 
     *numOutputSamples = numInputSamples;
     short* tmpInputSamples = inputSamples;
+    int samplesDropped = 0;
     while (numInputSamples > 0)
     {
         int samplesToRead = std::min(sampleRate_ / 100, numInputSamples);
-        tapThreadInput_.write(tmpInputSamples, samplesToRead);
+        if (tapThreadInput_.write(tmpInputSamples, samplesToRead) != 0)
+        {
+            samplesDropped += samplesToRead;
+        }
         tmpInputSamples += samplesToRead;
         numInputSamples -= samplesToRead;
-        if (tapThreadInput_.numUsed() > (100 * sampleRate_ / 1000))
-        {
-            sem_.signal();
-        }
+    }
+
+    // Wake the tap thread as soon as there's a block for it to process. The
+    // longer it's left asleep, the less room there is for what arrives before
+    // it actually gets to run.
+    if (tapThreadInput_.numUsed() >= sampleRate_ / 100)
+    {
+        sem_.signal();
+    }
+
+    // write() is all-or-nothing, so a full FIFO means the tapped step never sees those
+    // samples. We can't wait for the tap thread to catch up (this is the audio path), but
+    // whatever the tap produces (e.g. a recording) is now missing audio, so it gets said
+    // rather than dropped quietly. Not from here, though: logging isn't real-time safe
+    // (its first use on a thread allocates memory, for one). The tap thread reports what's
+    // counted here when it next runs; being what gets starved first when the machine is
+    // loaded, that may be a little while.
+    if (samplesDropped > 0)
+    {
+        unreportedDroppedSamples_.fetch_add(samplesDropped, std::memory_order_acq_rel);
+        unreportedDrops_.fetch_add(1, std::memory_order_acq_rel);
     }
  
     return inputSamples;
