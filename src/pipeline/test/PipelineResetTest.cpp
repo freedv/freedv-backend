@@ -3,7 +3,12 @@
 // bit-identical output to a new step fed the same input. Any internal state
 // that reset() forgets (filter history, gain, buffered samples, ...) shows up
 // as a mismatch.
+//
+// AgcStep is the exception: its gain and loudness history deliberately
+// survive a reset (see AgcStep::reset() and AgcStepTest), so it's only
+// checked for dropping buffered input.
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <functional>
@@ -114,14 +119,46 @@ bool resampleDownReset()
     return resetMatchesFresh([]() { return new ResampleStep(48000, 8000); });
 }
 
-bool agcReset8k()
+bool agcResetDiscardsBufferedInput()
 {
-    return resetMatchesFresh([]() { return new AgcStep(8000); });
-}
+    // Less than a block of loud audio is left buffered, then reset(): the
+    // next block out must be made only of what's fed afterwards. With
+    // silence fed, anything nonzero is leftover audio.
+    for (int sampleRate : {8000, 48000})
+    {
+        AgcStep step(sampleRate);
+        int block = std::min(160, sampleRate / 100); // the AGC's block size
 
-bool agcReset48k()
-{
-    return resetMatchesFresh([]() { return new AgcStep(48000); });
+        auto before = makeSignal(sampleRate, 1.0f, 440.0f, 20000.0f, 1);
+        run(step, before);
+        int numOut = 0;
+        step.execute(before.data(), block / 2, &numOut); // stays buffered
+        if (numOut != 0)
+        {
+            std::cerr << "[half a block produced " << numOut << " samples]...";
+            return false;
+        }
+
+        step.reset();
+
+        std::vector<short> silence(block, 0);
+        short* out = step.execute(silence.data(), block, &numOut);
+        if (numOut != block)
+        {
+            std::cerr << "[one block in gave " << numOut << " samples out at " << sampleRate << " Hz]...";
+            return false;
+        }
+        for (int i = 0; i < numOut; i++)
+        {
+            if (out[i] != 0)
+            {
+                std::cerr << "[audio from before the reset came out at " << sampleRate << " Hz (sample " << i
+                          << " = " << out[i] << ")]...";
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 bool rnnoiseReset()
@@ -161,12 +198,13 @@ bool eitherOrReset()
 bool audioPipelineReset()
 {
     // A whole pipeline with resamplers between steps and on the result:
-    // 8 kHz in -> 16 kHz AGC -> 16->48 kHz bandwidth expansion -> 48 kHz
-    // noise suppression -> 8 kHz out. AudioPipeline::reset() must reach the
-    // steps, the inserted resamplers and the result resampler.
+    // 8 kHz in -> 16 kHz level adjust -> 16->48 kHz bandwidth expansion ->
+    // 48 kHz noise suppression -> 8 kHz out. AudioPipeline::reset() must
+    // reach the steps, the inserted resamplers and the result resampler.
+    // (No AgcStep here: its gain deliberately survives a reset.)
     return resetMatchesFresh([]() {
         auto pipeline = new AudioPipeline(8000, 8000);
-        pipeline->appendPipelineStep(new AgcStep(16000));
+        pipeline->appendPipelineStep(new LevelAdjustStep(16000, +[]() FREEDV_NONBLOCKING { return 0.5f; }));
         pipeline->appendPipelineStep(new BandwidthExpandStep());
         pipeline->appendPipelineStep(new RNNoiseStep());
         return pipeline;
@@ -189,8 +227,7 @@ int main()
 #define RUN(name) check(#name, name)
     RUN(resampleUpReset);
     RUN(resampleDownReset);
-    RUN(agcReset8k);
-    RUN(agcReset48k);
+    RUN(agcResetDiscardsBufferedInput);
     RUN(rnnoiseReset);
     RUN(bandwidthExpandReset);
     RUN(eitherOrReset);

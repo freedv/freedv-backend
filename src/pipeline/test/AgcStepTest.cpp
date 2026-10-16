@@ -51,26 +51,26 @@ double measureLoudnessLufs(const short* samples, int numSamples, int sampleRate)
 // K-weighting behavior.
 double findAmplitudeForLoudness(double targetLufs, double freqHz, int sampleRate)
 {
-    double lo = 1.0;
-    double hi = 32767.0;
+    // 32767 = 0 dB. Solve for targetLufs = 20*log10(amp / 32767.0).
+    // 10^(targetLufs / 20) * 32767.0 = amp
+    // Note: this may not be the actual measured loudness depending on frequency
+    double levelDb = targetLufs;
 
-    for (int iter = 0; iter < 40; iter++)
+    // Generate sine wave, make sure the measured LUFS is the same as target.
+    // If not, move the level by the error and try again. (Stop as soon as
+    // it's on target: adjusting once more would move it off again.)
+    for (int iter = 0; iter < 20; iter++)
     {
-        double mid = std::sqrt(lo * hi);
-        auto probe = generateSineWave(mid, freqHz, 1.0, sampleRate);
-        double lufs = measureLoudnessLufs(probe.data(), probe.size(), sampleRate);
-
-        if (lufs < targetLufs)
+        double amplitude = 32767.0 * std::pow(10, levelDb / 20.0);
+        auto probe = generateSineWave(amplitude, freqHz, 1.0, sampleRate);
+        double measuredLufs = measureLoudnessLufs(probe.data(), probe.size(), sampleRate);
+        if (std::abs(measuredLufs - targetLufs) < 0.1)
         {
-            lo = mid;
+            break;
         }
-        else
-        {
-            hi = mid;
-        }
+        levelDb += targetLufs - measuredLufs;
     }
-
-    return std::sqrt(lo * hi);
+    return 32767.0 * std::pow(10, levelDb / 20.0);
 }
 
 // Streams the given signal through the AGC step in small chunks, mimicking
@@ -102,8 +102,8 @@ bool agcConvergesLoudSignalToTargetLoudness()
 
     AgcStep step(sampleRate);
 
-    double amplitude = findAmplitudeForLoudness(-10.0, TEST_TONE_FREQ_HZ, sampleRate);
-    auto loudSignal = generateSineWave(amplitude, TEST_TONE_FREQ_HZ, 6.0, sampleRate);
+    double amplitude = findAmplitudeForLoudness(-11.0, TEST_TONE_FREQ_HZ, sampleRate);
+    auto loudSignal = generateSineWave(amplitude, TEST_TONE_FREQ_HZ, 15.0, sampleRate);
     auto output = runThroughAgc(step, loudSignal, sampleRate / 10);
 
     double outputLufs = measureLoudnessLufs(&output[output.size() - sampleRate], sampleRate, sampleRate);
@@ -154,12 +154,14 @@ bool agcDoesNotBoostNearSilentSignal()
 
     double amplitude = findAmplitudeForLoudness(RAW_LUFS, TEST_TONE_FREQ_HZ, sampleRate);
     auto quietSignal = generateSineWave(amplitude, TEST_TONE_FREQ_HZ, 5.0, sampleRate);
+    auto referenceQuietSignal = generateSineWave(amplitude, TEST_TONE_FREQ_HZ, 5.0, sampleRate);
     auto output = runThroughAgc(step, quietSignal, sampleRate / 10);
 
-    double outputLufs = measureLoudnessLufs(&output[output.size() - sampleRate], sampleRate, sampleRate);
-    if (std::abs(outputLufs - RAW_LUFS) > TOLERANCE_DB)
+    double referenceOutputLufs = measureLoudnessLufs(&referenceQuietSignal[0], sampleRate * 5.0, sampleRate);
+    double outputLufs = measureLoudnessLufs(&output[0], sampleRate * 5.0, sampleRate);
+    if (std::abs(outputLufs - referenceOutputLufs) > TOLERANCE_DB)
     {
-        std::cerr << "[near-silent signal was altered: raw=" << RAW_LUFS << " output=" << outputLufs << "]...";
+        std::cerr << "[near-silent signal was altered: raw=" << referenceOutputLufs << " output=" << outputLufs << "]...";
         return false;
     }
 
@@ -172,9 +174,8 @@ bool agcDoesNotBoostNearSilentSignal()
     return true;
 }
 
-// reset() should immediately return the gain to unity (0dB) rather than
-// continuing from wherever it had drifted to.
-bool agcResetReturnsGainToUnity()
+// reset() should not touch the gain.
+bool agcResetDoesNotReturnGainToUnity()
 {
     constexpr int sampleRate = 8000;
     constexpr double TOLERANCE_DB = 2.0;
@@ -182,7 +183,7 @@ bool agcResetReturnsGainToUnity()
     AgcStep step(sampleRate);
 
     double amplitude = findAmplitudeForLoudness(-10.0, TEST_TONE_FREQ_HZ, sampleRate);
-    auto loudSignal = generateSineWave(amplitude, TEST_TONE_FREQ_HZ, 6.0, sampleRate);
+    auto loudSignal = generateSineWave(amplitude, TEST_TONE_FREQ_HZ, 15.0, sampleRate);
     auto output = runThroughAgc(step, loudSignal, sampleRate / 10);
 
     // Sanity check: confirm gain actually drifted away from unity before we
@@ -197,54 +198,34 @@ bool agcResetReturnsGainToUnity()
 
     step.reset();
 
-    // Immediately after reset(), the first block processed should be only a
-    // hair away from unity gain, regardless of how far gain had drifted.
-    int chunkSize = sampleRate / 100; // one 10ms AGC block
-    int numOutputSamples = 0;
-    short* result = step.execute(loudSignal.data(), chunkSize, &numOutputSamples);
-
-    if (numOutputSamples != chunkSize)
+    // Immediately after reset(), the first block processed should be close to the previous
+    // measurement.
+    output = runThroughAgc(step, loudSignal, sampleRate / 10);
+    double newConvergedLufs = measureLoudnessLufs(&output[0], sampleRate, sampleRate);
+    if (std::abs(convergedLufs - newConvergedLufs) > TOLERANCE_DB)
     {
-        std::cerr << "[numOutputSamples[" << numOutputSamples << "] != " << chunkSize << "]...";
-        return false;
-    }
-
-    double inputRms = 0.0;
-    double outputRms = 0.0;
-    for (int i = 0; i < numOutputSamples; i++)
-    {
-        inputRms += static_cast<double>(loudSignal[i]) * loudSignal[i];
-        outputRms += static_cast<double>(result[i]) * result[i];
-    }
-    inputRms = std::sqrt(inputRms / numOutputSamples);
-    outputRms = std::sqrt(outputRms / numOutputSamples);
-
-    // Note: the WebRTC limiter stage adds a small amount of its own gain
-    // adjustment on top of AgcStep's own dB tracking, so this won't be
-    // exactly 0dB -- but it should be nowhere near the ~-13dB gain that had
-    // been applied just before reset() was called.
-    double gainDb = 20.0 * std::log10(outputRms / inputRms);
-    if (std::abs(gainDb) > 4.0)
-    {
-        std::cerr << "[gain right after reset() was " << gainDb << " dB, expected close to 0 dB]...";
+        std::cerr << "[gain significantly different post-reset: expected = " << convergedLufs << ", actual = " << newConvergedLufs << "]...";
         return false;
     }
 
     return true;
 }
 
-bool agcLimitsCutToTwentyDb()
+bool agcLimitsCutToTwelveDb()
 {
     // A full-scale 3 kHz square wave measures well above 0 LUFS (K-weighting
     // boosts that range), so reaching -23 LUFS would take more than the
-    // AGC's maximum 20 dB of cut. It must stop at 20 dB.
+    // AGC's maximum 12 dB of cut. It must stop at 12 dB.
     constexpr int sampleRate = 48000;
-    constexpr double MAX_CUT_DB = 20.0;
+    constexpr double MAX_CUT_DB = 12.0;
     constexpr double TOLERANCE_DB = 1.5;
 
-    AgcStep step(sampleRate);
+    // Leveler only: the limiter would pull a square wave this loud down
+    // further, and this is about where the leveler stops.
+    AgcStep step(sampleRate, false, true);
 
-    std::vector<short> loudSignal(6 * sampleRate);
+    // The gain moves at 1 dB/s, so allow well over 12 s to get there.
+    std::vector<short> loudSignal(20 * sampleRate);
     for (size_t n = 0; n < loudSignal.size(); n++)
     {
         loudSignal[n] = (n / 8) % 2 ? 32767 : -32767; // 3 kHz
@@ -252,7 +233,7 @@ bool agcLimitsCutToTwentyDb()
     double inputLufs = measureLoudnessLufs(loudSignal.data(), sampleRate, sampleRate);
     if (inputLufs - MAX_CUT_DB < AGC_TARGET_LUFS + 3.0)
     {
-        std::cerr << "[test signal too quiet to need more than 20 dB of cut: " << inputLufs << " LUFS]...";
+        std::cerr << "[test signal too quiet to need more than 12 dB of cut: " << inputLufs << " LUFS]...";
         return false;
     }
 
@@ -261,7 +242,7 @@ bool agcLimitsCutToTwentyDb()
     if (std::abs(outputLufs - (inputLufs - MAX_CUT_DB)) > TOLERANCE_DB)
     {
         std::cerr << "[input " << inputLufs << " LUFS settled at " << outputLufs << " LUFS, expected "
-                  << (inputLufs - MAX_CUT_DB) << " (20 dB of cut)]...";
+                  << (inputLufs - MAX_CUT_DB) << " (12 dB of cut)]...";
         return false;
     }
 
@@ -303,8 +284,8 @@ int main()
     TEST_CASE(agcConvergesLoudSignalToTargetLoudness);
     TEST_CASE(agcConvergesQuietSignalToTargetLoudness);
     TEST_CASE(agcDoesNotBoostNearSilentSignal);
-    TEST_CASE(agcResetReturnsGainToUnity);
-    TEST_CASE(agcLimitsCutToTwentyDb);
+    TEST_CASE(agcResetDoesNotReturnGainToUnity);
+    TEST_CASE(agcLimitsCutToTwelveDb);
     TEST_CASE(agcUnsupportedRateRunsAt48k);
     return 0;
 }

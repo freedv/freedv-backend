@@ -44,7 +44,7 @@
 class AgcStep : public IPipelineStep
 {
 public:
-    AgcStep(int sampleRate);
+    AgcStep(int sampleRate, bool enableLimiter = true, bool enableLeveler = true);
     virtual ~AgcStep();
     
     virtual int getInputSampleRate() const FREEDV_NONBLOCKING override;
@@ -67,6 +67,9 @@ private:
     GenericFIFO<short> inputSampleFifo_;
     std::unique_ptr<short[]> outputSamples_;
     std::unique_ptr<short[]> tmpInput_;
+
+    bool enableLimiter_;
+    bool enableLeveler_;
 };
 
 
