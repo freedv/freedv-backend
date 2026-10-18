@@ -1,6 +1,6 @@
 # freedv-backend
 
-This repository contains a series of static libraries used by other FreeDV repositories (such as [freedv-integrations](https://github.com/tmiw/freedv-integrations)) to support various functions:
+This repository contains a series of static libraries used by other FreeDV repositories (such as [freedv-integrations](https://github.com/freedv/freedv-integrations)) to support various functions:
 
 1. RADE encode and decode.
 2. Audio processing (e.g. resampling, AGC and RNNoise, among other actions).
@@ -9,7 +9,7 @@ This repository contains a series of static libraries used by other FreeDV repos
 This is intended to be used as a Git submodule, i.e.
 
 ```sh
-project/src$ git submodule add https://github.com/tmiw/freedv-backend backend
+project/src$ git submodule add https://github.com/freedv/freedv-backend backend
 ...
 
 # inside src/CMakeLists.txt
