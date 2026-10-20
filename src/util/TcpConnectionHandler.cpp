@@ -27,7 +27,9 @@
 #include <errno.h>
 #include <unistd.h>
 #include <algorithm>
+#include <memory>
 #include <sstream>
+#include <string>
 
 #include "TcpConnectionHandler.h"
 
@@ -90,6 +92,7 @@ TcpConnectionHandler::TcpConnectionHandler()
     }, false)
     , socket_(-1)
     , cancelConnect_(false)
+    , connectionGeneration_(0)
     , receiveBuffer_(RX_BUFFER_SIZE)
 {
 #if defined(WIN32)
@@ -169,13 +172,12 @@ std::future<void> TcpConnectionHandler::send(const char* buf, int length)
     std::shared_ptr<std::promise<void>> prom = std::make_shared<std::promise<void> >();
     auto fut = prom->get_future();
     
-    char* allocBuf = new char[length];
-    assert(allocBuf != nullptr);
-    memcpy(allocBuf, buf, length);
-    
-    enqueue_([&, prom, allocBuf, length]() { // NOLINT
-        sendImpl_(allocBuf, length);
-        delete[] allocBuf;
+    // The task owns the copy, so it's freed even if the task never runs
+    // (enqueue_() drops tasks while waitForAllTasksComplete_() is waiting).
+    auto data = std::make_shared<std::string>(buf, length);
+
+    enqueue_([&, prom, data]() { // NOLINT
+        sendImpl_(data->data(), (int)data->size());
         prom->set_value();
     });
     return fut;
@@ -719,8 +721,21 @@ next_fd:
             }
 
             log_info("connection succeeded to %s", buf);
-            enqueue_(std::bind(&TcpConnectionHandler::onConnect_, this));
-        
+
+            // A disconnect() can already be queued ahead of this (e.g. one
+            // asked for while the connection was being made, too late to
+            // cancel it), and will have closed the connection by the time
+            // this runs. Starting to use a closed connection then would, for
+            // instance, leave SocketIoClient's websocket waiting on a read
+            // that never completes, and so never freed.
+            auto generation = ++connectionGeneration_;
+            enqueue_([this, generation]() {
+                if (generation == connectionGeneration_)
+                {
+                    onConnect_();
+                }
+            });
+
             // Start receive thread
             receiveThread_ = std::thread(std::bind(&TcpConnectionHandler::receiveImpl_, this));
         }
@@ -764,6 +779,9 @@ void TcpConnectionHandler::disconnectImpl_(bool callHandler)
     socket_.store(INVALID_SOCKET, std::memory_order_relaxed);
     if (tmp != INVALID_SOCKET)
     {
+        // Any onConnect_() still queued for this connection is now stale.
+        connectionGeneration_++;
+
 #if defined(ENABLE_TLS_SUPPORT)
         auto tmpSsl = ssl_.load(std::memory_order_relaxed);
         ssl_.store(nullptr, std::memory_order_relaxed);

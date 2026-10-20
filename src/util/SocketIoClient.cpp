@@ -21,6 +21,7 @@
 //=========================================================================
 
 #include <iostream>
+#include <memory>
 #include <sstream>
 
 #include "SocketIoClient.h"
@@ -285,12 +286,13 @@ void SocketIoClient::handleSocketIoMessage_(char* ptr, int)
         }
         case '2':
         {
-            // event received from server
-            yyjson_doc* eventDoc = yyjson_read(ptr + 1, strlen(ptr + 1), 0);
+            // event received from server (owned by the task, so that it's
+            // freed even if the task never runs)
+            std::shared_ptr<yyjson_doc> eventDoc(yyjson_read(ptr + 1, strlen(ptr + 1), 0), yyjson_doc_free);
             if (eventDoc != nullptr)
             {
                 enqueue_([this, eventDoc]() {
-                    yyjson_val* eventRoot = yyjson_doc_get_root(eventDoc);
+                    yyjson_val* eventRoot = yyjson_doc_get_root(eventDoc.get());
                     yyjson_val* eventName = yyjson_arr_get(eventRoot, 0);
                     yyjson_val* eventArgs = yyjson_arr_get(eventRoot, 1);
 
@@ -303,7 +305,6 @@ void SocketIoClient::handleSocketIoMessage_(char* ptr, int)
                             fireEvent(eventNameStr, eventArgs);
                         }
                     }
-                    yyjson_doc_free(eventDoc);
                 });
             }
             break;
