@@ -35,7 +35,7 @@ struct RadeSession
     RadeSession()
     {
         char modelFile[1] = {0};
-        dv = rade_open(modelFile, RADE_USE_C_ENCODER | RADE_USE_C_DECODER);
+        dv = rade_open(modelFile, RADE_USE_C_ENCODER | RADE_USE_C_DECODER | RADE_MODE_V2);
         assert(dv != nullptr);
         encState = lpcnet_encoder_create();
         assert(encState != nullptr);

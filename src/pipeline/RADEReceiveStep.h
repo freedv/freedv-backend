@@ -97,7 +97,6 @@ private:
     RADE_COMP* inputBufCplx_;
     short* inputBuf_;
     float* featuresOut_;
-    float* eooOut_;
     std::unique_ptr<short[]> outputSamples_;
     
     GenericFIFO<float>* utFeatures_;

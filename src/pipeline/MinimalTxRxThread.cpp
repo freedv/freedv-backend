@@ -82,15 +82,23 @@ void MinimalTxRxThread::initializePipeline_()
     
     if (m_tx)
     {
-        txStep_ = new RADETransmitStep(rade_, encState_);
-        auto agcStep = new AgcStep(txStep_->getInputSampleRate());
-        auto rnnoiseStep = new RNNoiseStep();
-        pipeline_->appendPipelineStep(rnnoiseStep);
-        pipeline_->appendPipelineStep(agcStep);
+        txStep_ = new RADETransmitStep(rade_, encState_, radeText_);
+
+        if (!disableProcessing_)
+        {
+            auto agcStep = new AgcStep(txStep_->getInputSampleRate());
+            auto rnnoiseStep = new RNNoiseStep();
+            pipeline_->appendPipelineStep(rnnoiseStep);
+            pipeline_->appendPipelineStep(agcStep);
+        }
+
         pipeline_->appendPipelineStep(txStep_);
         
-        auto levelAdjustStep = new LevelAdjustStep(outputSampleRate_, +[]() FREEDV_NONBLOCKING { return TxScaleFactor_; });
-        pipeline_->appendPipelineStep(levelAdjustStep);
+        if (!disableProcessing_)
+        {
+            auto levelAdjustStep = new LevelAdjustStep(outputSampleRate_, +[]() FREEDV_NONBLOCKING { return TxScaleFactor_; });
+            pipeline_->appendPipelineStep(levelAdjustStep);
+        }
     }
     else
     {
@@ -167,7 +175,7 @@ void* MinimalTxRxThread::Entry()
     
     // Return to normal scheduling
     helper->clearHelperRealTime();
-    
+
     return NULL;
 }
 

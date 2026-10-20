@@ -142,9 +142,6 @@ RADEReceiveStep::RADEReceiveStep(
     featuresOut_ = new float[rade_n_features_in_out(dv_)];
     assert(featuresOut_ != nullptr);
 
-    eooOut_ = new float[rade_n_eoo_bits(dv_)];
-    assert(eooOut_ != nullptr);
-
     pendingFeatures_ = new float[NB_TOTAL_FEATURES];
     assert(pendingFeatures_ != nullptr);
 
@@ -161,7 +158,6 @@ RADEReceiveStep::~RADEReceiveStep()
     delete[] inputBuf_;
     delete[] inputBufCplx_;
     delete[] featuresOut_;
-    delete[] eooOut_;
     delete[] pendingFeatures_;
     outputSamples_ = nullptr;
 
@@ -216,7 +212,7 @@ short* RADEReceiveStep::execute(short* inputSamples, int numInputSamples, int* n
         // demod per frame processing
         for(int i=0; i<nin; i++)
         {
-            inputBufCplx_[i].real = inputBuf_[i] / 32767.0;
+            inputBufCplx_[i].real = inputBuf_[i] * (2.0f / RADE_INT16_SCALE);
             inputBufCplx_[i].imag = 0.0;
         }
 
@@ -228,19 +224,22 @@ short* RADEReceiveStep::execute(short* inputSamples, int numInputSamples, int* n
         int hasEooOut = 0;
 
         FREEDV_BEGIN_VERIFIED_SAFE
-            nout = rade_rx(dv_, featuresOut_, &hasEooOut, eooOut_, rxFdmOffset_);
+            nout = rade_rx(dv_, featuresOut_, &hasEooOut, nullptr, rxFdmOffset_);
         FREEDV_END_VERIFIED_SAFE
 
-        if (hasEooOut && textPtr_ != nullptr)
+        if (nout > 0 && textPtr_ != nullptr)
         {
-            FREEDV_BEGIN_REALTIME_UNSAFE
+            float dataSym = 0.0f;
+            FREEDV_BEGIN_VERIFIED_SAFE
+                dataSym = rade_rx_get_data_symbol(dv_);
 
-            // Handle RX of bits from EOO.
-            rade_text_rx(textPtr_, eooOut_, rade_n_eoo_bits(dv_) / 2);
+                // Feed the streamed data symbol (~25 bits/s) into the text decoder.
+                rade_text_rx_symbol(textPtr_, dataSym);
 
-            FREEDV_END_REALTIME_UNSAFE
+            FREEDV_END_VERIFIED_SAFE
         }
-        else if (!hasEooOut)
+
+        if (!hasEooOut)
         {
             if (featuresFile_)
             {
@@ -285,7 +284,16 @@ short* RADEReceiveStep::execute(short* inputSamples, int numInputSamples, int* n
         sync = rade_sync(dv_);
     FREEDV_END_VERIFIED_SAFE
 
-    syncState_.store(sync, std::memory_order_release);
+    int prevSync = syncState_.exchange(sync, std::memory_order_acq_rel);
+
+    // Position within the text transmitter's cycle is lost along with sync,
+    // so previously received symbols can no longer be combined with new ones.
+    if (prevSync && !sync && textPtr_ != nullptr)
+    {
+        FREEDV_BEGIN_VERIFIED_SAFE
+            rade_text_rx_reset(textPtr_);
+        FREEDV_END_VERIFIED_SAFE
+    }
     
     // In RADEV1, SNR is only valid when in sync. It cannot be assumed
     // that the SNR remains valid when not in sync (for instance, we
