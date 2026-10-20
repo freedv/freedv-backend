@@ -91,6 +91,10 @@ private:
     std::atomic<bool> ipv6Complete_;
     // Cancellation flag polled by connectImpl_(); no payload -> relaxed.
     std::atomic<bool> cancelConnect_;
+    // Changes with every connection made and closed, so that an onConnect_()
+    // queued for a connection that's closed before it runs can tell and not
+    // run. Only used on the worker thread.
+    uint64_t connectionGeneration_;
     GenericFIFO<char> receiveBuffer_;
     OnRecvEndFn onRecvEndFn_;
 #if defined(ENABLE_TLS_SUPPORT)
