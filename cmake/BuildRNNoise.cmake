@@ -37,7 +37,7 @@ endif (CMAKE_CROSSCOMPILING)
 # - The NEON sparse_sgemv8x4() from xiph/rnnoise#234. (This has no effect in the
 #   default build, which compiles out the float weights it would be used with.)
 # Pinned to a commit so builds don't change underneath us.
-set(RNNOISE_REPO https://github.com/tmiw/rnnoise.git)
+set(RNNOISE_REPO https://github.com/freedv/rnnoise.git)
 set(RNNOISE_GIT_TAG 8b12912d0e4a4503ca7d83fd1111f00f7e8298e8)
 
 include(ExternalProject)
