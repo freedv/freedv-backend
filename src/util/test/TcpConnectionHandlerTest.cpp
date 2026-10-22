@@ -37,6 +37,24 @@ public:
         return (int)conn.socket_.load(std::memory_order_relaxed);
     }
 
+    // Queues closing the connection the way the receive thread does when
+    // the peer hangs up: unlike disconnect(), without cancelling a
+    // connection that's still being made.
+    static void queueDrop(TcpConnectionHandler& conn)
+    {
+        conn.enqueue_([&conn]() { conn.disconnectImpl_(); });
+    }
+
+    // Waits for everything queued so far to run. (Not waitForAllTasksComplete_(),
+    // which drops whatever's queued while it waits.)
+    static void waitForQueue(TcpConnectionHandler& conn)
+    {
+        auto done = std::make_shared<std::promise<void>>();
+        auto fut = done->get_future();
+        conn.enqueue_([done]() { done->set_value(); });
+        fut.wait();
+    }
+
 #if defined(ENABLE_TLS_SUPPORT)
     // True if the client's last TLS operation is waiting to write.
     static bool sslWantsWrite(TcpConnectionHandler& conn)
@@ -813,6 +831,31 @@ bool testDisconnectDuringDnsCancelsConnect()
     return report(result);
 }
 
+bool testDroppedBeforeOnConnectRuns()
+{
+    std::cout << "Test 37 (a connection closed before its onConnect_() runs doesn't get one): ";
+
+    LoopbackTcpServer server4;
+    // A moment's DNS lookup, so the connection is still being made when the
+    // drop below is queued, and its onConnect_() is queued after that.
+    ScriptedDnsConnection conn({200ms, {}}, {200ms, {{"127.0.0.1", server4.port()}}});
+
+    bool result = CHECK(server4.valid());
+    auto connectFut = conn.connect(SCRIPTED_HOST, 0, false);
+    TcpConnectionHandlerTest::queueDrop(conn);
+    result &= CHECK(connectFut.wait_for(EVENT_TIMEOUT) == std::future_status::ready);
+    result &= CHECK(server4.accept(ACCEPT_TIMEOUT_MS));
+    TcpConnectionHandlerTest::waitForQueue(conn);
+
+    // The connection was made and then closed, and onConnect_() never ran
+    // for it: SocketIoClient would otherwise start a websocket on the closed
+    // connection that's never freed.
+    result &= CHECK(conn.disconnectCount() == 1);
+    result &= CHECK(conn.connectCount() == 0);
+
+    return report(result);
+}
+
 #if defined(ENABLE_TLS_SUPPORT)
 
 // Runs the server half of a TLS session on the accepted peer socket:
@@ -1461,6 +1504,7 @@ int main(int, char**)
     result &= testUnansweredAddressDoesNotBlockNext();
     result &= testDisconnectDuringDnsCancelsConnect();
     result &= testLateIpv6AfterIpv4Fails();
+    result &= testDroppedBeforeOnConnectRuns();
 
     return result ? 0 : -1;
 }
