@@ -148,4 +148,13 @@ message(STATUS "Enabling unit tests.")
 enable_testing()
 endif(BUILD_BACKEND_UNITTESTS)
 
+# Diagnostic-only CSV logging (AgcStep), written to
+# ~/agc_diag.csv for tuning and evaluation. Off by default since it does
+# blocking file I/O from the real-time audio thread.
+option(ENABLE_AUDIO_DIAG_LOGGING "Enable diagnostic CSV logging in the audio leveler/limiter pipeline step. Not for production builds." OFF)
+if(ENABLE_AUDIO_DIAG_LOGGING)
+message(STATUS "Enabling audio diagnostic CSV logging.")
+add_compile_definitions(FREEDV_ENABLE_AUDIO_DIAG_LOGGING)
+endif(ENABLE_AUDIO_DIAG_LOGGING)
+
 add_subdirectory(src)
