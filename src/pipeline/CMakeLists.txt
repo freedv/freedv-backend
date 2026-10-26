@@ -1,10 +1,10 @@
 add_library(fdv_audio_pipeline STATIC
-    AgcStep.cpp
     AudioPipeline.cpp
     BandwidthExpandStep.cpp
     EitherOrStep.cpp
     IPipelineStep.cpp
     LevelAdjustStep.cpp
+    AgcStep.cpp
     LinkStep.cpp
     MinimalRealTimeHelper.cpp
     MinimalTxRxThread.cpp
@@ -22,7 +22,7 @@ add_library(fdv_audio_pipeline STATIC
 
 add_dependencies(fdv_audio_pipeline rade opus)
 target_compile_options(fdv_audio_pipeline PRIVATE ${WARNINGS_AS_ERRORS_FLAGS})
-target_link_libraries(fdv_audio_pipeline PRIVATE ${LIBEBUR128} agc rnnoise fdv_os_wrapper samplerate fdv_util)
+target_link_libraries(fdv_audio_pipeline PRIVATE ${LIBEBUR128} rnnoise fdv_os_wrapper samplerate fdv_util)
 target_link_libraries(fdv_audio_pipeline INTERFACE rade opus rnnoise)
 target_include_directories(fdv_audio_pipeline PRIVATE ${CODEC2_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMAKE_CURRENT_BINARY_DIR}/..)
 target_include_directories(fdv_audio_pipeline PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
