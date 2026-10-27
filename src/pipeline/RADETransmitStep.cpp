@@ -93,7 +93,6 @@ RADETransmitStep::RADETransmitStep(struct rade* dv, LPCNetEncState* encState)
     if (utTxFeatureFile != "")
     {
         utFeatures_ = new GenericFIFO<float>(FEATURE_FIFO_SIZE);
-        assert(utFeatures_ != nullptr);
 
         featuresFile_ = fopen((const char*)utTxFeatureFile.c_str(), "wb");
         assert(featuresFile_ != nullptr);
@@ -105,26 +104,20 @@ RADETransmitStep::RADETransmitStep(struct rade* dv, LPCNetEncState* encState)
     // Pre-allocate buffers so we don't have to do so during real-time operation.
     auto maxSamples = RADE_MODEM_SAMPLE_RATE;
     outputSamples_ = std::make_unique<short[]>(maxSamples);
-    assert(outputSamples_ != nullptr);
 
     int numOutputSamples = rade_n_tx_out(dv_);
 
     radeOut_ = new RADE_COMP[numOutputSamples];
-    assert(radeOut_ != nullptr);
 
     radeOutShort_ = new short[numOutputSamples];
-    assert(radeOutShort_ != nullptr);
 
     int numEOOSamples = rade_n_tx_eoo_out(dv_);
 
     eooOut_ = new RADE_COMP[numEOOSamples];
-    assert(eooOut_ != nullptr);
 
     eooOutShort_ = new short[numEOOSamples + NUM_SAMPLES_SILENCE];
-    assert(eooOutShort_ != nullptr);
 
     featureList_ = new float[rade_n_features_in_out(dv_)];
-    assert(featureList_ != nullptr);
 
     arch_ = opus_select_arch();
 }
@@ -290,7 +283,6 @@ void RADETransmitStep::utFeatureThreadEntry_()
     SetThreadName("RADETx");
 
     float* featureBuf = new float[utFeatures_->capacity()];
-    assert(featureBuf != nullptr);
 
     while (!exitingFeatureThread_.load(std::memory_order_acquire))
     {

@@ -51,6 +51,10 @@ constexpr float AGC_MIN_GAIN_DB = -20.0;
 constexpr float AGC_ATTACK_TIME_SEC = 0.5;
 constexpr float AGC_RELEASE_TIME_SEC = 6.0;
 constexpr float SILENCE_THRESHOLD_LUFS = -33.0;
+// A measurement is only used when lufs > SILENCE_THRESHOLD_LUFS, so the
+// computed target gain is always < AGC_LOUDNESS_TARGET_LUFS - SILENCE_THRESHOLD_LUFS;
+// the upper clamp below would therefore never fire.
+static_assert(AGC_LOUDNESS_TARGET_LUFS - SILENCE_THRESHOLD_LUFS < AGC_MAX_GAIN_DB);
 constexpr int LIMITER_LEVEL_DB = -1;
 
 constexpr int TEN_MS_DIVIDER = 100;
@@ -77,31 +81,22 @@ AgcStep::AgcStep(int sampleRate)
     , inputSampleFifo_(MAX_AGC_SAMPLES + 1)
 {
     numSamplesPerRun_ = std::min(MAX_AGC_SAMPLES, sampleRate_ / TEN_MS_DIVIDER); // 10ms blocks, 160 max samples
-    assert(numSamplesPerRun_ > 0);
 
     // Configure WebRTC as solely a limiter (i.e. no AGC)
     agcState_ = WebRtcAgc_Create();
     assert(agcState_ != nullptr);
  
-    auto status = WebRtcAgc_Init(agcState_, 0, 255, kAgcModeUnchanged, sampleRate_);
-    if (status != 0)
-    {
-        log_error("Could not initialize WebRTC AGC (err = %d)", status);
-        WebRtcAgc_Free(agcState_);
-        agcState_ = nullptr;
-    }
+    // WebRtcAgc_Init fails only on invalid arguments: micLevelMin(0) <= micLevelMax(255),
+    // kAgcModeUnchanged is valid, and sampleRate_ is validated above (8/16/32/48 kHz),
+    // so this call cannot fail.
+    WebRtcAgc_Init(agcState_, 0, 255, kAgcModeUnchanged, sampleRate_);
 
     // Set AGC configuration
     agcConfig_.compressionGaindB = 0; // default 9 dB
     agcConfig_.limiterEnable = 1; // default kAgcTrue (on)
     agcConfig_.targetLevelDbfs = -LIMITER_LEVEL_DB; // default 3 (-3 dBOv)
-    status = WebRtcAgc_set_config(agcState_, agcConfig_);
-    if (status != 0)
-    {
-        log_error("Could not initialize WebRTC AGC config (err = %d)", status);
-        WebRtcAgc_Free(agcState_);
-        agcState_ = nullptr;
-    }
+    // Same argument-validity reasoning as WebRtcAgc_Init above: set_config cannot fail.
+    WebRtcAgc_set_config(agcState_, agcConfig_);
 
     ebur128State_ = ebur128_init(1, sampleRate_, EBUR128_MODE_M);
     assert(ebur128State_ != nullptr);
@@ -110,10 +105,8 @@ AgcStep::AgcStep(int sampleRate)
     // Sized for the rate we actually run at: an unsupported sampleRate falls
     // back to 48 kHz, and callers then send audio at that rate.
     outputSamples_ = std::make_unique<short[]>(sampleRate_);
-    assert(outputSamples_ != nullptr);
 
     tmpInput_ = std::make_unique<short[]>(numSamplesPerRun_);
-    assert(tmpInput_ != nullptr);
 }
 
 AgcStep::~AgcStep()
@@ -144,20 +137,13 @@ short* AgcStep::execute(short* inputSamples, int numInputSamples, int* numOutput
 
     while (numInputSamples > 0)
     {
+        // Always room on every pass: the FIFO is sized numSamplesPerRun_ + 1 and
+        // the drain below leaves numUsed() < numSamplesPerRun_, so numFree() >= 2
+        // whenever numInputSamples > 0.
         int samplesToWrite = std::min(inputSampleFifo_.numFree(), numInputSamples);
-        if (samplesToWrite > 0)
-        {
-            inputSampleFifo_.write(inputSamples, samplesToWrite);
-            inputSamples += samplesToWrite;
-            numInputSamples -= samplesToWrite;
-        }
-
-        if (samplesToWrite == 0 && inputSampleFifo_.numUsed() < numSamplesPerRun_)
-        {
-            // Nothing left to write and not enough buffered for a block --
-            // no further progress is possible this call.
-            break;
-        }
+        inputSampleFifo_.write(inputSamples, samplesToWrite);
+        inputSamples += samplesToWrite;
+        numInputSamples -= samplesToWrite;
 
         while (inputSampleFifo_.numUsed() >= numSamplesPerRun_)
         {
@@ -169,7 +155,6 @@ short* AgcStep::execute(short* inputSamples, int numInputSamples, int* numOutput
             // loudness (and thus recompute targetGainDb_) every Nth block --
             // see LOUDNESS_UPDATE_INTERVAL_BLOCKS above for why.
             double lufs = 0.0;
-            int result = EBUR128_SUCCESS;
             bool loudnessUpdated = false;
 
             // Note: libebur128 is unlikely to use RT-unsafe constructs in normal operation
@@ -179,7 +164,7 @@ short* AgcStep::execute(short* inputSamples, int numInputSamples, int* numOutput
             if (++blocksSinceLoudnessUpdate_ >= LOUDNESS_UPDATE_INTERVAL_BLOCKS)
             {
                 blocksSinceLoudnessUpdate_ = 0;
-                result = ebur128_loudness_momentary(state, &lufs);
+                (void)ebur128_loudness_momentary(state, &lufs);
                 loudnessUpdated = true;
             }
             FREEDV_END_VERIFIED_SAFE
@@ -189,12 +174,12 @@ short* AgcStep::execute(short* inputSamples, int numInputSamples, int* numOutput
                 // Persist validity across the blocks we don't re-measure, so
                 // the silence gate below still behaves as if it were checked
                 // every block (matching the original per-block behavior).
-                lastMeasurementValid_ = result == EBUR128_SUCCESS && lufs != -HUGE_VAL && lufs > SILENCE_THRESHOLD_LUFS;
+                lastMeasurementValid_ = lufs != -HUGE_VAL && lufs > SILENCE_THRESHOLD_LUFS;
                 if (lastMeasurementValid_)
                 {
                     // Step 2: calculate target gain. Assume LUFS = dbFS (?)
                     targetGainDb_ = AGC_LOUDNESS_TARGET_LUFS - lufs;
-                    if (targetGainDb_ >= AGC_MAX_GAIN_DB) targetGainDb_ = AGC_MAX_GAIN_DB;
+                    // targetGainDb_ is always < AGC_MAX_GAIN_DB here (see static_assert above).
                     if (targetGainDb_ <= AGC_MIN_GAIN_DB) targetGainDb_ = AGC_MIN_GAIN_DB;
                 }
             }
@@ -258,12 +243,9 @@ void AgcStep::reset() FREEDV_NONBLOCKING
     // may allocate.
 
     // The WebRTC limiter keeps its own gain/envelope state. Re-initializing it
-    // doesn't allocate.
-    if (agcState_ != nullptr)
-    {
-        WebRtcAgc_Init(agcState_, 0, 255, kAgcModeUnchanged, sampleRate_);
-        WebRtcAgc_set_config(agcState_, agcConfig_);
-    }
+    // doesn't allocate. (agcState_ is non-null: the init above cannot fail.)
+    WebRtcAgc_Init(agcState_, 0, 255, kAgcModeUnchanged, sampleRate_);
+    WebRtcAgc_set_config(agcState_, agcConfig_);
 
     // libebur128 has no reset, and recreating the state allocates. Its
     // momentary loudness only looks at the last 400 ms, so feeding it 400 ms

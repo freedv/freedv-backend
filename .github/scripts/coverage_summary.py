@@ -10,9 +10,10 @@ The Markdown goes to $GITHUB_STEP_SUMMARY if set, otherwise stdout. The
 llvm-profdata and llvm-cov commands can be overridden with the LLVM_PROFDATA
 and LLVM_COV environment variables (e.g. LLVM_COV="xcrun llvm-cov").
 
-Third-party code, the tests themselves and the standalone LDPC tools are left
-out. llvm-cov only knows about files linked into a test, so backend sources
-that were compiled but never linked into one are listed separately.
+Third-party code (including the vendored ulog.c logging backend), the tests
+themselves and the standalone LDPC tools are left out. llvm-cov only knows
+about files linked into a test, so backend sources that were compiled but
+never linked into one are listed separately.
 """
 import glob
 import json
@@ -24,7 +25,7 @@ import subprocess
 import sys
 
 SOURCE_DIR = os.path.realpath(os.path.join(os.path.dirname(__file__), '..', '..', 'src'))
-EXCLUDE = r'3rdparty|/test/|Test\.cpp$|ldpc_(en|de)code\.c(pp)?$|util/timespec\.[ch]$|util/logging/libfmemopen|websocketpp/'
+EXCLUDE = r'3rdparty|/test/|Test\.cpp$|ldpc_(en|de)code\.c(pp)?$|util/timespec\.[ch]$|util/logging/libfmemopen|util/logging/ulog\.c$|websocketpp/'
 
 
 def tool(env_name, default):

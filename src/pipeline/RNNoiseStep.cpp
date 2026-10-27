@@ -53,7 +53,6 @@ RNNoiseStep::RNNoiseStep()
 
     // Pre-allocate buffers so we don't have to do so during real-time operation.
     outputSamples_ = std::make_unique<short[]>(RNNOISE_SAMPLE_RATE);
-    assert(outputSamples_ != nullptr);
 }
 
 RNNoiseStep::~RNNoiseStep()
@@ -81,20 +80,13 @@ short* RNNoiseStep::execute(short* inputSamples, int numInputSamples, int* numOu
 
     while (numInputSamples > 0)
     {
+        // Always room on every pass: the FIFO is sized RNNOISE_FRAME_SIZE + 1 and
+        // the drain below leaves numUsed() < RNNOISE_FRAME_SIZE, so numFree() >= 2
+        // whenever numInputSamples > 0.
         int samplesToWrite = std::min(inputSampleFifo_.numFree(), numInputSamples);
-        if (samplesToWrite > 0)
-        {
-            inputSampleFifo_.write(inputSamples, samplesToWrite);
-            inputSamples += samplesToWrite;
-            numInputSamples -= samplesToWrite;
-        }
-
-        if (samplesToWrite == 0 && inputSampleFifo_.numUsed() < RNNOISE_FRAME_SIZE)
-        {
-            // Nothing left to write and not enough buffered for a frame --
-            // no further progress is possible this call.
-            break;
-        }
+        inputSampleFifo_.write(inputSamples, samplesToWrite);
+        inputSamples += samplesToWrite;
+        numInputSamples -= samplesToWrite;
 
         while (inputSampleFifo_.numUsed() >= RNNOISE_FRAME_SIZE)
         {

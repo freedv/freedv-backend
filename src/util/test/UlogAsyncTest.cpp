@@ -714,6 +714,29 @@ bool testFlushPollBudgetExhaustion()
     return result;
 }
 
+// Precision run with no digits: when the character right after the '.' of
+// a precision is below '0' (a '!' or another '%'), the precision digit scan
+// ends on its very first test -- the only exit besides running off the
+// digits. Neither character is a valid conversion, so both records render
+// as <?> with the truncation flag, deterministically.
+bool testEmptyPrecision()
+{
+    std::cout << "Test 16 (precision '.' with no digits ends the spec scan): ";
+
+    std::string out = captureStderr([&]() {
+        log_info("dotbang: %.! end");
+        log_info("dotdot: %.% end");
+        ulog_async_flush();
+    });
+
+    bool result = contains(out, "dotbang: <?> end [ulog_async: truncated]") &&
+                  contains(out, "dotdot: <?> end [ulog_async: truncated]");
+
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    if (!result) std::cout << "---\n" << out << "---\n";
+    return result;
+}
+
 } // namespace
 
 int main()
@@ -735,6 +758,7 @@ int main()
     result &= testConversionClassificationEdges();
     result &= testCapBoundaryAppend();
     result &= testFlushPollBudgetExhaustion();
+    result &= testEmptyPrecision();
 
     return result ? 0 : -1;
 }

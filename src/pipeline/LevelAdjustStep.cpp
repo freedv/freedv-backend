@@ -43,10 +43,8 @@ LevelAdjustStep::LevelAdjustStep(int sampleRate, realtime_fp<float()> const& sca
 {
     // Pre-allocate buffers so we don't have to do so during real-time operation.
     outputSamples_ = std::make_unique<short[]>(sampleRate_);
-    assert(outputSamples_ != nullptr);
 
     tmpFloatInput_ = std::make_unique<float[]>(sampleRate_ / 100);
-    assert(tmpFloatInput_ != nullptr);
 }
 
 LevelAdjustStep::~LevelAdjustStep()

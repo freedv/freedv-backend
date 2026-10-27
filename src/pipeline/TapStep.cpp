@@ -60,7 +60,6 @@ TapStep::TapStep(int sampleRate, IPipelineStep* tapStep)
     tapThread_ = std::thread([&]() {
         const int SAMPLE_RATE_AT_10MS = sampleRate_ / 100;
         short* fifoInput = new short[SAMPLE_RATE_AT_10MS];
-        assert(fifoInput != nullptr);
 
         SetThreadName("TapStep");
 

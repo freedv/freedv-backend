@@ -86,14 +86,14 @@ void IPipelineStep::ConvertSingleSampleToFloatSampleType_(SrcType* sourceSamples
     static_assert(SampleDivisor != 0);
 
     // Iterate through samples, performing division (if needed) and typecasting
-    if (SampleDivisor == 1)
+    if constexpr (SampleDivisor == 1)
     {
         destSamples[0] = (DstType)sourceSamples[0];
     }
     else
     {
         auto divider = SampleDivisor + 1;
-        if (SampleDivisor != std::numeric_limits<DstType>::max())
+        if constexpr (SampleDivisor != std::numeric_limits<DstType>::max())
         {
             divider = SampleDivisor;
         }
@@ -112,7 +112,7 @@ void IPipelineStep::ConvertToFloatSampleType_(SrcType* sourceSamples, DstType* d
     static_assert(SampleDivisor != 0);
 
     // Iterate through samples, performing division (if needed) and typecasting
-    if (SampleDivisor == 1)
+    if constexpr (SampleDivisor == 1)
     {
         for (std::size_t index = 0; index < numSamples; index++)
         {
@@ -122,7 +122,7 @@ void IPipelineStep::ConvertToFloatSampleType_(SrcType* sourceSamples, DstType* d
     else
     {
         auto divider = SampleDivisor + 1;
-        if (SampleDivisor != std::numeric_limits<SrcType>::max())
+        if constexpr (SampleDivisor != std::numeric_limits<SrcType>::max())
         {
             divider = SampleDivisor;
         }
@@ -141,7 +141,7 @@ void IPipelineStep::ConvertSingleSampleToIntSampleType_(SrcType* sourceSamples, 
     static_assert(std::numeric_limits<DstType>::is_integer);
 
     // Iterate through samples, performing multiplication (if needed) and typecasting
-    if (SampleMultiplier == 1)
+    if constexpr (SampleMultiplier == 1)
     {
         destSamples[0] = (DstType)sourceSamples[0];
     }
@@ -174,7 +174,7 @@ void IPipelineStep::ConvertToIntSampleType_(SrcType* sourceSamples, DstType* des
     static_assert(std::numeric_limits<DstType>::is_integer);
 
     // Iterate through samples, performing multiplication (if needed) and typecasting
-    if (SampleMultiplier == 1)
+    if constexpr (SampleMultiplier == 1)
     {
         for (std::size_t index = 0; index < numSamples; index++)
         {

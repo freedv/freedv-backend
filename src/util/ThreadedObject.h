@@ -49,6 +49,10 @@ protected:
     
     // Waits for all queued tasks to complete.
     void waitForAllTasksComplete_();
+    // Event-loop shutdown flag. Exposed to test subclasses that must drive
+    // the event loop's destroy checks deterministically from a task;
+    // production code sets it only in ~ThreadedObject.
+    std::atomic<bool> isDestroying_;
 private:
     ThreadedObject* parent_;
     std::string name_;
@@ -61,7 +65,6 @@ private:
     dispatch_queue_t queue_;
     std::atomic<int> numQueued_; // dispatch groups don't fully seem to wait
 #else
-    std::atomic<bool> isDestroying_;
     std::atomic<bool> taskCurrentlyExecuting_;
     std::thread objectThread_;
     std::deque<std::function<void()> > eventQueue_;

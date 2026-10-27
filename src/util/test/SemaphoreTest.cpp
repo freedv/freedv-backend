@@ -22,6 +22,75 @@
 
 #include "../Semaphore.h"
 
+
+// ---------------------------------------------------------------------------
+// --wrap fault-injection shims (Linux-only; see src/util/CMakeLists.txt).
+// Each gate names the arming test thread (pthread token) and fires exactly
+// once, so a background ulog worker (which calls clock_gettime() with its
+// own CLOCK_REALTIME timestamps here too) can never consume an armed gate;
+// every other call passes straight through to __real_X. Diagnostics go to
+// stderr only, never log_* (ulog itself calls clock_gettime()).
+// ---------------------------------------------------------------------------
+#if !defined(_WIN32) && !defined(__APPLE__)
+#include <cerrno>
+#include <cstdio>
+#include <ctime>
+
+namespace {
+std::atomic<unsigned long> semFaultThread_{0}; // pthread_self() of the arming thread
+std::atomic<int> semInitFailOnce_{0};
+std::atomic<int> clockGettimeFailOnce_{0};
+std::atomic<int> semClockwaitFailOnce_{0};
+} // namespace
+
+extern "C" {
+
+int __real_sem_init(sem_t* sem, int pshared, unsigned int value);
+int __wrap_sem_init(sem_t* sem, int pshared, unsigned int value)
+{
+    if (semInitFailOnce_.load() && pthread_self() == (pthread_t)semFaultThread_.load())
+    {
+        semInitFailOnce_.store(0);
+        memset(sem, 0, sizeof(*sem)); // no real init happened; keep the bytes a
+                                      // valid never-signalled semaphore
+        errno = EINVAL;
+        fprintf(stderr, "[fault] sem_init -> -1\n");
+        return -1;
+    }
+    return __real_sem_init(sem, pshared, value);
+}
+
+int __real_clock_gettime(clockid_t clk, struct timespec* tp);
+int __wrap_clock_gettime(clockid_t clk, struct timespec* tp)
+{
+    if (clk == CLOCK_MONOTONIC && clockGettimeFailOnce_.load()
+        && pthread_self() == (pthread_t)semFaultThread_.load())
+    {
+        clockGettimeFailOnce_.store(0);
+        __real_clock_gettime(clk, tp); // ts is left sane even though the call reports failure
+        errno = EFAULT;
+        fprintf(stderr, "[fault] clock_gettime -> -1\n");
+        return -1;
+    }
+    return __real_clock_gettime(clk, tp);
+}
+
+int __real_sem_clockwait(sem_t* sem, clockid_t clk, const struct timespec* absTimeout);
+int __wrap_sem_clockwait(sem_t* sem, clockid_t clk, const struct timespec* absTimeout)
+{
+    if (semClockwaitFailOnce_.load() && pthread_self() == (pthread_t)semFaultThread_.load())
+    {
+        semClockwaitFailOnce_.store(0);
+        __real_sem_clockwait(sem, clk, absTimeout); // take the real wait result first...
+        errno = EINVAL; // ...then replace it (EINVAL ends the EINTR retry loop)
+        fprintf(stderr, "[fault] sem_clockwait -> -1/EINVAL\n");
+        return -1;
+    }
+    return __real_sem_clockwait(sem, clk, absTimeout);
+}
+
+} // extern "C"
+#endif // !defined(_WIN32) && !defined(__APPLE__)
 using namespace std::chrono_literals;
 
 namespace {
@@ -301,6 +370,59 @@ bool testWaitReturnsAfterSignal()
     bool result = CHECK(returned.load());
     return report(result);
 }
+
+bool testFailedSemInitIsGraceful()
+{
+    std::cout << "Test 9 (a failing sem_init() is logged and leaves the semaphore inert, not fatal): ";
+
+    semFaultThread_.store((unsigned long)pthread_self());
+    semInitFailOnce_.store(1);
+    {
+        Semaphore sem; // the shim fires inside the ctor, which logs the error
+        sem.waitFor(100); // the inert (never signalled) semaphore just times out
+    } // ~Semaphore posts/destroys the zeroed sem_ without hanging or crashing
+    bool result = CHECK(semInitFailOnce_.load() == 0); // the shim fired where intended
+
+    // Semaphores constructed afterwards still work.
+    Semaphore other;
+    other.signal();
+    auto start = Clock::now();
+    other.waitFor(3000); // must take the pending signal early
+    result &= CHECK(Clock::now() - start < 500ms);
+
+    return report(result);
+}
+
+bool testWaitForSurvivesClockFailure()
+{
+    std::cout << "Test 10 (waitFor(): a clock_gettime() failure returns immediately instead of waiting the full timeout): ";
+
+    Semaphore sem;
+    auto start = Clock::now(); // no clock call from this thread between here and waitFor()
+    semFaultThread_.store((unsigned long)pthread_self());
+    clockGettimeFailOnce_.store(1);
+    sem.waitFor(3000); // the shim fires on waitFor()'s own clock_gettime -> early return
+    bool result = CHECK(Clock::now() - start < 500ms); // returned promptly, not after 3s
+    result &= CHECK(clockGettimeFailOnce_.load() == 0);
+
+    return report(result);
+}
+
+bool testWaitForReportsSemaphoreError()
+{
+    std::cout << "Test 11 (waitFor(): a sem_clockwait() failure other than ETIMEDOUT is logged, not fatal): ";
+
+    Semaphore sem;
+    sem.signal();
+    semFaultThread_.store((unsigned long)pthread_self());
+    semClockwaitFailOnce_.store(1);
+    auto start = Clock::now();
+    sem.waitFor(3000); // the shim lets the real wait consume the signal, then reports -1/EINVAL
+    bool result = CHECK(Clock::now() - start < 500ms); // the error path returned, no hang
+    result &= CHECK(semClockwaitFailOnce_.load() == 0);
+
+    return report(result);
+}
 #endif // !defined(_WIN32) && !defined(__APPLE__)
 
 } // namespace
@@ -318,6 +440,9 @@ int main(int, char**)
 #if !defined(_WIN32) && !defined(__APPLE__)
     result &= testWaitForRetriesAfterSignal();
     result &= testWaitReturnsAfterSignal();
+    result &= testFailedSemInitIsGraceful();
+    result &= testWaitForSurvivesClockFailure();
+    result &= testWaitForReportsSemaphoreError();
 #endif // !defined(_WIN32) && !defined(__APPLE__)
 
     return result ? 0 : -1;

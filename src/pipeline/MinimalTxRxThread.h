@@ -91,9 +91,7 @@ public:
 
         auto numSamples = std::max(inputSampleRate_, outputSampleRate_);
         inputSamples_ = std::make_unique<short[]>(numSamples);
-        assert(inputSamples_ != nullptr);
         inputSamplesZeros_ = std::make_unique<short[]>(numSamples);
-        assert(inputSamplesZeros_ != nullptr);
         memset(inputSamplesZeros_.get(), 0, numSamples * sizeof(short));
 
         // Initialize sync

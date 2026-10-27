@@ -359,6 +359,51 @@ bool testExternalBufferNotOwned()
     return result;
 }
 
+// Moving a GenericFIFO transfers the ring contents, the position state and
+// the buffer ownership to the new object. The moved-from object is left
+// with a null buffer: it must report empty, a reset() on it must be safe,
+// and its destructor must delete nothing -- neither the buffer that now
+// belongs to the moved-to object (no double-free) nor any phantom one.
+bool testMoveTransfersBufferOwnership()
+{
+    std::cout << "Test 8 (Move: buffer ownership transfer): ";
+
+    bool result = true;
+
+    {
+        GenericFIFO<int> src(16);
+        int in[4] = { 10, 20, 30, 40 };
+        result &= (src.write(in, 4) == 0);
+        result &= (src.numUsed() == 4);
+
+        GenericFIFO<int> moved(std::move(src));
+
+        // The new object owns the data and the buffer: it reads back what
+        // was written before the move and keeps working normally.
+        int out[4] = { 0, 0, 0, 0 };
+        result &= (moved.capacity() == 15);
+        result &= (moved.numUsed() == 4);
+        result &= (moved.read(out, 4) == 0);
+        result &= (out[0] == 10 && out[3] == 40);
+        result &= (moved.write(in, 4) == 0);
+        result &= (moved.numUsed() == 4);
+        moved.reset();
+        result &= (moved.numUsed() == 0);
+
+        // The moved-from object is inert but valid: empty, safe to reset,
+        // and destructing it (buf == nullptr here) must free nothing.
+        result &= (src.numUsed() == 0);
+        src.reset();
+        result &= (src.numUsed() == 0);
+    }
+
+    // If the moved-from destructor had deleted the transferred buffer, the
+    // moved-to object's writes above would have hit freed memory; it ran to
+    // scope exit cleanly, which is the behavioral check.
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    return result;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -372,6 +417,7 @@ int main(int argc, char** argv)
     result &= testConcurrentResetRace();
     result &= testConcurrentResetsAndNumUsed();
     result &= testExternalBufferNotOwned();
+    result &= testMoveTransfersBufferOwnership();
 
     return result ? 0 : -1;
 }

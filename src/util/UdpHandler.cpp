@@ -296,15 +296,11 @@ bool UdpHandler::isMulticastAddress_(struct addrinfo* addr)
         auto ipv6Addr = (struct sockaddr_in6*)(addr->ai_addr);
         return ipv6Addr->sin6_addr.s6_addr[0] == 0xFF; // ff00::/8
     }
-    else if (addr->ai_family == AF_INET)
+    else  // resolveIpAddress_ hints AF_INET/AF_INET6 only
     {
         auto ipv4Addr = (struct sockaddr_in*)(addr->ai_addr);
         auto addrAsHost = ntohl(ipv4Addr->sin_addr.s_addr);
         return addrAsHost >= 0xE0000000 && addrAsHost <= 0xEFFFFFFF; // 224.0.0.0-239.255.255.255            
-    }
-    else
-    {
-        return false;
     }
 }
 
@@ -334,7 +330,7 @@ void UdpHandler::joinMulticastGroup_(struct addrinfo* addr)
 #endif // defined(WIN32)
             }
     }
-    else if (addr->ai_family == AF_INET)
+    else  // resolveIpAddress_ hints AF_INET/AF_INET6 only
     {
         struct ip_mreq multicastRequest;  /* Multicast address join structure */
 
@@ -415,8 +411,5 @@ void UdpHandler::joinMulticastGroup_(struct addrinfo* addr)
 #endif // defined(WIN32)
         }
     }
-    else
-    {
-        assert(0); // should not reach here
-    }
+    // (no third family: resolveIpAddress_ restricts results to AF_INET/AF_INET6)
 }

@@ -384,6 +384,63 @@ bool testTimeoutEnqueueUnderContention()
     return report(result);
 }
 
+#if !defined(__APPLE__)
+// A task may mark the object as destroying; the event loop then ends its
+// drain right after running that task (the do-while destroy check), the
+// worker thread exits and ~ThreadedObject joins cleanly. Deliberately NOT
+// exercised: enqueueing anything after such a task would hang
+// waitForAllTasksComplete_ (it has no timeout) because the loop no longer
+// drains the queue.
+class SelfDestroyObject : public ThreadedObject
+{
+public:
+    explicit SelfDestroyObject(std::atomic<int>* ran)
+        : ThreadedObject("SelfDestroyObject")
+        , ran_(ran)
+    {
+    }
+
+    virtual ~SelfDestroyObject()
+    {
+        waitForAllTasksComplete_();
+    }
+
+    void enqueueNormal()
+    {
+        auto ran = ran_;
+        enqueue_([ran]() { ran->fetch_add(1); });
+    }
+
+    void enqueueSelfDestroy()
+    {
+        auto ran = ran_;
+        enqueue_([this, ran]() {
+            isDestroying_.store(true, std::memory_order_relaxed);
+            ran->fetch_add(1);
+        });
+    }
+    void waitAll() { waitForAllTasksComplete_(); }
+
+private:
+    std::atomic<int>* ran_;
+};
+
+bool testSelfDestroyTaskEndsDrainAndJoins()
+{
+    std::cout << "Test: task sets destroy flag, drain ends after it, join succeeds: ";
+
+    std::atomic<int> ran{0};
+    {
+        SelfDestroyObject obj(&ran);
+        obj.enqueueNormal();       // queued ahead of the marker: must still run
+        obj.enqueueSelfDestroy();  // drain must stop right after this one
+        obj.waitAll();
+    }
+
+    bool result = CHECK(ran.load() == 2); // both tasks ran; destructor joined without hanging
+    return report(result);
+}
+#endif // !defined(__APPLE__)
 } // namespace
 
 int main(int, char**)
@@ -395,6 +452,7 @@ int main(int, char**)
     result &= testDestroyWithTasksInFlight();
 #if !defined(__APPLE__)
     result &= testWaitFromOwnTask();
+    result &= testSelfDestroyTaskEndsDrainAndJoins();
 #endif // !defined(__APPLE__)
 
     result &= testChildEnqueuesOnParent();

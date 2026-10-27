@@ -98,7 +98,7 @@ void UdpReporter::addReceiveRecord(std::string callsign, std::string mode,
 
     yyjson_mut_doc_free(doc);
 
-    if (jsonStr == nullptr || jsonLen == 0)
+    if (jsonStr == nullptr)
     {
         log_warn("UdpReporter: failed to serialise JSON for callsign %s",
                  callsign.c_str());

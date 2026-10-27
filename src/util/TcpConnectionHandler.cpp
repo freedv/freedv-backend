@@ -310,11 +310,9 @@ void TcpConnectionHandler::connectImpl_()
     
     while (!cancelConnect_.load(std::memory_order_relaxed) && (results[0] || results[1]))
     {
-        // At least one list is non-empty; make sure we're on one of those.
-        if (results[whichIndex] == nullptr)
-        {
-            whichIndex = (whichIndex + 1) % 2;
-        }
+        // whichIndex always indexes a non-empty list here: the initial
+        // selection above and the end-of-loop fallback both keep it on a list
+        // that has entries whenever the while condition holds.
         struct addrinfo* current = results[whichIndex];
         int ret = 0;
 #if defined(WIN32)
@@ -406,14 +404,9 @@ void TcpConnectionHandler::connectImpl_()
             log_warn("cannot start connection to %s (err=%d: %s)", buf, err, tmpBuf);
 #else
             auto ptr = strerror_r(err, tmpBuf, ERROR_BUFFER_LEN);
-            if (ptr == nullptr)
-            {
-                strncpy(tmpBuf, "(null)", 7);
-            }
-            else
-            {
-                memmove(tmpBuf, ptr, strlen(ptr) + 1);
-            }
+            // The GNU strerror_r always returns tmpBuf (or a static string),
+            // never nullptr.
+            memmove(tmpBuf, ptr, strlen(ptr) + 1);
             log_warn("cannot start connection to %s (err=%d: %s)", buf, err, tmpBuf);
 #endif // defined(__APPLE__) || ((_POSIX_C_SOURCE >= 200112L) && !_GNU_SOURCE)
             close(fd);
@@ -1092,10 +1085,7 @@ void TcpConnectionHandler::receiveImpl_()
                 // Queue RX handler. This thread is the buffer's only writer
                 // and we checked for room above, so this can't fail.
                 numHaveRead += numRead;
-                if (receiveBuffer_.write(buf, numRead) != 0)
-                {
-                    log_error("receive buffer overflow; dropped %d bytes", numRead);
-                }
+                receiveBuffer_.write(buf, numRead);
 
                 if (numRead < READ_SIZE_BYTES)
                 {

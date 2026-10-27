@@ -27,6 +27,169 @@
 #include <openssl/ssl.h>
 #include "TestCertificate.h"
 #endif // defined(ENABLE_TLS_SUPPORT)
+// ---------------------------------------------------------------------------
+// --wrap fault-injection shims (Linux-only; see src/util/CMakeLists.txt).
+// Each gate is armed by a test just before the targeted action, fires exactly
+// once, and otherwise the wrapper passes straight through to __real_X. The
+// shims call __real_X first wherever the real result leaves state the handler
+// still needs (a genuinely connected socket, filled sockaddr/name buffers),
+// except where the point is that the library call fails. Diagnostics go to
+// stderr only, never log_* (ulog itself would recurse into wrapped calls).
+// ---------------------------------------------------------------------------
+#if !defined(_WIN32) && !defined(__APPLE__)
+#include <cstdarg>
+
+namespace {
+std::atomic<int> fcntlFailMode_{0}; // 1: fail F_GETFL once, 2: fail F_SETFL once
+std::atomic<int> connectEinprogressOnce_{0};
+std::atomic<int> getpeernameFailOnce_{0};
+std::atomic<int> getnameinfoFailOnce_{0}; // armed by the getpeername shim itself
+#if defined(ENABLE_TLS_SUPPORT)
+std::atomic<int> sslCtxNewFailOnce_{0};
+std::atomic<int> sslDefaultPathsWarnOnce_{0};
+std::atomic<int> sslMinProtoWarnOnce_{0};
+std::atomic<int> sslSetFdFailOnce_{0};
+std::atomic<int> sslSet1HostWarnOnce_{0};
+#endif // defined(ENABLE_TLS_SUPPORT)
+} // namespace
+
+extern "C" {
+
+int __real_fcntl(int fd, int cmd, ...);
+int __wrap_fcntl(int fd, int cmd, ...)
+{
+    va_list args;
+    va_start(args, cmd);
+    int thirdArg = va_arg(args, int);
+    va_end(args);
+
+    int mode = fcntlFailMode_.load(std::memory_order_relaxed);
+    if (mode == 1 && cmd == F_GETFL)
+    {
+        fcntlFailMode_.store(0);
+        errno = EPERM;
+        fprintf(stderr, "[fault] fcntl(F_GETFL) -> -1\n");
+        return -1;
+    }
+    if (mode == 2 && cmd == F_SETFL)
+    {
+        fcntlFailMode_.store(0);
+        errno = EPERM;
+        fprintf(stderr, "[fault] fcntl(F_SETFL) -> -1\n");
+        return -1;
+    }
+    return __real_fcntl(fd, cmd, thirdArg);
+}
+
+int __real_connect(int fd, const struct sockaddr* addr, socklen_t len);
+int __wrap_connect(int fd, const struct sockaddr* addr, socklen_t len)
+{
+    int rv = __real_connect(fd, addr, len); // always run the real connect first, whichever way it goes
+    if (connectEinprogressOnce_.exchange(0)) // consume the gate either way: a loopback connect may
+    {                                        // legitimately return 0 or EINPROGRESS under load
+        errno = EINPROGRESS;
+        fprintf(stderr, "[fault] connect -> -1/EINPROGRESS\n");
+        return -1;
+    }
+    return rv;
+}
+
+int __real_getpeername(int fd, struct sockaddr* addr, socklen_t* len);
+int __wrap_getpeername(int fd, struct sockaddr* addr, socklen_t* len)
+{
+    int rv = __real_getpeername(fd, addr, len); // fill addr/len, then report failure
+    if (rv == 0 && getpeernameFailOnce_.exchange(0))
+    {
+        getnameinfoFailOnce_.store(1); // arm the follow-up getnameinfo() in the same block
+        errno = ENOTCONN;
+        fprintf(stderr, "[fault] getpeername -> -1/ENOTCONN\n");
+        return -1;
+    }
+    return rv;
+}
+
+int __real_getnameinfo(const struct sockaddr* sa, socklen_t salen, char* host, size_t hostlen,
+                       char* serv, size_t servlen, int flags);
+int __wrap_getnameinfo(const struct sockaddr* sa, socklen_t salen, char* host, size_t hostlen,
+                       char* serv, size_t servlen, int flags)
+{
+    int rv = __real_getnameinfo(sa, salen, host, hostlen, serv, servlen, flags); // fill host first
+    if (rv == 0 && getnameinfoFailOnce_.exchange(0))
+    {
+        fprintf(stderr, "[fault] getnameinfo -> EAI_NONAME\n");
+        return EAI_NONAME;
+    }
+    return rv;
+}
+
+#if defined(ENABLE_TLS_SUPPORT)
+SSL_CTX* __real_SSL_CTX_new(const SSL_METHOD* method);
+SSL_CTX* __wrap_SSL_CTX_new(const SSL_METHOD* method)
+{
+    if (sslCtxNewFailOnce_.exchange(0))
+    {
+        SSL_CTX* ctx = __real_SSL_CTX_new(method);
+        if (ctx != nullptr)
+        {
+            SSL_CTX_free(ctx); // keep the library consistent, hand the caller a failure
+        }
+        fprintf(stderr, "[fault] SSL_CTX_new -> nullptr\n");
+        return nullptr;
+    }
+    return __real_SSL_CTX_new(method);
+}
+
+int __real_SSL_CTX_set_default_verify_paths(SSL_CTX* ctx);
+int __wrap_SSL_CTX_set_default_verify_paths(SSL_CTX* ctx)
+{
+    if (sslDefaultPathsWarnOnce_.exchange(0))
+    {
+        fprintf(stderr, "[fault] SSL_CTX_set_default_verify_paths -> 0\n");
+        return 0;
+    }
+    return __real_SSL_CTX_set_default_verify_paths(ctx);
+}
+
+// OpenSSL spells SSL_CTX_set_min_proto_version() as a macro around
+// SSL_CTX_ctrl(), so the ctrl shim is what intercepts that call. Non-matching
+// ctrls stay transparent and leave the gate armed for the intended call.
+long __real_SSL_CTX_ctrl(SSL_CTX* ctx, int cmd, long larg, void* parg);
+long __wrap_SSL_CTX_ctrl(SSL_CTX* ctx, int cmd, long larg, void* parg)
+{
+    if (cmd == SSL_CTRL_SET_MIN_PROTO_VERSION && sslMinProtoWarnOnce_.load())
+    {
+        sslMinProtoWarnOnce_.store(0);
+        fprintf(stderr, "[fault] SSL_CTX_ctrl(SET_MIN_PROTO_VERSION) -> 0\n");
+        return 0;
+    }
+    return __real_SSL_CTX_ctrl(ctx, cmd, larg, parg);
+}
+
+int __real_SSL_set_fd(SSL* ssl, int fd);
+int __wrap_SSL_set_fd(SSL* ssl, int fd)
+{
+    if (sslSetFdFailOnce_.exchange(0))
+    {
+        fprintf(stderr, "[fault] SSL_set_fd -> 0\n");
+        return 0;
+    }
+    return __real_SSL_set_fd(ssl, fd);
+}
+
+int __real_SSL_set1_host(SSL* ssl, const char* host);
+int __wrap_SSL_set1_host(SSL* ssl, const char* host)
+{
+    if (sslSet1HostWarnOnce_.exchange(0))
+    {
+        fprintf(stderr, "[fault] SSL_set1_host -> 0\n");
+        return 0;
+    }
+    return __real_SSL_set1_host(ssl, host);
+}
+#endif // defined(ENABLE_TLS_SUPPORT)
+
+} // extern "C"
+#endif // !defined(_WIN32) && !defined(__APPLE__)
 
 using namespace std::chrono_literals;
 
@@ -2417,6 +2580,208 @@ bool testTlsHelloRetryRequestStallsWrite(TestCertificate& cert)
 }
 #endif // defined(ENABLE_TLS_SUPPORT)
 
+// ---------------------------------------------------------------------------
+// Linux-only fault-injection tests: the --wrap shims above drive the
+// handler's OS/library failure arms deterministically. Each test arms its
+// gate just before the connect attempt; each gate must read 0 afterwards,
+// proving the shim fired exactly where intended.
+// ---------------------------------------------------------------------------
+#if !defined(_WIN32) && !defined(__APPLE__)
+
+bool testConnectSocketFlagsGetFailure()
+{
+    std::cout << "Test 64 (fcntl(F_GETFL) failure: the attempt is dropped, the next address connects): ";
+
+    // Two identical scripted addresses: the first attempt dies at the fcntl
+    // shim before the server sees anything; the second must connect normally.
+    LoopbackTcpServer server;
+    ScriptedDnsConnection conn({0ms, {}}, {0ms, {{"127.0.0.1", server.port()}, {"127.0.0.1", server.port()}}});
+
+    bool result = CHECK(server.valid());
+    fcntlFailMode_.store(1);
+    conn.connect(SCRIPTED_HOST, 0, false);
+    result &= CHECK(server.accept(ACCEPT_TIMEOUT_MS));
+    result &= CHECK(conn.waitForConnects(1));
+    result &= CHECK((fcntlFailMode_.load() == 0));
+
+    return report(result);
+}
+
+bool testConnectSocketFlagsSetFailure()
+{
+    std::cout << "Test 65 (fcntl(F_SETFL) failure: the attempt is dropped, the next address connects): ";
+
+    LoopbackTcpServer server;
+    ScriptedDnsConnection conn({0ms, {}}, {0ms, {{"127.0.0.1", server.port()}, {"127.0.0.1", server.port()}}});
+
+    bool result = CHECK(server.valid());
+    fcntlFailMode_.store(2);
+    conn.connect(SCRIPTED_HOST, 0, false);
+    result &= CHECK(server.accept(ACCEPT_TIMEOUT_MS));
+    result &= CHECK(conn.waitForConnects(1));
+    result &= CHECK((fcntlFailMode_.load() == 0));
+
+    return report(result);
+}
+
+bool testConnectReportsEinprogress()
+{
+    std::cout << "Test 66 (connect() reporting EINPROGRESS: the SO_ERROR poll still completes the connection): ";
+
+    LoopbackTcpServer server;
+    TestConnection conn;
+
+    bool result = CHECK(server.valid());
+    // The shim lets the real connect succeed, then reports -1/EINPROGRESS,
+    // so the happy-eyeballs fall-through and checkConnections_() complete it.
+    connectEinprogressOnce_.store(1);
+    conn.connect("127.0.0.1", server.port(), false);
+    result &= CHECK(server.accept(ACCEPT_TIMEOUT_MS));
+    result &= CHECK(conn.waitForConnects(1));
+    result &= CHECK((connectEinprogressOnce_.load() == 0));
+
+    return report(result);
+}
+#endif // !defined(_WIN32) && !defined(__APPLE__)
+
+#if !defined(_WIN32) && !defined(__APPLE__) && defined(ENABLE_TLS_SUPPORT)
+
+bool testTlsSslCtxAllocationFailure(TestCertificate& cert)
+{
+    std::cout << "Test 67 (SSL_CTX_new failure: the TLS attempt fails cleanly, a retry connects): ";
+
+    testSetEnv("SSL_CERT_FILE", cert.path.c_str());
+
+    LoopbackTcpServer server;
+    TestConnection conn;
+
+    bool result = CHECK(server.valid());
+    sslCtxNewFailOnce_.store(1);
+    auto fut = conn.connect("localhost", server.port(), false, true);
+    result &= CHECK((fut.wait_for(EVENT_TIMEOUT) == std::future_status::ready));
+    result &= CHECK((sslCtxNewFailOnce_.load() == 0)); // the shim fired
+    result &= CHECK((conn.connectCount() == 0));       // the failed attempt never reached onConnect_
+
+    // With the shim spent, the same handler must complete a normal TLS session.
+    LoopbackTcpServer server2;
+    result &= CHECK(server2.valid());
+    conn.connect("localhost", server2.port(), false, true);
+    result &= CHECK(server2.accept(ACCEPT_TIMEOUT_MS));
+    setPeerRecvTimeout(server2.peerFd(), 5);
+    TlsServerSession tls(cert);
+    result &= CHECK(tls.handshake(server2.peerFd()));
+    result &= CHECK(conn.waitForConnects(1));
+    conn.disconnect().wait();
+    result &= CHECK(tls.waitForShutdown());
+
+    return report(result);
+}
+
+bool testTlsSetFdFailure(TestCertificate& cert)
+{
+    std::cout << "Test 68 (SSL_set_fd failure: the attempt disconnects without onConnect_, a retry connects): ";
+
+    testSetEnv("SSL_CERT_FILE", cert.path.c_str());
+
+    LoopbackTcpServer server;
+    TestConnection conn;
+
+    bool result = CHECK(server.valid());
+    sslSetFdFailOnce_.store(1);
+    auto fut = conn.connect("localhost", server.port(), false, true);
+    result &= CHECK((fut.wait_for(EVENT_TIMEOUT) == std::future_status::ready));
+    result &= CHECK((sslSetFdFailOnce_.load() == 0));
+    result &= CHECK((conn.connectCount() == 0));
+
+    LoopbackTcpServer server2;
+    result &= CHECK(server2.valid());
+    conn.connect("localhost", server2.port(), false, true);
+    result &= CHECK(server2.accept(ACCEPT_TIMEOUT_MS));
+    setPeerRecvTimeout(server2.peerFd(), 5);
+    TlsServerSession tls(cert);
+    result &= CHECK(tls.handshake(server2.peerFd()));
+    result &= CHECK(conn.waitForConnects(1));
+    conn.disconnect().wait();
+    result &= CHECK(tls.waitForShutdown());
+
+    return report(result);
+}
+
+bool testTlsWarnOnlySetupFailures(TestCertificate& cert)
+{
+    std::cout << "Test 69 (default_verify_paths / min_proto_version / set1_host failures are warn-only): ";
+
+    testSetEnv("SSL_CERT_FILE", cert.path.c_str());
+
+    LoopbackTcpServer server;
+    TestConnection conn;
+
+    bool result = CHECK(server.valid());
+    // The cert trust comes from SSL_CERT_FILE (loaded via SSL_CTX_load_verify
+    // _locations), so losing the default paths, the version floor and the
+    // hostname pin must all be survivable warnings.
+    sslDefaultPathsWarnOnce_.store(1);
+    sslMinProtoWarnOnce_.store(1);
+    sslSet1HostWarnOnce_.store(1);
+    conn.connect("localhost", server.port(), false, true);
+    result &= CHECK(server.accept(ACCEPT_TIMEOUT_MS));
+    setPeerRecvTimeout(server.peerFd(), 5);
+    TlsServerSession tls(cert);
+    result &= CHECK(tls.handshake(server.peerFd()));
+    result &= CHECK(conn.waitForConnects(1));
+
+    const std::string clientMsg = "warnings notwithstanding";
+    conn.send(clientMsg.c_str(), clientMsg.size());
+    std::string gotClientMsg;
+    result &= CHECK(tls.readExact(gotClientMsg, clientMsg.size()));
+    result &= CHECK((gotClientMsg == clientMsg));
+
+    conn.disconnect().wait();
+    result &= CHECK(tls.waitForShutdown());
+
+    // All three shims must have fired during this one TLS setup.
+    result &= CHECK((sslDefaultPathsWarnOnce_.load() == 0));
+    result &= CHECK((sslMinProtoWarnOnce_.load() == 0));
+    result &= CHECK((sslSet1HostWarnOnce_.load() == 0));
+
+    return report(result);
+}
+
+bool testTlsPeerNameWarnings(TestCertificate& cert)
+{
+    std::cout << "Test 70 (getpeername/getnameinfo failures only cost a warning): ";
+
+    testSetEnv("SSL_CERT_FILE", cert.path.c_str());
+
+    LoopbackTcpServer server;
+    TestConnection conn;
+
+    bool result = CHECK(server.valid());
+    // The getpeername shim arms the getnameinfo one, so the in-block follow-up
+    // call (not the earlier address-logging one) is the one that reports EAI_NONAME.
+    getpeernameFailOnce_.store(1);
+    conn.connect("localhost", server.port(), false, true);
+    result &= CHECK(server.accept(ACCEPT_TIMEOUT_MS));
+    setPeerRecvTimeout(server.peerFd(), 5);
+    TlsServerSession tls(cert);
+    result &= CHECK(tls.handshake(server.peerFd()));
+    result &= CHECK(conn.waitForConnects(1));
+
+    const std::string clientMsg = "peer name lookup warnings are survivable";
+    conn.send(clientMsg.c_str(), clientMsg.size());
+    std::string gotClientMsg;
+    result &= CHECK(tls.readExact(gotClientMsg, clientMsg.size()));
+    result &= CHECK((gotClientMsg == clientMsg));
+
+    conn.disconnect().wait();
+    result &= CHECK(tls.waitForShutdown());
+    result &= CHECK((getpeernameFailOnce_.load() == 0));
+    result &= CHECK((getnameinfoFailOnce_.load() == 0));
+
+    return report(result);
+}
+#endif // !defined(_WIN32) && !defined(__APPLE__) && defined(ENABLE_TLS_SUPPORT)
+
 } // namespace
 
 int main(int, char**)
@@ -2471,6 +2836,12 @@ int main(int, char**)
     result &= testTlsSendLosesSslObjectMidWait(cert);
     result &= testTlsSendWaitingOnInvalidSocket(cert);
     result &= testTlsReadWantsWriteOnInvalidSocket(cert);
+#if !defined(_WIN32) && !defined(__APPLE__)
+    result &= testTlsSslCtxAllocationFailure(cert);
+    result &= testTlsSetFdFailure(cert);
+    result &= testTlsWarnOnlySetupFailures(cert);
+    result &= testTlsPeerNameWarnings(cert);
+#endif // !defined(_WIN32) && !defined(__APPLE__)
 #endif // defined(ENABLE_TLS_SUPPORT)
 
     // Numbered after the TLS tests, which were written first.
@@ -2507,6 +2878,11 @@ int main(int, char**)
     result &= testLateIpv6CollectedWhileIpv4AttemptInFlight();
     result &= testStalledSendSelectErrorOnClosedSocket();
 #endif // !defined(WIN32)
+#if !defined(_WIN32) && !defined(__APPLE__)
+    result &= testConnectSocketFlagsGetFailure();
+    result &= testConnectSocketFlagsSetFailure();
+    result &= testConnectReportsEinprogress();
+#endif // !defined(_WIN32) && !defined(__APPLE__)
 
     return result ? 0 : -1;
 }

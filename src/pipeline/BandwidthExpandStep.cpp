@@ -48,17 +48,13 @@ BandwidthExpandStep::BandwidthExpandStep()
 {
     // Pre-allocate buffers so we don't have to do so during real-time operation.
     outputSamples_ = std::make_unique<short[]>(OUTPUT_SAMPLE_RATE);
-    assert(outputSamples_ != nullptr);
 
     tmpInput_ = std::make_unique<short[]>(BWE_FRAME_SIZE);
-    assert(tmpInput_ != nullptr);
     
     osceBWE_ = new silk_OSCE_BWE_struct();
-    assert(osceBWE_ != nullptr);
     memset(osceBWE_, 0, sizeof(silk_OSCE_BWE_struct));
     
     osce_ = new OSCEModel();
-    assert(osce_ != nullptr);
     memset(osce_, 0, sizeof(OSCEModel));
     
     arch_ = opus_select_arch();

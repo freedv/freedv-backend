@@ -43,7 +43,6 @@ MuteStep::MuteStep(int outputSampleRate)
 {
     // Pre-allocate buffers so we don't have to do so during real-time operation.
     outputSamples_ = std::make_unique<short[]>(outputSampleRate_);
-    assert(outputSamples_ != nullptr);
 
     memset(outputSamples_.get(), 0, sizeof(short) * outputSampleRate_);
 }
@@ -54,7 +53,6 @@ MuteStep::MuteStep(int inputSampleRate, int outputSampleRate)
 {
     // Pre-allocate buffers so we don't have to do so during real-time operation.
     outputSamples_ = std::make_unique<short[]>(outputSampleRate_);
-    assert(outputSamples_ != nullptr);
 
     memset(outputSamples_.get(), 0, sizeof(short) * outputSampleRate_);
 }

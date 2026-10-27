@@ -120,7 +120,6 @@ RADEReceiveStep::RADEReceiveStep(
     if (utRxFeatureFile != "")
     {
         utFeatures_ = new GenericFIFO<float>(FEATURE_FIFO_SIZE);
-        assert(utFeatures_ != nullptr);
 
         featuresFile_ = fopen((const char*)utRxFeatureFile.c_str(), "wb");
         assert(featuresFile_ != nullptr);
@@ -131,25 +130,18 @@ RADEReceiveStep::RADEReceiveStep(
 
     // Pre-allocate buffers so we don't have to do so during real-time operation.
     outputSamples_ = std::make_unique<short[]>(RADE_SPEECH_SAMPLE_RATE);
-    assert(outputSamples_ != nullptr);
 
     inputBufCplx_ = new RADE_COMP[rade_nin_max(dv_)];
-    assert(inputBufCplx_ != nullptr);
 
     inputBuf_ = new short[rade_nin_max(dv_)];
-    assert(inputBuf_ != nullptr);
 
     featuresOut_ = new float[rade_n_features_in_out(dv_)];
-    assert(featuresOut_ != nullptr);
 
     eooOut_ = new float[rade_n_eoo_bits(dv_)];
-    assert(eooOut_ != nullptr);
 
     pendingFeatures_ = new float[NB_TOTAL_FEATURES];
-    assert(pendingFeatures_ != nullptr);
 
     rxFdmOffset_ = new RADE_COMP[rade_nin_max(dv_)];
-    assert(rxFdmOffset_ != nullptr);
     
     rxFreqOffsetPhaseRectObjs_.real = cos(0.0);
     rxFreqOffsetPhaseRectObjs_.imag = sin(0.0);
@@ -218,7 +210,10 @@ short* RADEReceiveStep::execute(short* inputSamples, int numInputSamples, int* n
             inputSamples += samplesToWrite;
         }
 
-        if (inputSampleFifo_.read(inputBuf_, nin) != 0 && numInputSamples == 0)
+        // FIFO capacity is rade_nin_max(dv)+1, so a failed read (numUsed < nin)
+        // implies the write above drained all remaining input samples:
+        // numInputSamples == 0 is guaranteed whenever the read fails.
+        if (inputSampleFifo_.read(inputBuf_, nin) != 0)
         {
             break;
         }
@@ -335,7 +330,6 @@ void RADEReceiveStep::utFeatureThreadEntry_()
     SetThreadName("RADERx");
 
     float* featureBuf = new float[utFeatures_->capacity()];
-    assert(featureBuf != nullptr);
 
     while (!exitingFeatureThread_.load(std::memory_order_acquire))
     {
