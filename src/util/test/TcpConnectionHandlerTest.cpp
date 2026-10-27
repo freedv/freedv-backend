@@ -15,9 +15,9 @@
 #include <utility>
 #include <vector>
 
-#if !defined(WIN32)
+#if !defined(_WIN32)
 #include <sys/resource.h>
-#endif // !defined(WIN32)
+#endif // !defined(_WIN32)
 
 
 #include "../TcpConnectionHandler.h"
@@ -262,12 +262,12 @@ static void joinRecvThread(TcpConnectionHandler& conn)
     }
 }
 
-#if !defined(WIN32)
+#if !defined(_WIN32)
 static void callCheckConnections(TcpConnectionHandler& conn, std::vector<int>& socks)
 {
     conn.checkConnections_(socks);
 }
-#endif // !defined(WIN32)
+#endif // !defined(_WIN32)
 
 #if defined(ENABLE_TLS_SUPPORT)
     // True if the client's last TLS operation is waiting to write.
@@ -1421,7 +1421,7 @@ bool testDispatchAbandonedWhenSocketInvalidated()
     result &= CHECK(conn.disconnectCount() == 0);
     return report(result);
 }
-#if !defined(WIN32)
+#if !defined(_WIN32)
 bool testCheckConnectionsSocketErrors()
 {
     std::cout << "Test 50 (checkConnections_ on a dead socket number: getsockopt error deletes it): ";
@@ -1590,7 +1590,7 @@ bool testStalledSendSelectErrorOnClosedSocket()
     conn.disconnect().wait();
     return report(result);
 }
-#endif // !defined(WIN32)
+#endif // !defined(_WIN32)
 
 #if defined(ENABLE_TLS_SUPPORT)
 
@@ -2920,12 +2920,12 @@ int main(int, char**)
     result &= testReceiveAfterSocketClosedReportsSelectError();
     result &= testSelectWakeDiscardedWhenSocketInvalidated();
     result &= testDispatchAbandonedWhenSocketInvalidated();
-#if !defined(WIN32)
+#if !defined(_WIN32)
     result &= testCheckConnectionsSocketErrors();
     result &= testSocketExhaustionDuringConnect();
     result &= testLateIpv6CollectedWhileIpv4AttemptInFlight();
     result &= testStalledSendSelectErrorOnClosedSocket();
-#endif // !defined(WIN32)
+#endif // !defined(_WIN32)
 #if !defined(_WIN32) && !defined(__APPLE__)
     result &= testConnectSocketFlagsGetFailure();
     result &= testConnectSocketFlagsSetFailure();
