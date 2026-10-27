@@ -330,12 +330,13 @@ bool testWebsocketppUlogAdapter()
     return report(result);
 }
 
-// Edge inputs to ulog_event_to_cstr(): a zero-size buffer and one so large
-// fmemopen() cannot back it must both fail cleanly without touching the
-// caller's buffer.
+// Edge input to ulog_event_to_cstr(): a zero-size buffer must fail cleanly
+// without touching the caller's buffer. (Claiming a buffer is bigger than it
+// is can't be made safe: glibc's fmemopen() happens to refuse a huge size,
+// but macOS's writes past the end of the real buffer.)
 bool testEventToCstrEdges()
 {
-    std::cout << "Test 8 (ulog_event_to_cstr rejects zero/huge buffers): ";
+    std::cout << "Test 8 (ulog_event_to_cstr rejects a zero-size buffer): ";
 
     struct tm tmBuf;
     memset(&tmBuf, 0, sizeof(tmBuf));
@@ -347,10 +348,6 @@ bool testEventToCstrEdges()
     memset(out, 'X', sizeof(out));
 
     bool result = CHECK(renderEvent(out, 0, &tmBuf, LOG_WARN, "no room") == -1);
-    result &= CHECK(out[0] == 'X' && out[sizeof(out) - 1] == 'X');
-
-    memset(out, 'X', sizeof(out));
-    result &= CHECK(renderEvent(out, (size_t)-1, &tmBuf, LOG_WARN, "huge %d", 1) == -1);
     result &= CHECK(out[0] == 'X' && out[sizeof(out) - 1] == 'X');
 
     return report(result);

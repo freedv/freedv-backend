@@ -928,6 +928,15 @@ void TcpConnectionHandler::sendImpl_(const char* buf, int length)
             }
             else if (rv < 0)
             {
+#if !defined(WIN32)
+                if (errno == EINTR)
+                {
+                    continue;
+                }
+#endif // !defined(WIN32)
+
+                // Nothing can be written to this socket (e.g. it's been
+                // closed): give up rather than failing again forever.
 #if defined(WIN32)
                 log_warn("write failed (errno=%d)", WSAGetLastError());
 #else
@@ -936,6 +945,7 @@ void TcpConnectionHandler::sendImpl_(const char* buf, int length)
                 enqueue_([&]() {
                     disconnectImpl_();
                 });
+                break;
             }
             continue;
 tryAgain:
