@@ -136,34 +136,39 @@ void AudioPipeline::reloadResampler_(int index)
         createResampler |= resampleStep->getInputSampleRate() != pipelineSteps_[index - 1]->getOutputSampleRate();
     }
     
-    if (createResampler)
+    if (!createResampler)
     {
-        if (index == 0)
+        // The existing resampler still matches the pipeline wiring: keep it
+        // as-is. Falling through to the ownership assignment below would be
+        // a unique_ptr self-move of the live pointer, which destroys the
+        // resampler and leaves the slot dangling until pipeline teardown
+        // double-frees it.
+        return;
+    }
+    
+    if (index == 0)
+    {
+        if (pipelineSteps_[0]->getInputSampleRate() != getInputSampleRate())
         {
-            if (pipelineSteps_[0]->getInputSampleRate() != getInputSampleRate())
-            {
-                resampleStep = new ResampleStep(getInputSampleRate(), pipelineSteps_[0]->getInputSampleRate());
-            }
-            else
-            {
-                resampleStep = nullptr;
-            }
+            resamplers_[index] = std::make_unique<ResampleStep>(getInputSampleRate(), pipelineSteps_[0]->getInputSampleRate());
         }
         else
         {
-            int prevOutputSampleRate = pipelineSteps_[index - 1]->getOutputSampleRate();
-            if (pipelineSteps_[index]->getInputSampleRate() != prevOutputSampleRate)
-            {
-                resampleStep = new ResampleStep(prevOutputSampleRate, pipelineSteps_[index]->getInputSampleRate());
-            }
-            else
-            {
-                resampleStep = nullptr;
-            }
+            resamplers_[index] = nullptr;
         }
     }
-    
-    resamplers_[index] = std::unique_ptr<ResampleStep>(resampleStep); // NOLINT
+    else
+    {
+        int prevOutputSampleRate = pipelineSteps_[index - 1]->getOutputSampleRate();
+        if (pipelineSteps_[index]->getInputSampleRate() != prevOutputSampleRate)
+        {
+            resamplers_[index] = std::make_unique<ResampleStep>(prevOutputSampleRate, pipelineSteps_[index]->getInputSampleRate());
+        }
+        else
+        {
+            resamplers_[index] = nullptr;
+        }
+    }
 }
 
 void AudioPipeline::reloadResultResampler_()

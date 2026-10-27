@@ -56,8 +56,8 @@ private:
     int outputSampleRate_;
     SRC_STATE* resampleState_;
 
-    float* tempInput_;
-    float* tempOutput_;
+    std::unique_ptr<float[]> tempInput_;
+    std::unique_ptr<float[]> tempOutput_;
     std::unique_ptr<short[]> outputSamples_;
 };
 

@@ -554,6 +554,39 @@ bool reloadResultResamplerEveryCondition()
     return result;
 }
 
+// Regression: the keep path of reloadResampler_() (the existing resampler
+// matches its predecessor's output seam, and its output does not equal the
+// step's input) must leave the resampler untouched. Historically it fell
+// through to re-wrapping the still-live raw pointer into the same unique_ptr
+// slot, which is a unique_ptr self-move: the object is destroyed, the slot
+// keeps a dangling pointer, and pipeline teardown double-frees it.
+bool reloadResamplerKeepPathIsSafe()
+{
+    AudioPipeline pipeline(8000, 48000);
+    pipeline.appendPipelineStep(new MutableStep(8000, 8000));
+    pipeline.appendPipelineStep(new MutableStep(16000, 16000));
+
+    ResampleStep* original = pipeline.resamplers_[1].get();
+    bool result = original != nullptr;
+
+    // Move step 1 so the resampler's output no longer matches the step's
+    // input (first reload condition false), while the resampler's input
+    // still matches step 0's output (second condition false): keep path.
+    MutableStep* step1 = static_cast<MutableStep*>(pipeline.pipelineSteps_[1].get());
+    step1->setRates(32000, 16000);
+    pipeline.reloadResampler_(1);
+
+    result &= pipeline.resamplers_[1].get() == original;
+
+    if (!result)
+    {
+        std::cerr << "[reloadResampler_ keep path replaced the matching resampler]...";
+    }
+    // Scope exit destroys the pipeline: with the self-move bug this
+    // double-frees the resampler (ASan/heap-checker abort).
+    return result;
+}
+
 int main()
 {
     TEST_CASE(passthrough);
@@ -576,6 +609,7 @@ int main()
     TEST_CASE(conversionHelperDivisorSpecialCases);
     TEST_CASE(reloadResamplerRefreshThenRebuild);
     TEST_CASE(reloadResultResamplerEveryCondition);
+    TEST_CASE(reloadResamplerKeepPathIsSafe);
     
     return 0;
 }

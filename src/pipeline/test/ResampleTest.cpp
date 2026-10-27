@@ -143,6 +143,29 @@ bool negativeInputRateRejected()
     return true;
 }
 
+// Regression: feeding exactly one second of input at an integer upsample
+// ratio must not push more samples into the one-second output buffer than
+// it can hold. The linear converter emits ceil(input*ratio) per 10 ms
+// chunk (80 samples at x6 yield 481), which used to overshoot by one
+// sample per chunk: 100 chunks wrote 48100 shorts into a 48000-sample
+// buffer.
+bool linearOneSecondFeedStaysWithinOutputBuffer()
+{
+    ResampleStep resampleStep(8000, 48000, true);
+    auto inputSineWave = std::unique_ptr<short[]>(generateOneSecondSineWave(1000, 8000), std::default_delete<short[]>());
+
+    int numOutputSamples = 0;
+    resampleStep.execute(inputSineWave.get(), 8000, &numOutputSamples);
+
+    bool result = numOutputSamples > 0 && numOutputSamples <= 48000;
+    if (!result)
+    {
+        std::cerr << "[linear one-second feed produced " << numOutputSamples
+                  << " samples, more than the 48000-sample buffer]...";
+    }
+    return result;
+}
+
 int main()
 {
     TEST_CASE(resampleEqual);
@@ -155,5 +178,6 @@ int main()
     TEST_CASE(resample48000To8000Tone);
     TEST_CASE(linearResampleForPlots);
     TEST_CASE(negativeInputRateRejected);
+    TEST_CASE(linearOneSecondFeedStaysWithinOutputBuffer);
     return 0;
 }
