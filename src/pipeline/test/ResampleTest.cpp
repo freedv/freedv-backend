@@ -2,6 +2,7 @@
 #include "PipelineTestCommon.h"
 
 #include <vector>
+#include <new>
 
 #ifndef M_PI // not defined by every C library (e.g. on Windows)
 #define M_PI 3.14159265358979323846
@@ -105,6 +106,43 @@ bool resample44100To8000() { return resampleToneCommon(44100, 8000); }
 bool resample8000To44100() { return resampleToneCommon(8000, 44100); }
 bool resample48000To8000Tone() { return resampleToneCommon(48000, 8000); }
 
+bool linearResampleForPlots()
+{
+    // The linear variant (for plots only) must resample just like the
+    // default one, at the expected output count.
+    ResampleStep resampleStep(8000, 48000, true);
+    auto inputSineWave = std::unique_ptr<short[]>(generateOneSecondSineWave(2000, 8000), std::default_delete<short[]>());
+    int numOutputSamples = 0;
+    resampleStep.execute(inputSineWave.get(), 8000, &numOutputSamples);
+    if (numOutputSamples < 48000 * 0.9 || numOutputSamples > 48000 * 1.1)
+    {
+        std::cerr << "[linear resampling produced " << numOutputSamples << " samples, expected 48000]...";
+        return false;
+    }
+    return true;
+}
+
+bool negativeInputRateRejected()
+{
+    // A negative input rate can't size the resampler's one-second scratch
+    // array; the allocation must reject it.
+    bool rejected = false;
+    try
+    {
+        ResampleStep resampleStep(-10000, 48000);
+    }
+    catch (const std::bad_alloc&)
+    {
+        rejected = true;
+    }
+    if (!rejected)
+    {
+        std::cerr << "[negative input rate was accepted]...";
+        return false;
+    }
+    return true;
+}
+
 int main()
 {
     TEST_CASE(resampleEqual);
@@ -115,5 +153,7 @@ int main()
     TEST_CASE(resample44100To8000);
     TEST_CASE(resample8000To44100);
     TEST_CASE(resample48000To8000Tone);
+    TEST_CASE(linearResampleForPlots);
+    TEST_CASE(negativeInputRateRejected);
     return 0;
 }

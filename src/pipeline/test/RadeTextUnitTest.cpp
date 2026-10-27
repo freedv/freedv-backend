@@ -868,6 +868,85 @@ static bool test19_long_and_empty_callsigns()
     printf("Over-long and empty callsigns: %s\n\n", ok ? "PASS" : "FAIL");
     return ok;
 }
+// ---------------------------------------------------------------------------
+// Test 20: strlength larger than the string: generation must stop at the
+//          string's own terminator, so the frame decodes back to "AB"
+// ---------------------------------------------------------------------------
+static bool test20_string_shorter_than_strlength()
+{
+    printf("=== Test 20: strlength larger than the string ===\n");
+
+    rade_text_t tx = rade_text_create();
+    float syms[TOTAL_FLOATS];
+    memset(syms, 0, sizeof(syms));
+    rade_text_generate_tx_string(tx, "AB", 8, syms, TOTAL_FLOATS);
+    rade_text_destroy(tx);
+
+    RxState state = receiveFrame(syms);
+    bool ok = state.callCount == 1 && state.received == "AB";
+    printf("Received '%s' (%d callbacks): %s\n\n", state.received.c_str(), state.callCount,
+           ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
+// Test 21: a valid frame arrives on an instance that never had a rx callback
+//          set: the text is decoded but nothing is reported
+// ---------------------------------------------------------------------------
+static bool test21_valid_frame_without_rx_callback()
+{
+    printf("=== Test 21: valid frame received with no callback set ===\n");
+
+    rade_text_t tx = rade_text_create();
+    float syms[TOTAL_FLOATS];
+    memset(syms, 0, sizeof(syms));
+    rade_text_generate_tx_string(tx, "K6AQ", 4, syms, TOTAL_FLOATS);
+    rade_text_destroy(tx);
+
+    // Same frame through a normal receiver, to prove it is decodable.
+    RxState state = receiveFrame(syms);
+    bool decoded = state.callCount == 1 && state.received == "K6AQ";
+
+    // A receiver without a callback must swallow it silently.
+    rade_text_t rx = rade_text_create();
+    float copy[TOTAL_FLOATS];
+    memcpy(copy, syms, sizeof(copy));
+    rade_text_rx(rx, copy, TOTAL_SYMS);
+    rade_text_destroy(rx);
+
+    bool ok = decoded && state.callCount == 1;
+    printf("Callback receiver: '%s' (%d callbacks); callback-less receiver: silent: %s\n\n",
+           state.received.c_str(), state.callCount, ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
+// Test 22: symSize exactly equal to the LDPC payload (112 floats): no filler
+//          may be written past the payload, and the payload itself is the
+//          same as with a larger symSize
+// ---------------------------------------------------------------------------
+static bool test22_sym_size_equal_to_payload()
+{
+    printf("=== Test 22: symSize equal to the LDPC payload size ===\n");
+
+    rade_text_t tx = rade_text_create();
+    float full[TOTAL_FLOATS];
+    memset(full, 0, sizeof(full));
+    rade_text_generate_tx_string(tx, "K6AQ", 4, full, TOTAL_FLOATS);
+
+    float trimmed[TOTAL_FLOATS];
+    memset(trimmed, 0, sizeof(trimmed));
+    trimmed[PAYLOAD_FLOATS] = 7.0f; // sentinel: must survive, nothing written there
+    rade_text_generate_tx_string(tx, "K6AQ", 4, trimmed, PAYLOAD_FLOATS);
+    rade_text_destroy(tx);
+
+    bool ok = trimmed[PAYLOAD_FLOATS] == 7.0f &&
+              memcmp(trimmed, full, PAYLOAD_FLOATS * sizeof(float)) == 0;
+    printf("Payload identical to full-size generation, nothing written past float 112: %s\n\n",
+           ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 
 int main()
 {
@@ -892,6 +971,9 @@ int main()
     success &= test17_undefined_codes_dropped();
     success &= test18_unencodable_characters_skipped();
     success &= test19_long_and_empty_callsigns();
+    success &= test20_string_shorter_than_strlength();
+    success &= test21_valid_frame_without_rx_callback();
+    success &= test22_sym_size_equal_to_payload();
 
     printf("=== Overall: %s ===\n", success ? "PASS" : "FAIL");
     return success ? 0 : 1;

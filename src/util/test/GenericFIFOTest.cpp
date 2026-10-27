@@ -238,6 +238,127 @@ bool testConcurrentResetRace()
     return result;
 }
 
+// Several threads calling reset() at once must contend on the resetting_
+// CAS (the compare_exchange_weak retry side), and numUsed() sampled while
+// that churn is live has to hit the generation-mismatch window (it returns
+// 0 in that window rather than computing nonsense from mismatched
+// generations). The asserted invariant is the contract either way:
+// numUsed() must never return anything outside [0, NELEM].
+bool testConcurrentResetsAndNumUsed()
+{
+    std::cout << "Test 6 (Contended reset() and numUsed() generation guard): ";
+
+    constexpr int NELEM = 512;
+    std::vector<int> storage(NELEM, 0);
+    GenericFIFO<int> fifo(NELEM, storage.data());
+
+    std::atomic<bool> stop{ false };
+    std::atomic<std::uint64_t> samples{ 0 };
+    std::atomic<std::uint64_t> outOfRange{ 0 };
+    std::atomic<std::uint64_t> zeroSamples{ 0 };
+    std::atomic<std::uint64_t> resets{ 0 };
+
+    std::thread writer([&]() {
+        int buf[8];
+        for (int i = 0; i < 8; i++) buf[i] = i + 1;
+        while (!stop.load(std::memory_order_relaxed))
+        {
+            fifo.write(buf, 8);
+        }
+    });
+
+    std::vector<std::thread> workers;
+    for (int t = 0; t < 3; t++)
+    {
+        workers.emplace_back([&]() {
+            while (!stop.load(std::memory_order_relaxed))
+            {
+                fifo.reset();
+                resets.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+    for (int t = 0; t < 2; t++)
+    {
+        workers.emplace_back([&]() {
+            while (!stop.load(std::memory_order_relaxed))
+            {
+                int used = fifo.numUsed();
+                samples.fetch_add(1, std::memory_order_relaxed);
+                if (used < 0 || used > NELEM) outOfRange.fetch_add(1, std::memory_order_relaxed);
+                if (used == 0) zeroSamples.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+
+    std::this_thread::sleep_for(800ms);
+    stop.store(true, std::memory_order_relaxed);
+
+    writer.join();
+    for (auto& worker : workers) worker.join();
+
+    bool result = (outOfRange.load() == 0) && (samples.load() > 0) && (resets.load() > 0);
+
+    std::cout << (result ? "PASS" : "FAIL")
+              << " (samples=" << samples.load()
+              << " zero=" << zeroSamples.load()
+              << " resets=" << resets.load()
+              << " outOfRange=" << outOfRange.load() << ")\n";
+    return result;
+}
+
+// A FIFO fed an external buffer must use that buffer rather than allocate
+// its own, behave normally through write/read/reset, and not free the
+// caller's storage when it is destroyed (the ownBuffer_-false paths of the
+// constructor and destructor).
+bool testExternalBufferNotOwned()
+{
+    std::cout << "Test 7 (External buffer: used but not owned): ";
+
+    constexpr int NELEM = 64;
+    std::vector<int> storage(NELEM, 0);
+
+    bool result = true;
+
+    {
+        GenericFIFO<int> fifo(NELEM, storage.data());
+        result &= (fifo.capacity() == NELEM - 1);
+
+        int in[5] = { 11, 22, 33, 44, 55 };
+        int out[5] = { 0, 0, 0, 0, 0 };
+        result &= (fifo.write(in, 5) == 0);
+        result &= (fifo.numUsed() == 5);
+        result &= (fifo.numFree() == NELEM - 1 - 5);
+        result &= (fifo.read(out, 5) == 0);
+        result &= (out[0] == 11 && out[4] == 55);
+
+        // Fill to capacity and drain again, so the external buffer is
+        // exercised across a ring wraparound.
+        std::vector<int> filled(fifo.capacity());
+        std::vector<int> drained(fifo.capacity(), -1);
+        for (int i = 0; i < fifo.capacity(); i++) filled[i] = i + 1;
+        result &= (fifo.write(filled.data(), fifo.capacity()) == 0);
+        result &= (fifo.numFree() == 0);
+        result &= (fifo.read(drained.data(), fifo.capacity()) == 0);
+        bool allMatch = true;
+        for (int i = 0; i < fifo.capacity(); i++) allMatch &= (drained[i] == i + 1);
+        result &= allMatch;
+        result &= (fifo.numUsed() == 0);
+
+        fifo.reset();
+        result &= (fifo.numUsed() == 0);
+        result &= (fifo.write(in, 5) == 0);
+        result &= (fifo.numUsed() == 5);
+    }
+
+    // The FIFO is gone but the caller's buffer is still its own, intact
+    // storage (the destructor must not have deleted it).
+    result &= ((int)storage.size() == NELEM);
+
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    return result;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -249,6 +370,8 @@ int main(int argc, char** argv)
     result &= testWraparound();
     result &= testResetClearsData();
     result &= testConcurrentResetRace();
+    result &= testConcurrentResetsAndNumUsed();
+    result &= testExternalBufferNotOwned();
 
     return result ? 0 : -1;
 }

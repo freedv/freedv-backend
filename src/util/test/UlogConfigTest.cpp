@@ -36,6 +36,8 @@
 
 #include "../logging/ulog.h"
 #include "../logging/ulog_async.h"
+#include "../ulog_logger.h"
+#include <websocketpp/concurrency/basic.hpp>
 
 namespace {
 
@@ -294,6 +296,66 @@ bool testEventToCstr()
     return report(result);
 }
 
+// The websocketpp->ulog adapter (src/util/ulog_logger.h) is the logger type
+// SocketIoClient's custom_config installs. Exercise its channel bookkeeping
+// directly: enable/disable channels, the set_channels(none) shortcut (which
+// must clear everything and enable nothing), and the write() gate.
+bool testWebsocketppUlogAdapter()
+{
+    std::cout << "Test 7 (websocketpp ulog logger adapter channels): ";
+
+    websocketpp::log::ulog<websocketpp::concurrency::basic,
+        websocketpp::log::alevel> logger;
+
+    logger.set_channels(websocketpp::log::alevel::connect);
+    bool result = CHECK(logger.static_test(websocketpp::log::alevel::connect));
+    result &= CHECK(logger.dynamic_test(websocketpp::log::alevel::connect));
+    result &= CHECK(!logger.dynamic_test(websocketpp::log::alevel::fail));
+
+    std::string captured = captureStderr([&]() {
+        logger.write(websocketpp::log::alevel::connect, std::string("open"));
+        logger.write(websocketpp::log::alevel::fail, "must not appear");
+    });
+    result &= CHECK(contains(captured, "[connect] open"));
+    result &= CHECK(!contains(captured, "must not appear"));
+
+    logger.set_channels(websocketpp::log::alevel::none);
+    result &= CHECK(!logger.dynamic_test(websocketpp::log::alevel::connect));
+
+    logger.set_channels(websocketpp::log::alevel::all);
+    result &= CHECK(logger.dynamic_test(websocketpp::log::alevel::fail));
+    logger.clear_channels(websocketpp::log::alevel::all);
+    result &= CHECK(!logger.dynamic_test(websocketpp::log::alevel::fail));
+
+    return report(result);
+}
+
+// Edge inputs to ulog_event_to_cstr(): a zero-size buffer and one so large
+// fmemopen() cannot back it must both fail cleanly without touching the
+// caller's buffer.
+bool testEventToCstrEdges()
+{
+    std::cout << "Test 8 (ulog_event_to_cstr rejects zero/huge buffers): ";
+
+    struct tm tmBuf;
+    memset(&tmBuf, 0, sizeof(tmBuf));
+    tmBuf.tm_hour = 1;
+    tmBuf.tm_min = 2;
+    tmBuf.tm_sec = 3;
+
+    char out[8];
+    memset(out, 'X', sizeof(out));
+
+    bool result = CHECK(renderEvent(out, 0, &tmBuf, LOG_WARN, "no room") == -1);
+    result &= CHECK(out[0] == 'X' && out[sizeof(out) - 1] == 'X');
+
+    memset(out, 'X', sizeof(out));
+    result &= CHECK(renderEvent(out, (size_t)-1, &tmBuf, LOG_WARN, "huge %d", 1) == -1);
+    result &= CHECK(out[0] == 'X' && out[sizeof(out) - 1] == 'X');
+
+    return report(result);
+}
+
 } // namespace
 
 int main(int, char**)
@@ -306,6 +368,8 @@ int main(int, char**)
     result &= testSetLock();
     result &= testPrefixFn();
     result &= testEventToCstr();
+    result &= testWebsocketppUlogAdapter();
+    result &= testEventToCstrEdges();
 
     return result ? 0 : -1;
 }

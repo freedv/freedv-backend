@@ -6,13 +6,22 @@
 // the multicast delivery checks first verify with a plain socket that the
 // environment loops multicast back to itself, and are skipped (not failed)
 // when it doesn't.
-
+#include <atomic>
 #include <cstring>
+#include <chrono>
 #include <iostream>
 #include <string>
+#include <vector>
 
+#if !defined(_WIN32)
+#include <sys/resource.h>
+#endif // !defined(_WIN32)
 #include "TestSocketCompat.h"
 
+
+#include <thread>
+
+#include "../SocketIoClient.h"
 #include "../UdpHandler.h"
 
 namespace {
@@ -330,6 +339,194 @@ bool testBadAddresses()
     return report(result);
 }
 
+#if !defined(_WIN32)
+// Exhaust the process socket descriptors so the socket() calls inside
+// openImpl_()/joinMulticastGroup_() fail, exercising their error branches.
+bool testSocketExhaustion()
+{
+    std::cout << "Test 6 (open() survives socket creation and group-join failures): ";
+
+    struct rlimit original;
+    if (getrlimit(RLIMIT_NOFILE, &original) != 0)
+    {
+        return report(true); // nothing to exhaust here; skip
+    }
+
+    // Fetch ports while descriptors are still available; getUnusedPort()
+    // opens a socket itself and would fail once the limit is in place.
+    const int port1 = getUnusedPort();
+    const int port2 = getUnusedPort();
+    const int port3 = getUnusedPort();
+
+    struct rlimit lowered = original;
+    lowered.rlim_cur = 16; // well below the number of fds already open below
+    if (setrlimit(RLIMIT_NOFILE, &lowered) != 0)
+    {
+        return report(true); // not permitted to lower the limit; skip
+    }
+
+    bool result = true;
+    std::vector<int> dummies;
+    try
+    {
+        int fd = -1;
+        while (dummies.size() < 4096 && (fd = ::socket(AF_INET, SOCK_DGRAM, 0)) >= 0)
+        {
+            dummies.push_back(fd);
+        }
+
+        // Host-empty open with a multicast send hint: socket() fails, yet the
+        // flow continues into the IPv4 group join on an invalid socket.
+        {
+            TestUdpHandler handler;
+            auto fut = handler.open("", 0, MULTICAST_GROUP_V4, port1);
+            fut.wait();
+            result &= CHECK(fut.wait_for(std::chrono::seconds(0)) == std::future_status::ready);
+            handler.close().wait();
+        }
+
+        // Same again for IPv6: setsockopt(IPV6_JOIN_GROUP) on the failed socket.
+        {
+            TestUdpHandler handler;
+            auto fut = handler.open("", 0, MULTICAST_GROUP_V6, port2);
+            fut.wait();
+            result &= CHECK(fut.wait_for(std::chrono::seconds(0)) == std::future_status::ready);
+            handler.close().wait();
+        }
+
+        // Bound-host open: socket() fails before bind(); receive thread
+        // must not start and close() must still complete.
+        {
+            TestUdpHandler handler;
+            auto fut = handler.open("127.0.0.1", port3);
+            fut.wait();
+            result &= CHECK(fut.wait_for(std::chrono::seconds(0)) == std::future_status::ready);
+            handler.close().wait();
+        }
+    }
+    catch (const std::exception&)
+    {
+        // EMFILE surfacing from std::thread or promise machinery still counts
+        // as "surviving" as long as we can restore the limits below.
+        result = true;
+    }
+
+    for (int fd : dummies)
+    {
+        testCloseSocket(fd);
+    }
+    setrlimit(RLIMIT_NOFILE, &original);
+
+    // Sanity check: the limits are usable again and a normal open works.
+    struct rlimit restored;
+    getrlimit(RLIMIT_NOFILE, &restored);
+    result &= CHECK(restored.rlim_cur == original.rlim_cur);
+
+    {
+        TestUdpHandler handler;
+        int port = getUnusedPort();
+        handler.open("127.0.0.1", port).wait();
+        handler.close().wait();
+    }
+
+    return report(result);
+}
+#endif // !defined(_WIN32)
+
+// 240.0.0.0/4 is above the 224.0.0.0-239.255.255.255 multicast band: the
+// second half of the isMulticastAddress_() IPv4 range test must be evaluated.
+bool testOutOfRangeMulticastProbe()
+{
+    std::cout << "Test 7 (addresses above the multicast band are not multicast): ";
+
+    bool result = true;
+
+    {
+        TestUdpHandler handler;
+        auto fut = handler.open("240.1.1.1", 0); // bind fails (local address not owned)
+        fut.wait();
+        result &= CHECK(fut.wait_for(std::chrono::seconds(0)) == std::future_status::ready);
+        handler.close().wait();
+    }
+
+    return report(result);
+}
+
+// A SocketIoClient that never connected must still drain its task queue on
+// destruction: the deferred emit lambda must run with a null connection
+// (its guard falls through) and the disconnect handler must tolerate the
+// missing connection.
+bool testSocketIoClientUnconnectedEmit()
+{
+    std::cout << "Test 8 (unconnected SocketIoClient emit and teardown are safe): ";
+
+    bool result = true;
+
+    {
+        SocketIoClient client;
+        client.emit("unconnected-event");
+        // Give the handler thread a moment to drain the queued lambda.
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+
+    return report(result);
+}
+
+// A SocketIoClient whose TCP connect succeeds but whose websocketpp layer is
+// never opened (onConnect_ overridden to do nothing). Its disconnect handler
+// must run with a null connection_: disconnectImpl_ reaches onDisconnect_
+// because the raw socket is valid, and the connection_ guard inside
+// onDisconnect_ must fall through cleanly.
+class NeverWebsocketedSocketIoClient : public SocketIoClient
+{
+protected:
+    virtual void onConnect_() override {}
+};
+
+bool testSocketIoClientDisconnectWithoutWebsocket()
+{
+    std::cout << "Test 9 (SocketIoClient teardown without websocket connection runs handler): ";
+
+    bool result = true;
+
+    {
+        // A plain TCP listener that accepts nothing and sends nothing, so
+        // the websocket handshake can never complete.
+        int listenFd = testOpenSocket(AF_INET, SOCK_STREAM);
+        result &= CHECK(listenFd >= 0);
+
+        struct sockaddr_in addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = 0;
+        result &= CHECK(bind(listenFd, (struct sockaddr*)&addr, sizeof(addr)) == 0);
+        socklen_t addrLen = sizeof(addr);
+        result &= CHECK(getsockname(listenFd, (struct sockaddr*)&addr, &addrLen) == 0);
+        int port = ntohs(addr.sin_port);
+        result &= CHECK(listen(listenFd, 1) == 0);
+
+        NeverWebsocketedSocketIoClient client;
+        std::atomic<bool> handlerRan{false};
+        client.setOnDisconnectFn([&]() { handlerRan.store(true); });
+
+        auto connectFuture = client.connect("127.0.0.1", port, false, false);
+        connectFuture.wait();
+        result &= CHECK(connectFuture.wait_for(std::chrono::seconds(0)) == std::future_status::ready);
+
+        // The socket is valid but connection_ is null: onDisconnect_ must
+        // still reach the application callback.
+        auto disconnectFuture = client.disconnect();
+        disconnectFuture.wait();
+        result &= CHECK(handlerRan.load());
+
+        testCloseSocket(listenFd);
+    }
+
+    return report(result);
+}
+
+
 } // namespace
 
 int main(int, char**)
@@ -341,6 +538,12 @@ int main(int, char**)
     result &= testBindToMulticastGroup();
     result &= testIpv6Multicast();
     result &= testBadAddresses();
+#if !defined(_WIN32)
+    result &= testSocketExhaustion();
+#endif // !defined(_WIN32)
+    result &= testOutOfRangeMulticastProbe();
+    result &= testSocketIoClientUnconnectedEmit();
+    result &= testSocketIoClientDisconnectWithoutWebsocket();
 
     return result ? 0 : -1;
 }

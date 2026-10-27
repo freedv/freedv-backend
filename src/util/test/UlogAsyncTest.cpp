@@ -104,6 +104,30 @@ size_t countOccurrences(const std::string& hay, const std::string& needle)
     return n;
 }
 
+// Lock hook shared by the consumer-thread tests below. It is installed only
+// for the duration of those tests (mode != 0) and must never recurse: the
+// hook body itself never logs.
+std::atomic<int> g_hookMode{ 0 };   // 0 = inactive, 1 = raise level on first consumer call
+std::atomic<int> g_hookFired{ 0 };
+
+void lockHook(bool lock, void* /*arg*/)
+{
+    if (!lock || g_hookMode.load() == 0)
+    {
+        return;
+    }
+    // While the async front end is up, producers only enqueue -- they never
+    // reach lock(). A hook invocation with ulog_async_is_active() false is
+    // therefore running on the consumer thread.
+    if (ulog_async_is_active())
+    {
+        return;
+    }
+    if (g_hookMode.load() == 1 && g_hookFired.exchange(1) == 0)
+    {
+        ulog_set_level(LOG_ERROR);
+    }
+}
 // -------------------------------------------------------------------------
 
 bool testDeferredFormatting()
@@ -530,6 +554,166 @@ bool testLifecycleEdges()
     return result;
 }
 
+// The lock hook runs on the consumer thread when it emits (covers the
+// consumer-side branch of ulog_async_is_active()), and a level change made
+// from the hook mid-drain must suppress the remaining queued records.
+bool testConsumerSideLockHook()
+{
+    std::cout << "Test 12 (lock hook on consumer thread; mid-drain level change filters rest): ";
+
+    ulog_set_level(LOG_INFO);
+    g_hookFired.store(0);
+    g_hookMode.store(1);
+    ulog_set_lock(lockHook, nullptr);
+
+    std::string out = captureStderr([&]() {
+        log_info("hook-passes %d", 1);
+        log_info("hook-filtered %d", 2);
+        log_info("hook-filtered %d", 3);
+        ulog_async_flush();
+    });
+
+    ulog_set_lock(nullptr, nullptr);
+    g_hookMode.store(0);
+    ulog_set_level(LOG_INFO);
+
+    bool result = contains(out, "hook-passes 1") &&
+                  !contains(out, "hook-filtered 2") &&
+                  !contains(out, "hook-filtered 3") &&
+                  g_hookFired.load() == 1;
+
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    if (!result) std::cout << "---\n" << out << "---\n";
+    return result;
+}
+
+// Conversion forms the walker must classify but may not all get exercised by
+// the printf-parity tests: %c and %p, an unterminated '*' spec (mid-format and
+// at end of format -- the spec-length walker has to consume to end-of-string),
+// a trailing %n, and a multi-digit precision.
+bool testConversionClassificationEdges()
+{
+    std::cout << "Test 13 (%c, %p, unterminated '*' specs, trailing %n, multi-digit precision): ";
+
+    int probe = 0;
+    std::string out = captureStderr([&]() {
+        log_info("chr %c end", 'A');
+        log_info("ptr %p end", &probe);
+        log_info("star at end %5*");
+        log_info("star mid %5* %d end", 7);
+        log_info("dotstar at end %.*");
+        log_info("trailing-n %n");
+        log_info("precision %23.04lld end", 1234567890123LL);
+        log_info("misc %zu %jd %zd %u %hhd %c end", (size_t)11, (intmax_t)12, (ptrdiff_t)13, 14u, 15, 'Z');
+        ulog_async_flush();
+    });
+
+    bool result = contains(out, "chr A end") &&
+                  contains(out, "ptr 0x") &&
+                  contains(out, "star at end <?>") &&
+                  contains(out, "star mid <?>") &&
+                  contains(out, "dotstar at end <?>") &&
+                  contains(out, "trailing-n <?>") &&
+                  contains(out, "1234567890123") &&
+                  contains(out, "misc 11 12 13 14 15 Z end");
+
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    if (!result) std::cout << "---\n" << out << "---\n";
+    return result;
+}
+
+// An unsupported conversion and the truncation marker that land at the very
+// end of a render buffer must not exceed it: the "doesn't fit" sides of both
+// appends get exercised, and the record must still be emitted safely.
+bool testCapBoundaryAppend()
+{
+    std::cout << "Test 14 (unsupported conversion and truncation marker at render cap): ";
+
+    const std::size_t kStr = 160; // mirrors the private kStrMax cap in ulog_async.cpp
+    std::string probeFmt = "probeF" + std::string(505, 'q') + "%n";
+    unsigned long before = ulog_async_dropped_count();
+
+    // Three cap-boundary shapes:
+    //  a) long literal + %s: the conversion output runs exactly to the cap
+    //     and is cut, with no trailing conversion;
+    //  b) long literal + %s + %n: the <?> append lands when the buffer is
+    //     already full and must be refused;
+    //  c) long %s at a small offset: the <?> append lands exactly at the cap
+    //     boundary and is refused too.
+    // The truncated flag makes the consumer also try the fixed marker after
+    // a full buffer, which must be refused as well. None of these may crash
+    // or write past the buffer.
+    std::string out = captureStderr([&]() {
+        log_info("probeA %s %s %n", std::string(kStr, 'x').c_str(), std::string(140, 'y').c_str());
+        log_info("probeB %s %n", std::string(kStr - 60, 'z').c_str());
+        log_info("probeC %s %n", std::string(430, 'w').c_str());
+        log_info("probeD %s %n %s", std::string(370, 'v').c_str(), std::string(320, 'b').c_str());
+        log_info("probeE %s %lld", std::string(kStr, 'x').c_str(), 7LL);
+        log_info(probeFmt.c_str());
+        ulog_async_flush();
+    });
+
+    bool result = contains(out, "probeA") &&
+                  contains(out, "probeB") &&
+                  contains(out, "probeC") &&
+                  contains(out, "probeD") &&
+                  contains(out, "probeE") &&
+                  contains(out, "probeF") &&
+                  ulog_async_dropped_count() == before;
+
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    if (!result) std::cout << "---\n" << out.substr(0, 600) << "---\n";
+    return result;
+}
+
+// flush() polls (empty ring && consumer idle) up to 2000 times and gives up;
+// a producer outrunning the consumer must drive it through the full poll
+// budget and out the other side without hanging.
+bool testFlushPollBudgetExhaustion()
+{
+    std::cout << "Test 15 (flush gives up after its poll budget while producers outrun the consumer): ";
+
+    unsigned long before = ulog_async_dropped_count();
+    auto t0 = std::chrono::steady_clock::now();
+
+    std::atomic<bool> churn{ true };
+    std::atomic<bool> warmed{ false };
+    std::thread producer([&]() {
+        // Warm the ring first so flush() cannot observe an idle consumer
+        // before the churn thread has even started pushing.
+        for (int i = 0; i < 600; i++)
+        {
+            log_info("warm %d", 1);
+        }
+        warmed.store(true, std::memory_order_release);
+        while (churn.load(std::memory_order_relaxed))
+        {
+            log_info("churn %d", 1);
+        }
+    });
+
+    while (!warmed.load(std::memory_order_acquire))
+    {
+        std::this_thread::yield();
+    }
+
+    ulog_async_flush(); // must return on its own even though the ring never quiets
+
+    churn.store(false);
+    producer.join();
+    ulog_async_flush(); // second flush now that the churn stopped: drains fully
+
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+    unsigned long after = ulog_async_dropped_count();
+
+    bool result = after > before && elapsed >= 2000 && elapsed < 15000;
+
+    std::cout << (result ? "PASS" : "FAIL")
+              << " (elapsed=" << elapsed << "ms dropped+=" << (after - before) << ")\n";
+    return result;
+}
+
 } // namespace
 
 int main()
@@ -547,6 +731,10 @@ int main()
     result &= testLifecycleEdges();
     result &= testRemainingConversions();
     result &= testArgumentSpaceRunsOut();
+    result &= testConsumerSideLockHook();
+    result &= testConversionClassificationEdges();
+    result &= testCapBoundaryAppend();
+    result &= testFlushPollBudgetExhaustion();
 
     return result ? 0 : -1;
 }

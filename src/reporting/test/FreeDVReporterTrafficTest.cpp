@@ -7,18 +7,21 @@
 #include <csignal>
 #include <condition_variable>
 #include <cstdint>
+#include <atomic>
 #include <cstring>
 #include <functional>
 #include <iostream>
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <websocketpp/base64/base64.hpp>
 #include <websocketpp/sha1/sha1.hpp>
 
 #include "../FreeDVReporter.h"
+#include "../../util/SocketIoClient.h"
 #include "../../util/test/LoopbackTcpServer.h"
 
 #if defined(ENABLE_TLS_SUPPORT)
@@ -27,6 +30,15 @@
 #endif // defined(ENABLE_TLS_SUPPORT)
 
 using namespace std::chrono_literals;
+
+// Grants the one piece of reporter state needed to observe the reporter's own
+// disconnect cleanup. Kept at namespace scope to match the friend declaration
+// in FreeDVReporter.h.
+class FreeDVReporterTest
+{
+public:
+    static bool fullyConnected(const FreeDVReporter& reporter) { return reporter.isFullyConnected_.load(std::memory_order_relaxed); }
+};
 
 namespace {
 
@@ -205,6 +217,17 @@ public:
                 frame += (char)(((uint64_t)payload.size() >> shift) & 0xFF);
             }
         }
+        frame += payload;
+        return sendAll_(frame);
+    }
+
+    // Sends one unmasked binary (opcode 2) frame; the client's websocket
+    // layer must deliver it without disturbing the engine.io parser.
+    bool sendBinary(const std::string& payload)
+    {
+        std::string frame;
+        frame += (char)0x82;
+        frame += (char)payload.size();
         frame += payload;
         return sendAll_(frame);
     }
@@ -914,6 +937,136 @@ bool testSecureConnectionRejectsUntrustedServer(TestCertificate& cert)
     }
 }
 #endif // defined(ENABLE_TLS_SUPPORT)
+bool testDropWithoutReporterDisconnectCallback()
+{
+    std::cout << "Test 11 (dropped socket clears the connected gate with no reporter callback): ";
+
+    FakeReporterServer server;
+    CallbackLog log;
+    FreeDVReporter reporter(server.hostname(), "N1DQ", "CN98", "FreeDV Test", false);
+
+    // Deliberately no setOnReporterDisconnectFn(): the reporter's own cleanup
+    // has to run whether or not the application listens for it.
+    reporter.setConnectionSuccessfulFn([&]() { log.add("connection_successful"); });
+
+    bool result = CHECK(server.valid());
+    reporter.connect();
+    JsonDoc auth;
+    result &= CHECK(server.completeHandshake(auth));
+    result &= CHECK(server.sendEvent("connection_successful", "{}"));
+    result &= CHECK(log.waitFor("connection_successful"));
+    result &= CHECK(FreeDVReporterTest::fullyConnected(reporter));
+
+    server.dropConnection();
+
+    // The only witness is the gate the internal handler drops.
+    bool gateCleared = false;
+    for (int i = 0; i < 50 && !gateCleared; i++)
+    {
+        gateCleared = !FreeDVReporterTest::fullyConnected(reporter);
+        if (!gateCleared) std::this_thread::sleep_for(20ms);
+    }
+    result &= CHECK(gateCleared);
+    result &= CHECK((log.count("reporter_disconnect") == 0));
+
+    return report(result);
+}
+
+bool testNonTextWebsocketFrameIgnored()
+{
+    std::cout << "Test 12 (binary websocket frame shrugged off, connection stays healthy): ";
+
+    FakeReporterServer server;
+    CallbackLog log;
+    FreeDVReporter reporter(server.hostname(), "N1DQ", "CN98", "FreeDV Test", false);
+    registerCallbacks(reporter, log);
+
+    bool result = CHECK(server.valid());
+    reporter.connect();
+    JsonDoc auth;
+    result &= CHECK(server.completeHandshake(auth));
+    result &= CHECK(server.sendEvent("connection_successful", "{}"));
+    result &= CHECK(log.waitFor("connection_successful"));
+
+    // A non-text (binary, opcode 2) frame arrives on the websocket layer.
+    // The client must not feed it into the engine.io parser and must not
+    // disconnect.
+    result &= CHECK(server.sendBinary("bin\x01\x02junk"));
+
+    // engine.io pings are still answered (skipping any status frames the
+    // reporter pushes on its own schedule)...
+    std::string payload;
+    bool pongSeen = false;
+    result &= CHECK(server.sendText("2"));
+    for (int i = 0; i < 8 && !pongSeen; i++)
+    {
+        result &= CHECK(server.recvText(payload));
+        pongSeen = (payload == "3");
+    }
+    result &= CHECK(pongSeen);
+
+    // ...and events still reach the reporter callbacks.
+    result &= CHECK(server.sendEvent("message_update", R"({"sid":"s12","last_update":"u","message":"after binary"})"));
+    result &= CHECK(log.waitFor("message_update s12 after binary"));
+    result &= CHECK((log.count("reporter_disconnect") == 0));
+
+    return report(result);
+}
+
+bool testRawClientNoConnectFnAndNamelessEvent()
+{
+    std::cout << "Test 13 (raw SocketIoClient with no onConnect callback; '42[]' skipped): ";
+
+    FakeReporterServer server;
+    bool result = CHECK(server.valid());
+
+    SocketIoClient client;
+    std::atomic<bool> disconnectHappened{false};
+    std::atomic<bool> eventSeen{false};
+    client.setOnDisconnectFn([&]() { disconnectHappened.store(true); });
+    client.on("probe_event", [&](yyjson_val*) { eventSeen.store(true); });
+
+    // Minimal auth payload so the CONNECT packet parses; deliberately no
+    // setOnConnectFn(): the socket.io CONNECT ack ("40{...}") must be
+    // handled with a null onConnectFn_.
+    yyjson_mut_doc* doc = yyjson_mut_doc_new(nullptr);
+    yyjson_mut_val* authJson = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, authJson);
+    yyjson_mut_obj_add_str(doc, authJson, "role", "report");
+    client.setAuthDictionary(doc);
+
+    client.connect("127.0.0.1", server.port(), false, false);
+
+    JsonDoc gotAuth;
+    result &= CHECK(server.acceptWebSocket());
+    result &= CHECK(server.openAndReadAuth(gotAuth));
+    result &= CHECK((getStr(gotAuth.root(), "role") == "report"));
+    result &= CHECK(server.sendText(R"(40{"sid":"sio-test"})"));
+
+    // The client is alive despite the missing callback: engine.io pings get
+    // answered.
+    std::string payload;
+    result &= CHECK(server.sendText("2"));
+    result &= CHECK(server.recvText(payload));
+    result &= CHECK((payload == "3"));
+
+    // A socket.io event with no name at all: '42[]' parses, but the first
+    // array entry is null; the client must skip it and keep serving events.
+    result &= CHECK(server.sendText("42[]"));
+    result &= CHECK(server.sendEvent("probe_event", "{}"));
+
+    bool seen = false;
+    for (int i = 0; i < 250 && !seen; i++)
+    {
+        seen = eventSeen.load();
+        if (!seen) std::this_thread::sleep_for(20ms);
+    }
+    result &= CHECK(seen);
+    result &= CHECK((disconnectHappened.load() == false));
+
+    return report(result);
+}
+
 
 } // namespace
 
@@ -947,6 +1100,10 @@ int main(int, char**)
     result &= testSecureConnection(cert);
     result &= testSecureConnectionRejectsUntrustedServer(cert);
 #endif // defined(ENABLE_TLS_SUPPORT)
+
+    result &= testDropWithoutReporterDisconnectCallback();
+    result &= testNonTextWebsocketFrameIgnored();
+    result &= testRawClientNoConnectFnAndNamelessEvent();
 
     return result ? 0 : -1;
 }

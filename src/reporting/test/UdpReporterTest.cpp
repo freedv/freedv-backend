@@ -184,6 +184,42 @@ bool testRecordFrequencyFollowsArgumentNotFreqChange()
     std::cout << (result ? "PASS" : "FAIL") << "\n";
     return result;
 }
+bool testRecordWithInvalidUtf8IsNotSent()
+{
+    std::cout << "Test 4 (a record that cannot be serialised is dropped, not sent): ";
+
+    int port = 0;
+    int fd = makeLoopbackReceiver(port);
+    bool result = (fd >= 0);
+
+    if (result)
+    {
+        // Shorter than the harness default: this test only waits for a
+        // datagram that must not arrive.
+        testSetRecvTimeout(fd, 500);
+        {
+            UdpReporter reporter("127.0.0.1", port);
+
+            // 0xFF 0xFE is not valid UTF-8, so yyjson refuses to serialise
+            // the record; UdpReporter must drop it rather than emit a
+            // malformed or empty datagram.
+            reporter.addReceiveRecord("\xff\xfe", "1600X", 14236000, 3);
+
+            char buf[4096];
+            ssize_t len = recv(fd, buf, sizeof(buf), 0);
+            result &= (len < 0) && testLastRecvTimedOut();
+
+            // The same reporter still delivers a well formed record.
+            reporter.addReceiveRecord("N1DQ", "1600X", 14236000, -5);
+            result &= receiveAndValidateRecord(fd, "N1DQ", "1600X", -5, 14236000ULL);
+        }
+        testCloseSocket(fd);
+    }
+
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    return result;
+}
+
 
 } // namespace
 
@@ -194,6 +230,7 @@ int main(int argc, char** argv)
     result &= testReceiveRecordProducesValidJson();
     result &= testNonRecordMethodsSendNothing();
     result &= testRecordFrequencyFollowsArgumentNotFreqChange();
+    result &= testRecordWithInvalidUtf8IsNotSent();
 
     return result ? 0 : -1;
 }

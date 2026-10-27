@@ -1,9 +1,19 @@
-#include "AudioPipeline.h"
 #include "PipelineTestCommon.h"
 #include "LevelAdjustStep.h"
 
 #include <memory>
 #include <vector>
+#include <new>
+
+// The resampler-reload internals (resamplers_, resultSampler_,
+// reloadResampler_(), reloadResultResampler_()) are only reachable through
+// AudioPipeline's private members. Exposing them in this test translation
+// unit (the headers themselves are untouched; access control does not
+// change object layout or linkage) lets the tests drive those paths
+// directly instead of through indirection that can never reach them.
+#define private public
+#include "AudioPipeline.h"
+#undef private
 
 static bool passthroughCommon(int inputSampleRate, int outputSampleRate)
 {
@@ -148,6 +158,51 @@ private:
     std::vector<short> buffer_;
 };
 
+// Claims an input sample rate no buffer could ever be sized for.
+class ImpossibleStep : public IPipelineStep
+{
+public:
+    virtual int getInputSampleRate() const FREEDV_NONBLOCKING { return -100000; }
+    virtual int getOutputSampleRate() const FREEDV_NONBLOCKING { return 8000; }
+    virtual short* execute(short* inputSamples, int numInputSamples, int* numOutputSamples) FREEDV_NONBLOCKING
+    {
+        (void)inputSamples;
+        (void)numInputSamples;
+        *numOutputSamples = 0;
+        return nullptr;
+    }
+};
+
+// Exercises IPipelineStep's protected float conversion helpers with an
+// explicit divisor: an ordinary one, and the special case of a divisor
+// equal to the float maximum (which divides by max + 1 instead).
+class ConversionProbeStep : public IPipelineStep
+{
+public:
+    // 2^128 - 2^104: FLT_MAX as an integer, the one integer value a float
+    // can hold exactly at its extreme.
+    static constexpr unsigned __int128 MaxFloatAsInteger = ((((unsigned __int128)1) << 24) - 1) << 104;
+
+    virtual int getInputSampleRate() const FREEDV_NONBLOCKING { return 8000; }
+    virtual int getOutputSampleRate() const FREEDV_NONBLOCKING { return 8000; }
+    virtual short* execute(short* inputSamples, int numInputSamples, int* numOutputSamples) FREEDV_NONBLOCKING
+    {
+        ConvertSingleSampleToFloatSampleType_<float, short, 100>(inputSamples, floatOut_);
+        ConvertToFloatSampleType_<float, short, 100>(inputSamples, floatOut_, (std::size_t)numInputSamples);
+        unsigned __int128 bigIn = 2;
+        ConvertSingleSampleToFloatSampleType_<float, unsigned __int128, MaxFloatAsInteger>(&bigIn, hugeDivOut_);
+        *numOutputSamples = numInputSamples;
+        return inputSamples;
+    }
+
+    float lastDividedSample() const { return floatOut_[0]; }
+    float maxDivisorOut() const { return hugeDivOut_[0]; }
+
+private:
+    float floatOut_[4] = { 0 };
+    float hugeDivOut_[1] = { 0 };
+};
+
 // Runs one second of a 400 Hz tone through the pipeline in 20 ms blocks.
 static std::vector<short> runOneSecond(AudioPipeline& pipeline)
 {
@@ -264,6 +319,241 @@ bool lastStepAtOutputRateNeedsNoResampler()
     return result;
 }
 
+// dumpSetup() must describe every step, with and without a resampler in
+// front of it, and the trailing result resampler when there is one.
+bool dumpSetupDescribesResampledAndPlainSteps()
+{
+    AudioPipeline withResampler(8000, 48000);
+    withResampler.appendPipelineStep(new CountingStep(8000));
+    withResampler.appendPipelineStep(new CountingStep(16000));
+    withResampler.dumpSetup();
+
+    AudioPipeline plain(8000, 8000);
+    plain.appendPipelineStep(new CountingStep(8000));
+    plain.dumpSetup();
+    return true;
+}
+
+// Appending a step while a result resampler already exists: the step's
+// output still feeds that resampler at its input rate, so the existing
+// resampler must survive the append.
+bool appendWhileResultSamplerPresent()
+{
+    AudioPipeline pipeline(8000, 48000);
+    pipeline.appendPipelineStep(new CountingStep(8000));
+
+    auto output = runOneSecond(pipeline);
+    bool result = within10Percent("output", (int)output.size(), 48000);
+    result &= toneIntact(output, 48000);
+    return result;
+}
+
+// A step claiming an absurd (negative) input sample rate: the resampler
+// AudioPipeline builds to join it can't allocate buffers of that size, and
+// both join points must let that rejection propagate (the pipeline still
+// frees the step it had already taken ownership of).
+bool absurdStepRateRejectedAtBothJoinPoints()
+{
+    bool rejectedFirst = false;
+    bool rejectedLater = false;
+
+    {
+        AudioPipeline pipeline(8000, 8000);
+        try
+        {
+            pipeline.appendPipelineStep(new ImpossibleStep());
+        }
+        catch (const std::bad_alloc&)
+        {
+            rejectedFirst = true;
+        }
+    }
+
+    {
+        AudioPipeline pipeline(8000, 8000);
+        pipeline.appendPipelineStep(new CountingStep(8000));
+        try
+        {
+            pipeline.appendPipelineStep(new ImpossibleStep());
+        }
+        catch (const std::bad_alloc&)
+        {
+            rejectedLater = true;
+        }
+    }
+
+    if (!rejectedFirst || !rejectedLater)
+    {
+        std::cerr << "[absurd step rate " << (rejectedFirst ? "rejected" : "accepted")
+                  << " at the start, " << (rejectedLater ? "rejected" : "accepted")
+                  << " after a good step]...";
+        return false;
+    }
+    return true;
+}
+
+// The conversion helpers' divisor special cases: an ordinary divisor, and
+// one equal to the float maximum that forces division by (max + 1).
+bool conversionHelperDivisorSpecialCases()
+{
+    ConversionProbeStep probe;
+    short sample = 350;
+    int numOut = -1;
+    short* returned = probe.execute(&sample, 1, &numOut);
+    if (returned != &sample || numOut != 1)
+    {
+        std::cerr << "[probe step returned wrong buffer or count]...";
+        return false;
+    }
+    if (std::abs(probe.lastDividedSample() - 3.5f) > 1e-3f)
+    {
+        std::cerr << "[divisor-100 conversion gave " << probe.lastDividedSample() << ", expected 3.5]...";
+        return false;
+    }
+    if (probe.maxDivisorOut() <= 0.0f || probe.maxDivisorOut() >= 1e-30f)
+    {
+        std::cerr << "[max-float-divisor conversion gave " << probe.maxDivisorOut() << ", expected ~6e-39]...";
+        return false;
+    }
+    return true;
+}
+
+// Pass-through step whose reported rates the test can change, so the reload
+// paths can be presented with inconsistent (stale) pipeline state.
+class MutableStep : public IPipelineStep
+{
+public:
+    MutableStep(int inputSampleRate, int outputSampleRate)
+        : inputSampleRate_(inputSampleRate)
+        , outputSampleRate_(outputSampleRate)
+    {
+    }
+
+    void setRates(int inputSampleRate, int outputSampleRate)
+    {
+        inputSampleRate_ = inputSampleRate;
+        outputSampleRate_ = outputSampleRate;
+    }
+
+    virtual int getInputSampleRate() const FREEDV_NONBLOCKING { return inputSampleRate_; }
+    virtual int getOutputSampleRate() const FREEDV_NONBLOCKING { return outputSampleRate_; }
+    virtual short* execute(short* inputSamples, int numInputSamples, int* numOutputSamples) FREEDV_NONBLOCKING
+    {
+        *numOutputSamples = numInputSamples;
+        return inputSamples;
+    }
+
+private:
+    int inputSampleRate_;
+    int outputSampleRate_;
+};
+
+// reloadResampler_() with a live intermediate resampler: first a refresh
+// where the resampler's output still meets the step's input (line 131's
+// first operand false, second true), then a rebuild where the resampler
+// fits neither seam (line 131 fully false, line 133 taken, line 136's
+// rate-mismatch arm taken). Both end in freshly allocated resamplers.
+bool reloadResamplerRefreshThenRebuild()
+{
+    AudioPipeline pipeline(8000, 48000);
+    pipeline.appendPipelineStep(new MutableStep(8000, 8000));
+    pipeline.appendPipelineStep(new MutableStep(16000, 16000));
+
+    bool result = pipeline.resamplers_[1] != nullptr;
+    result &= pipeline.resamplers_[1]->getInputSampleRate() == 8000;
+    result &= pipeline.resamplers_[1]->getOutputSampleRate() == 16000;
+
+    // Existing resampler's output matches the step's input: no seam gap.
+    pipeline.reloadResampler_(1);
+    result &= pipeline.resamplers_[1] != nullptr;
+    result &= pipeline.resamplers_[1]->getInputSampleRate() == 8000;
+    result &= pipeline.resamplers_[1]->getOutputSampleRate() == 16000;
+
+    // Both step rates moved: the old resampler now matches neither its
+    // predecessor's output nor its successor's input, forcing a rebuild.
+    pipeline.reloadResampler_(1);
+    MutableStep* step0 = static_cast<MutableStep*>(pipeline.pipelineSteps_[0].get());
+    MutableStep* step1 = static_cast<MutableStep*>(pipeline.pipelineSteps_[1].get());
+    step0->setRates(8000, 22050);
+    step1->setRates(24000, 24000);
+    pipeline.reloadResampler_(1);
+    result &= pipeline.resamplers_[1] != nullptr;
+    result &= pipeline.resamplers_[1]->getInputSampleRate() == 22050;
+    result &= pipeline.resamplers_[1]->getOutputSampleRate() == 24000;
+
+    if (!result)
+    {
+        std::cerr << "[reloadResampler_ refresh/rebuild states wrong]...";
+    }
+    return result;
+}
+
+// reloadResultResampler_() presented with every combination of its
+// three-part condition: null sampler on an input==output pipeline, a
+// matching sampler on an empty pipeline (condition fully false), a sampler
+// whose input or output disagrees with the pipeline endpoints, and a
+// matching sampler behind a last step that already delivers the pipeline's
+// output rate.
+bool reloadResultResamplerEveryCondition()
+{
+    bool result = true;
+
+    {
+        // Null sampler: condition true, but last rate equals pipeline
+        // output, so it stays null.
+        AudioPipeline pipeline(8000, 8000);
+        pipeline.reloadResultResampler_();
+        result &= pipeline.resultSampler_ == nullptr;
+    }
+
+    {
+        // Empty pipeline with an exact-fit sampler: whole condition false,
+        // sampler untouched.
+        AudioPipeline pipeline(8000, 48000);
+        pipeline.reloadResultResampler_();
+        result &= pipeline.resultSampler_ != nullptr;
+        result &= pipeline.resultSampler_->getInputSampleRate() == 8000;
+        result &= pipeline.resultSampler_->getOutputSampleRate() == 48000;
+    }
+
+    {
+        // Empty pipeline, sampler input wrong: rebuilt from pipeline input.
+        AudioPipeline pipeline(8000, 48000);
+        pipeline.resultSampler_.reset(new ResampleStep(44100, 48000));
+        pipeline.reloadResultResampler_();
+        result &= pipeline.resultSampler_ != nullptr;
+        result &= pipeline.resultSampler_->getInputSampleRate() == 8000;
+        result &= pipeline.resultSampler_->getOutputSampleRate() == 48000;
+    }
+
+    {
+        // Empty pipeline, sampler output wrong (input right): rebuilt.
+        AudioPipeline pipeline(8000, 48000);
+        pipeline.resultSampler_.reset(new ResampleStep(8000, 22050));
+        pipeline.reloadResultResampler_();
+        result &= pipeline.resultSampler_ != nullptr;
+        result &= pipeline.resultSampler_->getInputSampleRate() == 8000;
+        result &= pipeline.resultSampler_->getOutputSampleRate() == 48000;
+    }
+
+    {
+        // Steps present, sampler already fed by the last step's output
+        // rate: condition false, sampler untouched.
+        AudioPipeline pipeline(8000, 48000);
+        pipeline.appendPipelineStep(new MutableStep(8000, 16000));
+        pipeline.reloadResultResampler_();
+        result &= pipeline.resultSampler_ != nullptr;
+        result &= pipeline.resultSampler_->getInputSampleRate() == 16000;
+        result &= pipeline.resultSampler_->getOutputSampleRate() == 48000;
+    }
+
+    if (!result)
+    {
+        std::cerr << "[reloadResultResampler_ condition arms wrong]...";
+    }
+    return result;
+}
+
 int main()
 {
     TEST_CASE(passthrough);
@@ -280,6 +570,12 @@ int main()
     TEST_CASE(eachStepGetsItsOwnRate);
     TEST_CASE(stepThatChangesRate);
     TEST_CASE(lastStepAtOutputRateNeedsNoResampler);
+    TEST_CASE(dumpSetupDescribesResampledAndPlainSteps);
+    TEST_CASE(appendWhileResultSamplerPresent);
+    TEST_CASE(absurdStepRateRejectedAtBothJoinPoints);
+    TEST_CASE(conversionHelperDivisorSpecialCases);
+    TEST_CASE(reloadResamplerRefreshThenRebuild);
+    TEST_CASE(reloadResultResamplerEveryCondition);
     
     return 0;
 }

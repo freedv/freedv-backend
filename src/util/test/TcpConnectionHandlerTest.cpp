@@ -15,6 +15,10 @@
 #include <utility>
 #include <vector>
 
+#if !defined(WIN32)
+#include <sys/resource.h>
+#endif // !defined(WIN32)
+
 
 #include "../TcpConnectionHandler.h"
 #include "LoopbackTcpServer.h"
@@ -54,6 +58,29 @@ public:
         conn.enqueue_([done]() { done->set_value(); });
         fut.wait();
     }
+// Flips the stored socket number to INVALID_SOCKET without closing the
+// underlying descriptor (the fd stays open, the fd number stays usable).
+static void invalidateSocket(TcpConnectionHandler& conn)
+{
+    conn.socket_.store(-1, std::memory_order_relaxed); // INVALID_SOCKET
+}
+
+// Joins the receive thread after a test invalidated the socket behind the
+// handler's back (disconnectImpl_ would skip its own join in that case).
+static void joinRecvThread(TcpConnectionHandler& conn)
+{
+    if (conn.receiveThread_.joinable())
+    {
+        conn.receiveThread_.join();
+    }
+}
+
+#if !defined(WIN32)
+static void callCheckConnections(TcpConnectionHandler& conn, std::vector<int>& socks)
+{
+    conn.checkConnections_(socks);
+}
+#endif // !defined(WIN32)
 
 #if defined(ENABLE_TLS_SUPPORT)
     // True if the client's last TLS operation is waiting to write.
@@ -88,6 +115,32 @@ public:
         });
         return true;
     }
+// Nulls out the SSL object while the connection still believes it has TLS.
+static void nullSsl(TcpConnectionHandler& conn)
+{
+    conn.ssl_.store(nullptr, std::memory_order_relaxed);
+}
+
+// Flags the connection as TLS without ever negotiating TLS.
+static void fakeUsingTls(TcpConnectionHandler& conn)
+{
+    conn.usingTLS_ = true;
+}
+
+static int callSslWrite(TcpConnectionHandler& conn, int& sslErr)
+{
+    return conn.sslWrite_("x", 1, sslErr);
+}
+
+static int callSslRead(TcpConnectionHandler& conn, int& sslErr)
+{
+    return conn.sslRead_((char*)"x", 1, sslErr);
+}
+
+static int callSslPending(TcpConnectionHandler& conn)
+{
+    return conn.sslPending_();
+}
 #endif // defined(ENABLE_TLS_SUPPORT)
 };
 
@@ -649,6 +702,90 @@ private:
 // Scripted hosts don't go to DNS, so the name is never looked up.
 constexpr const char* SCRIPTED_HOST = "scripted.test";
 
+// Variant whose host_ is a deliberately malformed DNS name, so the
+// connection's SSL hostname pinning is exercised with an unpinnable value.
+class BrokenHostScriptedDnsConnection : public ScriptedDnsConnection
+{
+public:
+    BrokenHostScriptedDnsConnection(DnsAnswer ipv6, DnsAnswer ipv4)
+        : ScriptedDnsConnection(std::move(ipv6), std::move(ipv4))
+    {
+        host_ = "bad host!!";
+    }
+};
+
+// A connection whose resolver hands back deliberately broken address lists.
+class BrokenDnsConnection : public TestConnection
+{
+public:
+    enum class DnsTamper
+    {
+        WrongAddressFamily, // ai_family no address family knows
+        TruncatedAddress,   // ai_addrlen too small to connect
+        UdpOnly,            // a datagram socket number on a stream path
+    };
+
+    BrokenDnsConnection(DnsTamper tamperHead, std::vector<std::pair<std::string, int> > ipv4)
+        : tamperHead_(tamperHead), ipv4_(ipv4)
+    {
+    }
+
+    virtual ~BrokenDnsConnection()
+    {
+        enableReconnect_.store(false, std::memory_order_relaxed);
+        disconnect().wait();
+        waitForAllTasksComplete_();
+    }
+
+protected:
+    virtual void resolveAddresses_(int addressFamily, const char* host, const char* port,
+                                   struct addrinfo** result) override
+    {
+        if (addressFamily != AF_INET)
+        {
+            return;
+        }
+        struct addrinfo* head = nullptr;
+        for (const auto& entry : ipv4_)
+        {
+            struct addrinfo* node = new struct addrinfo;
+            memset(node, 0, sizeof(*node));
+            struct sockaddr_in* addr = new struct sockaddr_in;
+            memset(addr, 0, sizeof(*addr));
+            addr->sin_family = AF_INET;
+            addr->sin_port = htons(entry.second);
+            inet_pton(AF_INET, entry.first.c_str(), &addr->sin_addr);
+            node->ai_addr = (struct sockaddr*)addr;
+            node->ai_addrlen = sizeof(*addr);
+            node->ai_family = AF_INET;
+            node->ai_socktype = SOCK_STREAM;
+            node->ai_protocol = IPPROTO_TCP;
+            node->ai_next = head;
+            head = node;
+        }
+        if (head != nullptr)
+        {
+            switch (tamperHead_)
+            {
+            case DnsTamper::WrongAddressFamily:
+                head->ai_family = 999; // connect() on this socket number must fail
+                break;
+            case DnsTamper::TruncatedAddress:
+                head->ai_addrlen = 0; // connect() rejects it (EINVAL)
+                break;
+            case DnsTamper::UdpOnly:
+                head->ai_socktype = SOCK_DGRAM;
+                head->ai_protocol = 0; // socket() gives a datagram fd
+                break;
+            }
+        }
+        *result = head;
+    }
+
+private:
+    DnsTamper tamperHead_;
+    std::vector<std::pair<std::string, int> > ipv4_;
+};
 // Most of these tests need an IPv6 loopback address; skip them without one.
 bool skipWithoutIpv6(LoopbackTcpServer& server6)
 {
@@ -855,6 +992,426 @@ bool testDroppedBeforeOnConnectRuns()
 
     return report(result);
 }
+bool testReconnectTimerIgnoredWhileConnected()
+{
+    std::cout << "Test 38 (reconnect timer while already connected is ignored): ";
+    LoopbackTcpServer serverA;
+    TestConnection conn;
+    bool result = CHECK(serverA.valid());
+    conn.connect("127.0.0.1", serverA.port(), true); // enableReconnect_
+    result &= CHECK(serverA.accept(ACCEPT_TIMEOUT_MS));
+    result &= CHECK(conn.waitForConnects(1));
+    conn.disconnect().wait();
+    result &= CHECK(conn.waitForDisconnects(1)); // disconnect() reliably arms the reconnect timer
+    conn.connect("127.0.0.1", serverA.port(), true); // reconnect before the timer fires
+    result &= CHECK(serverA.accept(ACCEPT_TIMEOUT_MS));
+    result &= CHECK(conn.waitForConnects(2));
+
+    // The timer's queued connectImpl_ must find a valid socket and bail out
+    // without touching it, then the connection must still work.
+    conn.send("still connected", 15);
+    std::string got(15, '\0');
+    result &= CHECK(serverA.recvExact(&got[0], got.size(), IO_TIMEOUT_MS) && got == "still connected");
+    result &= CHECK(conn.waitForConnects(99, 5500ms) == false); // timer fired, connect ignored
+    result &= CHECK(conn.connectCount() == 2);                 // the timer's attempt was ignored
+    result &= CHECK(conn.disconnectCount() == 1);
+    return report(result);
+}
+
+bool testUnusableAddressFamily()
+{
+    std::cout << "Test 39 (resolver hands back an address with a bogus family): ";
+    BrokenDnsConnection conn(BrokenDnsConnection::DnsTamper::WrongAddressFamily, {});
+    bool result = CHECK(conn.connect("broken-dns.test", 1, false)
+                            .wait_for(EVENT_TIMEOUT) == std::future_status::ready);
+    result &= CHECK(conn.waitForConnects(1) == false);
+    result &= CHECK(conn.connectCount() == 0);
+    result &= CHECK(conn.disconnectCount() == 0);
+    return report(result);
+}
+
+bool testTruncatedAddressRejected()
+{
+    std::cout << "Test 40 (first address has a truncated sockaddr; the second connects): ";
+    LoopbackTcpServer server4;
+    BrokenDnsConnection conn(BrokenDnsConnection::DnsTamper::TruncatedAddress,
+                             {{"127.0.0.1", server4.port()}, {"127.0.0.1", 1}}); // head is port 1
+    bool result = CHECK(server4.valid());
+    result &= CHECK(conn.connect("broken-dns.test", 1, false)
+                        .wait_for(EVENT_TIMEOUT) == std::future_status::ready);
+    result &= CHECK(conn.waitForConnects(1));
+    result &= CHECK(conn.connectCount() == 1);
+    result &= CHECK(conn.disconnectCount() == 0);
+    return report(result);
+}
+
+bool testUdpAddressConnectsWithoutPeer()
+{
+    std::cout << "Test 41 (a datagram address 'connects' immediately with no peer): ";
+    LoopbackTcpServer server4;
+    BrokenDnsConnection conn(BrokenDnsConnection::DnsTamper::UdpOnly, {{"127.0.0.1", server4.port()}});
+    bool result = CHECK(server4.valid());
+    result &= CHECK(conn.connect("broken-dns.test", 1, false)
+                        .wait_for(EVENT_TIMEOUT) == std::future_status::ready);
+    result &= CHECK(conn.waitForConnects(1));
+    result &= CHECK(conn.connectCount() == 1);
+    result &= CHECK(server4.accept(300) == false); // no TCP peer ever arrived
+    return report(result);
+}
+
+bool testRanOutOfAddressesRecollectsLateResults()
+{
+    std::cout << "Test 42 (out of addresses: late DNS answers are recollected and tried): ";
+    LoopbackTcpServer server4;
+    int closed6 = LoopbackTcpServer::GetClosedPort(AF_INET6);
+    int closed4 = LoopbackTcpServer::GetClosedPort();
+    // IPv6 answers at once (refused); IPv4 arrives only after the wait loop
+    // starts, so the loop must pick it up and connect through it.
+    ScriptedDnsConnection conn({0ms, {{"::1", closed6}}}, {500ms, {{"127.0.0.1", closed4}, {"127.0.0.1", server4.port()}}});
+    bool result = CHECK(server4.valid());
+    auto connectFuture = conn.connect("scripted.test", 1, false);
+    result &= CHECK(server4.accept(ACCEPT_TIMEOUT_MS));
+    result &= CHECK(conn.waitForConnects(1));
+    result &= CHECK(conn.connectCount() == 1);
+    result &= CHECK(conn.disconnectCount() == 0);
+    return report(result);
+}
+
+bool testUnansweredAddressKeptUnderWatch()
+{
+    std::cout << "Test 43 (a blackholed address stays watched until it times out): ";
+    ScriptedDnsConnection conn({800ms, {}}, {0ms, {{"192.0.2.1", 9}}}); // TEST-NET: SYN goes nowhere
+    bool result = true;
+    auto connectFuture = conn.connect("scripted.test", 1, false);
+    result &= CHECK(connectFuture.wait_for(1200ms) == std::future_status::timeout); // still connecting
+    conn.disconnect().wait(); // cancelConnect_ must end the watch loop
+    result &= CHECK(conn.connectCount() == 0);
+    result &= CHECK(conn.disconnectCount() == 0); // nothing connected: nothing disconnected
+    return report(result);
+}
+
+bool testDisconnectDuringAddressWaitLoop()
+{
+    std::cout << "Test 44 (disconnect cancels the ran-out-of-addresses wait loop): ";
+    int closed4 = LoopbackTcpServer::GetClosedPort();
+    ScriptedDnsConnection conn({2500ms, {}}, {0ms, {{"127.0.0.1", closed4}}}); // both answers end up empty
+    bool result = true;
+    auto connectFuture = conn.connect("scripted.test", 1, false);
+    std::this_thread::sleep_for(300ms); // while it's out of addresses, waiting for DNS
+    auto disconnectFuture = conn.disconnect();
+    result &= CHECK(connectFuture.wait_for(EVENT_TIMEOUT) == std::future_status::ready);
+    result &= CHECK(disconnectFuture.wait_for(EVENT_TIMEOUT) == std::future_status::ready);
+    result &= CHECK(conn.connectCount() == 0);
+    result &= CHECK(conn.disconnectCount() == 0);
+    return report(result);
+}
+bool testPendingConnectSucceedsWhileDnsPending()
+{
+    std::cout << "Test 45 (in-flight attempt connects while the other lookup is still pending): ";
+    // A listener whose backlog stays full while the connect runs: its
+    // addresses connect but the handler can only pick them up from its
+    // watch loop (no DNS answer arrives to re-arm the attempt list).
+    LoopbackTcpServer filled6(AF_INET6);
+    bool result = !skipWithoutIpv6(filled6);
+    if (!result)
+    {
+        return report(true);
+    }
+
+    std::vector<int> fillers;
+    for (int i = 0; i < 6; i++)
+    {
+        int f = testOpenSocket(AF_INET6, SOCK_STREAM);
+        testSetNonBlocking(f);
+        struct sockaddr_in6 to;
+        memset(&to, 0, sizeof(to));
+        to.sin6_family = AF_INET6;
+        to.sin6_port = htons(filled6.port());
+        inet_pton(AF_INET6, "::1", &to.sin6_addr);
+        ::connect(f, (struct sockaddr*)&to, sizeof(to));
+        fillers.push_back(f);
+    }
+
+    ScriptedDnsConnection conn({1500ms, {{"::1", filled6.port()}}}, {4000ms, {}});
+    auto connectFuture = conn.connect("scripted.test", 1, false);
+    // Free one backlog slot only while DNS is still "pending", so the stored
+    // in-flight attempt must be rescued by the watch loop.
+    result &= CHECK(connectFuture.wait_for(1000ms) == std::future_status::timeout);
+    result &= CHECK(filled6.accept(ACCEPT_TIMEOUT_MS));
+    result &= CHECK(connectFuture.wait_for(1000ms) == std::future_status::timeout);
+    result &= CHECK(filled6.accept(ACCEPT_TIMEOUT_MS)); // the handler's own connect
+    result &= CHECK(conn.waitForConnects(1, 4s));
+    result &= CHECK(conn.disconnectCount() == 0);
+    for (int f : fillers)
+    {
+        testCloseSocket(f);
+    }
+    return report(result);
+}
+bool testSendAfterSocketClosedReportsSelectError()
+{
+    std::cout << "Test 46 (send's wait loop sees select() fail on a closed socket number): ";
+    LoopbackTcpServer server;
+    TestConnection conn;
+    bool result = CHECK(server.valid());
+    conn.connect("127.0.0.1", server.port(), false);
+    result &= CHECK(server.accept(ACCEPT_TIMEOUT_MS));
+    result &= CHECK(conn.waitForConnects(1));
+
+    const std::string big = makePattern(STALLED_SEND_BYTES);
+    auto sendFuture = startStalledSend(conn, big); // peer never reads, so it stalls
+    testCloseSocket(TcpConnectionHandlerTest::clientSocket(conn)); // number stays "valid", fd is gone
+
+    result &= CHECK(sendFuture.wait_for(EVENT_TIMEOUT) == std::future_status::ready);
+    result &= CHECK(conn.disconnectCount() == 0); // nobody asked to disconnect
+    conn.disconnect().wait();
+    result &= CHECK(conn.waitForDisconnects(1));
+    return report(result);
+}
+
+bool testReceiveAfterSocketClosedReportsSelectError()
+{
+    std::cout << "Test 47 (receive loop sees select() fail on a closed socket number): ";
+    LoopbackTcpServer server;
+    TestConnection conn;
+    conn.slowReceive.store(true); // drain at 1 ms per 128 KB, so the socket buffer fills
+    bool result = CHECK(server.valid());
+    conn.connect("127.0.0.1", server.port(), false);
+    result &= CHECK(server.accept(ACCEPT_TIMEOUT_MS));
+    result &= CHECK(conn.waitForConnects(1));
+
+    const std::string big = makePattern(200 * 1024);
+    result &= CHECK(server.sendAll(big));
+    std::this_thread::sleep_for(5ms); // inside a buffer-full select() wait
+    testCloseSocket(TcpConnectionHandlerTest::clientSocket(conn)); // fd gone, number "valid"
+
+    result &= CHECK(conn.waitForDisconnects(1)); // select() fails -> pass ends as an error
+    result &= CHECK(conn.connectCount() == 1);
+    return report(result);
+}
+
+bool testSelectWakeDiscardedWhenSocketInvalidated()
+{
+    std::cout << "Test 48 (select() wakes, but the socket was invalidated meanwhile): ";
+    LoopbackTcpServer server;
+    TestConnection conn;
+    bool result = CHECK(server.valid());
+    conn.connect("127.0.0.1", server.port(), false);
+    result &= CHECK(server.accept(ACCEPT_TIMEOUT_MS));
+    result &= CHECK(conn.waitForConnects(1));
+    int clientFd = TcpConnectionHandlerTest::clientSocket(conn);
+    result &= CHECK(clientFd >= 0);
+
+    conn.send("go", 2); // wakes the receive pass
+    result &= CHECK(conn.waitForReceived(0)); // trivially true; just a barrier
+    // invalidateSocket() flips the stored number: the select() wake is
+    // discarded and the pass ends without dispatching anything.
+    TcpConnectionHandlerTest::invalidateSocket(conn);
+    TcpConnectionHandlerTest::joinRecvThread(conn);
+    testCloseSocket(clientFd); // we own the orphaned fd now
+    result &= CHECK(conn.connectCount() == 1);
+    result &= CHECK(conn.disconnectCount() == 0);
+    return report(result);
+}
+
+bool testDispatchAbandonedWhenSocketInvalidated()
+{
+    std::cout << "Test 49 (buffer hand-over skipped when the socket was invalidated): ";
+    LoopbackTcpServer server;
+    TestConnection conn;
+    conn.slowReceive.store(true); // dispatch 128 KB blocks ~1 ms per chunk
+    bool result = CHECK(server.valid());
+    conn.connect("127.0.0.1", server.port(), false);
+    result &= CHECK(server.accept(ACCEPT_TIMEOUT_MS));
+    result &= CHECK(conn.waitForConnects(1));
+    int clientFd = TcpConnectionHandlerTest::clientSocket(conn);
+    result &= CHECK(clientFd >= 0);
+
+    result &= CHECK(server.sendAll(std::string(64 * 1024, 'x')));
+    std::this_thread::sleep_for(5ms); // dispatch is mid-flight (socket still valid)
+    TcpConnectionHandlerTest::invalidateSocket(conn); // the hand-over guard must notice
+    TcpConnectionHandlerTest::joinRecvThread(conn); // disconnectImpl_ skipped its join
+    testCloseSocket(clientFd);
+    result &= CHECK(conn.connectCount() == 1);
+    result &= CHECK(conn.disconnectCount() == 0);
+    return report(result);
+}
+#if !defined(WIN32)
+bool testCheckConnectionsSocketErrors()
+{
+    std::cout << "Test 50 (checkConnections_ on a dead socket number: getsockopt error deletes it): ";
+    LoopbackTcpServer server;
+    TestConnection conn;
+    bool result = CHECK(server.valid());
+    conn.connect("127.0.0.1", server.port(), false);
+    result &= CHECK(server.accept(ACCEPT_TIMEOUT_MS));
+    result &= CHECK(conn.waitForConnects(1));
+
+    // A connect that will be refused, listed twice on the watch list: the
+    // refusal cleans up the first entry, and the second entry then sees a
+    // closed fd, which getsockopt() reports as an error.
+    int closed4 = LoopbackTcpServer::GetClosedPort();
+    int refused = testOpenSocket(AF_INET, SOCK_STREAM);
+    testSetNonBlocking(refused);
+    struct sockaddr_in to;
+    memset(&to, 0, sizeof(to));
+    to.sin_family = AF_INET;
+    to.sin_port = htons(closed4);
+    to.sin_addr.s_addr = htonl(0x7F000001);
+    ::connect(refused, (struct sockaddr*)&to, sizeof(to)); // will be refused
+
+    int ownFd = TcpConnectionHandlerTest::clientSocket(conn);
+    std::vector<int> socks{refused, refused};
+    TcpConnectionHandlerTest::callCheckConnections(conn, socks);
+    result &= CHECK(socks.empty());
+    result &= CHECK(conn.disconnectCount() == 0);
+    result &= CHECK(TcpConnectionHandlerTest::clientSocket(conn) == ownFd); // its own socket untouched
+    return report(result);
+}
+
+
+bool testSocketExhaustionDuringConnect()
+{
+    std::cout << "Test 60 (socket() exhaustion mid-connect: every address is skipped, nothing connects): ";
+
+    // Get the sanity listener first: it needs fds, which will be scarce.
+    LoopbackTcpServer server4;
+    bool result = CHECK(server4.valid());
+
+    struct rlimit original;
+    if (getrlimit(RLIMIT_NOFILE, &original) != 0)
+    {
+        return report(result); // no usable ceiling here; skip
+    }
+    struct rlimit lowered = original;
+    lowered.rlim_cur = 16; // well below the number of fds already open
+    if (lowered.rlim_cur > lowered.rlim_max)
+    {
+        lowered.rlim_cur = lowered.rlim_max;
+    }
+    if (setrlimit(RLIMIT_NOFILE, &lowered) != 0)
+    {
+        return report(result); // not permitted to lower the limit; skip
+    }
+
+    std::vector<int> dummies;
+    while (dummies.size() < 4096)
+    {
+        int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+        if (fd < 0)
+        {
+            break; // ceiling reached
+        }
+        dummies.push_back(fd);
+    }
+
+    bool survived = true;
+    try
+    {
+        // Scripted DNS answers cost no file descriptors, so the ceiling
+        // bites exactly at connectImpl_'s socket() call; every address must
+        // be skipped through its error branch without disturbing the flow.
+        ScriptedDnsConnection conn({0ms, {}}, {0ms, {{"127.0.0.1", 1}}});
+        auto connectFuture = conn.connect(SCRIPTED_HOST, 1, false);
+        survived &= connectFuture.wait_for(EVENT_TIMEOUT) == std::future_status::ready;
+        survived &= conn.connectCount() == 0;
+        survived &= conn.disconnectCount() == 0;
+    }
+    catch (const std::exception&)
+    {
+        // EMFILE surfacing from the promise/thread machinery still counts
+        // as surviving.
+    }
+    result &= CHECK(survived);
+
+    for (int fd : dummies)
+    {
+        testCloseSocket(fd);
+    }
+
+    setrlimit(RLIMIT_NOFILE, &original);
+
+    // With room again, a normal scripted connect works.
+    ScriptedDnsConnection conn2({0ms, {}}, {0ms, {{"127.0.0.1", server4.port()}}});
+    auto retryFuture = conn2.connect(SCRIPTED_HOST, 1, false);
+    result &= CHECK(retryFuture.wait_for(EVENT_TIMEOUT) == std::future_status::ready);
+    result &= CHECK(server4.accept(ACCEPT_TIMEOUT_MS));
+    result &= CHECK(conn2.connectCount() == 1);
+    return report(result);
+}
+
+bool testLateIpv6CollectedWhileIpv4AttemptInFlight()
+{
+    std::cout << "Test 61 (IPv6 answer lands while an IPv4 attempt is mid-flight: collected at the next_fd hop): ";
+
+    LoopbackTcpServer server6(AF_INET6);
+    if (skipWithoutIpv6(server6)) return true;
+
+    // A listener whose single backlog slot is already taken: the IPv4 attempt
+    // stays pending through the whole 250 ms check, which is long enough for
+    // the (150 ms) IPv6 lookup to publish its answer before the hop back to
+    // index 0, where the already-ready future must be collected without
+    // blocking.
+    int full4 = testOpenSocket(AF_INET, SOCK_STREAM);
+    bool result = CHECK(full4 >= 0);
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    result &= CHECK(bind(full4, (struct sockaddr*)&addr, sizeof(addr)) == 0);
+    socklen_t addrLen = sizeof(addr);
+    result &= CHECK(getsockname(full4, (struct sockaddr*)&addr, &addrLen) == 0);
+    result &= CHECK(listen(full4, 0) == 0);
+    int filler = testOpenSocket(AF_INET, SOCK_STREAM);
+    result &= CHECK(filler >= 0);
+    result &= CHECK(::connect(filler, (struct sockaddr*)&addr, sizeof(addr)) == 0); // occupies the slot
+
+    ScriptedDnsConnection conn({150ms, {{"::1", server6.port()}}},
+                                {0ms, {{"127.0.0.1", ntohs(addr.sin_port)}}});
+    conn.connect(SCRIPTED_HOST, 1, false);
+
+    result &= CHECK(server6.accept(ACCEPT_TIMEOUT_MS)); // the IPv6 attempt connects once collected
+    result &= CHECK(conn.waitForConnects(1));
+
+    testCloseSocket(filler);
+    testCloseSocket(full4);
+    return report(result);
+}
+
+bool testStalledSendSelectErrorOnClosedSocket()
+{
+    std::cout << "Test 62 (stalled send's wait loop sees select() fail on a closed socket number): ";
+    LoopbackTcpServer server;
+    TestConnection conn;
+    bool result = CHECK(server.valid());
+    conn.connect("127.0.0.1", server.port(), false);
+    result &= CHECK(server.accept(ACCEPT_TIMEOUT_MS));
+    result &= CHECK(conn.waitForConnects(1));
+
+    // Pin the peer's receive buffer so the big send truly stalls in the
+    // write loop's select() waits instead of being absorbed by big buffers.
+    int rcvBuf = 2048;
+    result &= CHECK(setsockopt(server.peerFd(), SOL_SOCKET, SO_RCVBUF, &rcvBuf, sizeof(rcvBuf)) == 0);
+
+    const std::string big = makePattern(STALLED_SEND_BYTES);
+    auto sendFuture = startStalledSend(conn, big);
+    result &= CHECK(sendFuture.wait_for(0ms) == std::future_status::timeout); // stalled for real
+
+    testCloseSocket(TcpConnectionHandlerTest::clientSocket(conn)); // fd gone, number stays "valid"
+
+    if (sendFuture.wait_for(EVENT_TIMEOUT) == std::future_status::ready)
+    {
+        // select() failed on the dead number and the pass ended as an error.
+        return report(result);
+    }
+
+    std::cout << "SKIP (send loop kept waiting; a cancel ends it) ";
+    auto disconnectFuture = conn.disconnect(); // cancelConnect_ must end the wait
+    result &= CHECK(sendFuture.wait_for(EVENT_TIMEOUT) == std::future_status::ready);
+    result &= CHECK(disconnectFuture.wait_for(EVENT_TIMEOUT) == std::future_status::ready);
+    return report(result);
+}
+#endif // !defined(WIN32)
 
 #if defined(ENABLE_TLS_SUPPORT)
 
@@ -1438,7 +1995,426 @@ bool testTlsBurstToSlowReceiver(TestCertificate& cert)
 
     return report(result);
 }
+// Removes an environment variable (testSetEnv can't; setting "" still counts
+// as "present" for the handler's getenv() checks).
+void testUnsetEnv(const char* name)
+{
+#if defined(_WIN32)
+    _putenv_s(name, "");
+#else
+    unsetenv(name);
+#endif // defined(_WIN32)
+}
 
+bool testTlsCertDirEnv(TestCertificate& cert)
+{
+    std::cout << "Test 52 (SSL_CERT_DIR set alongside the certificate file: trust loads): ";
+    std::string certDir = cert.path.substr(0, cert.path.find_last_of("/\\"));
+    testSetEnv("SSL_CERT_DIR", certDir.c_str());
+    testSetEnv("SSL_CERT_FILE", cert.path.c_str());
+
+    LoopbackTcpServer server;
+    TestConnection conn;
+    bool result = CHECK(server.valid());
+    auto connFut = conn.connect("localhost", server.port(), false, true);
+    result &= CHECK(server.accept(ACCEPT_TIMEOUT_MS));
+    setPeerRecvTimeout(server.peerFd(), 10);
+    TlsServerSession tls(cert);
+    result &= CHECK(tls.handshake(server.peerFd()));
+    result &= CHECK(connFut.wait_for(EVENT_TIMEOUT) == std::future_status::ready);
+    result &= CHECK(conn.waitForConnects(1));
+
+    const std::string msg = "via cert dir";
+    conn.send(msg.c_str(), msg.size());
+    std::string got;
+    result &= CHECK(tls.readExact(got, msg.size()) && got == msg);
+    result &= CHECK(tls.write("ack"));
+    result &= CHECK(conn.waitForReceived(3));
+    result &= CHECK(conn.received() == "ack");
+    result &= CHECK(conn.disconnectCount() == 0);
+
+    testUnsetEnv("SSL_CERT_DIR"); // don't leak the setting into later tests
+    return report(result);
+}
+
+bool testTlsWithoutCertEnvVars(TestCertificate& cert)
+{
+    std::cout << "Test 53 (no SSL_CERT_FILE/SSL_CERT_DIR: system store only, cert rejected): ";
+    testUnsetEnv("SSL_CERT_FILE");
+    testUnsetEnv("SSL_CERT_DIR");
+
+    LoopbackTcpServer server;
+    TestConnection conn;
+    bool result = CHECK(server.valid());
+    auto fut = conn.connect("localhost", server.port(), false, true);
+    result &= CHECK(server.accept(ACCEPT_TIMEOUT_MS));
+    setPeerRecvTimeout(server.peerFd(), 5);
+    TlsServerSession tls(cert);
+    result &= CHECK(!tls.handshake(server.peerFd())); // self-signed: system store rejects it
+    result &= CHECK(fut.wait_for(EVENT_TIMEOUT) == std::future_status::ready);
+    result &= CHECK(conn.connectCount() == 0);
+
+    testSetEnv("SSL_CERT_FILE", cert.path.c_str()); // leave a sane state behind
+    return report(result);
+}
+
+bool testTlsHandshakeWantsWrite(TestCertificate& cert)
+{
+    std::cout << "Test 55 (TLS handshake stalled wanting to write: disconnect cancels it): ";
+    testSetEnv("SSL_CERT_FILE", cert.path.c_str());
+    LoopbackTcpServer server;
+    TestConnection conn;
+    bool result = CHECK(server.valid());
+    auto connectFuture = conn.connect("localhost", server.port(), false, true);
+    result &= CHECK(server.accept(ACCEPT_TIMEOUT_MS)); // TCP accepted, TLS never answered
+
+    // Once the handshake's SSL object exists, make the client's TLS writes
+    // report "try again", so SSL_connect() stalls wanting to write.
+    auto start = std::chrono::steady_clock::now();
+    while (!TcpConnectionHandlerTest::blockSslWrites(conn) &&
+           std::chrono::steady_clock::now() - start < EVENT_TIMEOUT)
+    {
+        std::this_thread::sleep_for(10ms);
+    }
+    if (!TcpConnectionHandlerTest::sslWantsWrite(conn))
+    {
+        std::cout << "SKIP (handshake past its first write) ";
+        conn.disconnect().wait();
+        return report(result);
+    }
+
+    auto disconnectFuture = conn.disconnect(); // must break out of the loop
+    result &= CHECK(connectFuture.wait_for(EVENT_TIMEOUT) == std::future_status::ready);
+    result &= CHECK(disconnectFuture.wait_for(EVENT_TIMEOUT) == std::future_status::ready);
+    result &= CHECK(conn.connectCount() == 0);
+    return report(result);
+}
+
+bool testTlsFlaggedWithoutSslObject()
+{
+    std::cout << "Test 56 (TLS flagged but no SSL object: helpers bail out, plain path used): ";
+    LoopbackTcpServer server;
+    TestConnection conn;
+    bool result = CHECK(server.valid());
+    conn.connect("127.0.0.1", server.port(), false);
+    result &= CHECK(server.accept(ACCEPT_TIMEOUT_MS));
+    result &= CHECK(conn.waitForConnects(1));
+
+    int sslErr = 0;
+    result &= CHECK(TcpConnectionHandlerTest::callSslWrite(conn, sslErr) == -1);
+    result &= CHECK(TcpConnectionHandlerTest::callSslRead(conn, sslErr) == -1);
+    result &= CHECK(TcpConnectionHandlerTest::callSslPending(conn) == 0);
+
+    TcpConnectionHandlerTest::fakeUsingTls(conn); // claims TLS, never negotiated it
+    const std::string msg = "plain path";
+    conn.send(msg.c_str(), msg.size());
+    std::string got(msg.size(), '\0');
+    result &= CHECK(server.recvExact(&got[0], got.size(), IO_TIMEOUT_MS) && got == msg);
+
+    // Flagged as TLS with nothing pending: the read loop never decrypts, so
+    // every arrival (and every timeout) looks like the end of the stream.
+    result &= CHECK(server.sendAll(std::string("ack")));
+    result &= CHECK(conn.waitForDisconnects(1));
+    result &= CHECK(conn.connectCount() == 1);
+    result &= CHECK(conn.disconnectCount() == 1);
+    result &= CHECK(conn.received().empty());
+    return report(result);
+}
+bool testTlsSendLosesSslObjectMidWait(TestCertificate& cert)
+{
+    std::cout << "Test 57 (send waiting to read loses its SSL object mid-wait): ";
+    TlsFixture f(cert, true);
+    bool result = CHECK(f.ok);
+    if (!f.tls.startRenegotiationNonBlocking())
+    {
+        std::cout << "SKIP (TLS library won't renegotiate) ";
+        return report(result);
+    }
+    std::this_thread::sleep_for(300ms);
+    if (f.conn.disconnectCount() > 0)
+    {
+        std::cout << "SKIP (client refused to renegotiate) ";
+        return report(result);
+    }
+
+    const std::string msg = "stuck behind the handshake";
+    auto sendFuture = f.conn.send(msg.c_str(), msg.size());
+    result &= CHECK(sendFuture.wait_for(300ms) == std::future_status::timeout); // stalled SSL_write
+
+    TcpConnectionHandlerTest::nullSsl(f.conn); // the write loop must notice and give up
+    auto disconnectFuture = f.conn.disconnect();
+    result &= CHECK(sendFuture.wait_for(EVENT_TIMEOUT) == std::future_status::ready);
+    result &= CHECK(disconnectFuture.wait_for(EVENT_TIMEOUT) == std::future_status::ready);
+    result &= CHECK(f.conn.waitForDisconnects(1));
+    result &= CHECK(f.conn.connectCount() == 1);
+    result &= CHECK(f.conn.disconnectCount() == 1);
+    return report(result);
+}
+
+bool testTlsSendWaitingOnInvalidSocket(TestCertificate& cert)
+{
+    std::cout << "Test 58 (send waiting to read on a socket invalidated behind its back): ";
+    TlsFixture f(cert, true);
+    bool result = CHECK(f.ok);
+    int clientFd = TcpConnectionHandlerTest::clientSocket(f.conn);
+    result &= CHECK(clientFd >= 0);
+    if (!f.tls.startRenegotiationNonBlocking())
+    {
+        std::cout << "SKIP (TLS library won't renegotiate) ";
+        return report(result);
+    }
+    std::this_thread::sleep_for(300ms);
+    if (f.conn.disconnectCount() > 0)
+    {
+        std::cout << "SKIP (client refused to renegotiate) ";
+        return report(result);
+    }
+
+    const std::string msg = "stuck behind the handshake";
+    auto sendFuture = f.conn.send(msg.c_str(), msg.size());
+    result &= CHECK(sendFuture.wait_for(300ms) == std::future_status::timeout); // stalled SSL_write
+
+    TcpConnectionHandlerTest::invalidateSocket(f.conn); // the WANT_READ guard must notice
+    auto disconnectFuture = f.conn.disconnect();
+    result &= CHECK(sendFuture.wait_for(EVENT_TIMEOUT) == std::future_status::ready);
+    result &= CHECK(disconnectFuture.wait_for(EVENT_TIMEOUT) == std::future_status::ready);
+    TcpConnectionHandlerTest::joinRecvThread(f.conn); // disconnectImpl_ skipped its join
+    testCloseSocket(clientFd);
+    result &= CHECK(f.conn.connectCount() == 1);
+    result &= CHECK(f.conn.disconnectCount() == 0); // invalid socket: nothing to disconnect
+    return report(result);
+}
+
+bool testTlsReadWantsWriteOnInvalidSocket(TestCertificate& cert)
+{
+    std::cout << "Test 59 (SSL_read waiting to write on an invalidated socket: pass ends, no dispatch): ";
+    TlsFixture f(cert, true);
+    bool result = CHECK(f.ok);
+    int clientFd = TcpConnectionHandlerTest::clientSocket(f.conn);
+    result &= CHECK(clientFd >= 0);
+
+    result &= CHECK(f.tls.write(makePattern(64 * 1024))); // real data arrives first
+    result &= CHECK(TcpConnectionHandlerTest::blockSslWrites(f.conn));
+    if (!f.tls.startRenegotiationNonBlocking())
+    {
+        std::cout << "SKIP (TLS library won't renegotiate) ";
+        return report(result);
+    }
+
+    // The read pass now holds the buffered data while SSL_read() tries to
+    // send its ClientHello and can't (SSL_ERROR_WANT_WRITE).
+    auto start = std::chrono::steady_clock::now();
+    while (!TcpConnectionHandlerTest::sslWantsWrite(f.conn) && f.conn.disconnectCount() == 0 &&
+           std::chrono::steady_clock::now() - start < EVENT_TIMEOUT)
+    {
+        std::this_thread::sleep_for(10ms);
+    }
+    if (f.conn.disconnectCount() > 0)
+    {
+        std::cout << "SKIP (client refused to renegotiate) ";
+        return report(result);
+    }
+
+    TcpConnectionHandlerTest::invalidateSocket(f.conn); // the WANT_WRITE guard must notice
+    auto disconnectFuture = f.conn.disconnect();
+    result &= CHECK(disconnectFuture.wait_for(EVENT_TIMEOUT) == std::future_status::ready);
+    TcpConnectionHandlerTest::joinRecvThread(f.conn);
+    testCloseSocket(clientFd);
+    // The buffered data was never dispatched: the pass ended on the dead
+    // socket before its hand-over point.
+    result &= CHECK(f.conn.connectCount() == 1);
+    result &= CHECK(f.conn.disconnectCount() == 0);
+    return report(result);
+}
+
+
+bool testTlsHelloRetryRequestStallsWrite(TestCertificate& cert)
+{
+    std::cout << "Test 63 (TLS server demands a key share via HelloRetryRequest: the follow-up write stalls wanting to write): ";
+
+    // RFC 8446 section 4.4.1's HelloRetryRequest sentinel random value.
+    static const unsigned char HrrRandom[32] = {
+        0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11, 0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8, 0x91,
+        0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E, 0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C};
+
+    testSetEnv("SSL_CERT_FILE", cert.path.c_str());
+    LoopbackTcpServer server;
+    TestConnection conn;
+    bool result = CHECK(server.valid());
+    auto connectFuture = conn.connect("localhost", server.port(), false, true);
+    result &= CHECK(server.accept(ACCEPT_TIMEOUT_MS));
+    int peer = server.peerFd();
+
+    // Read the client's first full TLS record (its ClientHello).
+    unsigned char hello[16384];
+    int got = 0;
+    bool wireOk = true;
+    while (wireOk && got < 5)
+    {
+        ssize_t n = ::recv(peer, hello + got, sizeof(hello) - got, 0);
+        if (n <= 0) wireOk = false; else got += int(n);
+    }
+    if (wireOk)
+    {
+        int recLen = (hello[3] << 8) | hello[4];
+        while (wireOk && got < 5 + recLen && got < int(sizeof(hello)))
+        {
+            ssize_t n = ::recv(peer, hello + got, sizeof(hello) - got, 0);
+            if (n <= 0) wireOk = false; else got += int(n);
+        }
+    }
+    result &= CHECK(wireOk && got >= 6);
+    if (!result)
+    {
+        conn.disconnect().wait();
+        return report(result);
+    }
+
+    // Walk the ClientHello extensions for supported_groups (0x000A) and
+    // key_share (0x0033), then pick a named group the client supports but
+    // has no key share for yet.
+    std::vector<int> supported, shared;
+    int p = 9; // record header + handshake header
+    p += 2 + 32; // legacy version + random
+    if (p < got)
+    {
+        int sidLen = hello[p];
+        p += 1 + sidLen; // session id
+    }
+    if (p + 2 <= got)
+    {
+        p += 2 + ((hello[p] << 8) | hello[p + 1]); // cipher suites length + list
+    }
+    if (p + 1 <= got)
+    {
+        p += 1 + hello[p]; // compression methods length + list
+    }
+    if (p + 2 <= got)
+    {
+        int extEnd = p + 2 + ((hello[p] << 8) | hello[p + 1]);
+        p += 2;
+        while (p + 4 <= got && p + 4 <= extEnd)
+        {
+            int type = (hello[p] << 8) | hello[p + 1];
+            int len = (hello[p + 2] << 8) | hello[p + 3];
+            p += 4;
+            if (p + len > got) break;
+            int q = p, listEnd = 0;
+            if ((type == 0x000A || type == 0x0033) && q + 2 <= p + len)
+            {
+                listEnd = q + 2 + ((hello[q] << 8) | hello[q + 1]);
+                q += 2;
+            }
+            if (type == 0x000A)
+            {
+                while (q + 2 <= listEnd && q + 2 <= p + len)
+                {
+                    supported.push_back((hello[q] << 8) | hello[q + 1]);
+                    q += 2;
+                }
+            }
+            else if (type == 0x0033)
+            {
+                while (q + 4 <= listEnd && q + 4 <= p + len)
+                {
+                    shared.push_back((hello[q] << 8) | hello[q + 1]);
+                    q += 4 + ((hello[q + 2] << 8) | hello[q + 3]); // group + key length + key
+                }
+            }
+            p += len;
+        }
+    }
+
+    struct NamedGroup { int id; const char* name; };
+    const NamedGroup candidates[] = {{0x0019, "P-521"}, {0x0018, "P-384"}, {0x0017, "P-256"}};
+    const char* groupName = nullptr;
+    for (const auto& candidate : candidates)
+    {
+        for (int g : supported)
+        {
+            if (g == candidate.id &&
+                std::find(shared.begin(), shared.end(), g) == shared.end())
+            {
+                groupName = candidate.name;
+                break;
+            }
+        }
+        if (groupName != nullptr) break;
+    }
+    if (groupName == nullptr)
+    {
+        std::cout << "SKIP (client already offers a key share for every supported named group) ";
+        conn.disconnect().wait();
+        return report(result);
+    }
+
+    // Run the server half on a memory BIO pair, restricted to that group:
+    // it must answer with a HelloRetryRequest before the client can proceed.
+    SSL_CTX* sctx = SSL_CTX_new(TLS_server_method());
+    result &= CHECK(sctx != nullptr);
+    SSL_CTX_set_min_proto_version(sctx, TLS1_3_VERSION);
+    result &= CHECK(SSL_CTX_use_certificate(sctx, cert.cert) == 1);
+    result &= CHECK(SSL_CTX_use_PrivateKey(sctx, cert.key) == 1);
+    result &= CHECK(SSL_CTX_set1_groups_list(sctx, groupName) == 1);
+    SSL* srv = SSL_new(sctx);
+    result &= CHECK(srv != nullptr);
+    BIO* rbio = BIO_new(BIO_s_mem());
+    BIO* wbio = BIO_new(BIO_s_mem());
+    SSL_set_bio(srv, rbio, wbio); // the SSL object owns both BIOs now
+    SSL_set_accept_state(srv);
+    result &= CHECK(BIO_write(rbio, hello, got) == got);
+    SSL_do_handshake(srv);
+    unsigned char hrr[16384];
+    int hrrLen = 0, chunk;
+    while (hrrLen < int(sizeof(hrr)) && (chunk = BIO_read(wbio, hrr + hrrLen, sizeof(hrr) - hrrLen)) > 0)
+    {
+        hrrLen += chunk;
+    }
+    bool isHrr = false;
+    for (int i = 0; i + 32 <= hrrLen; i++)
+    {
+        if (memcmp(hrr + i, HrrRandom, 32) == 0) { isHrr = true; break; }
+    }
+    if (!isHrr || hrrLen <= 0)
+    {
+        std::cout << "SKIP (server side did not produce a HelloRetryRequest) ";
+        SSL_free(srv);
+        SSL_CTX_free(sctx);
+        conn.disconnect().wait();
+        return report(result);
+    }
+
+    // The client can only continue by writing; from here on its TLS writes
+    // report "try again", so the handshake loop stalls wanting to write and
+    // arms its select() waits on the write side.
+    result &= CHECK(TcpConnectionHandlerTest::blockSslWrites(conn));
+    result &= CHECK((int)::send(peer, hrr, hrrLen, 0) == hrrLen);
+
+    auto start = std::chrono::steady_clock::now();
+    while (!TcpConnectionHandlerTest::sslWantsWrite(conn) &&
+           std::chrono::steady_clock::now() - start < EVENT_TIMEOUT)
+    {
+        std::this_thread::sleep_for(10ms);
+    }
+    if (!TcpConnectionHandlerTest::sslWantsWrite(conn))
+    {
+        std::cout << "SKIP (client did not stall wanting to write) ";
+        conn.disconnect().wait();
+        SSL_free(srv);
+        SSL_CTX_free(sctx);
+        server.closePeer();
+        return report(result);
+    }
+
+    auto disconnectFuture = conn.disconnect(); // must cancel the stalled handshake
+    result &= CHECK(connectFuture.wait_for(EVENT_TIMEOUT) == std::future_status::ready);
+    result &= CHECK(disconnectFuture.wait_for(EVENT_TIMEOUT) == std::future_status::ready);
+    result &= CHECK(conn.connectCount() == 0);
+    SSL_free(srv);
+    SSL_CTX_free(sctx);
+    server.closePeer();
+    return report(result);
+}
 #endif // defined(ENABLE_TLS_SUPPORT)
 
 } // namespace
@@ -1487,6 +2463,14 @@ int main(int, char**)
     result &= testTlsReadWantsWriteThenDisconnect(cert);
     result &= testTlsSendWaitingToReadAbandonedOnDisconnect(cert);
     result &= testTlsBurstToSlowReceiver(cert);
+    result &= testTlsCertDirEnv(cert);
+    result &= testTlsWithoutCertEnvVars(cert);
+    result &= testTlsHandshakeWantsWrite(cert);
+    result &= testTlsHelloRetryRequestStallsWrite(cert);
+    result &= testTlsFlaggedWithoutSslObject();
+    result &= testTlsSendLosesSslObjectMidWait(cert);
+    result &= testTlsSendWaitingOnInvalidSocket(cert);
+    result &= testTlsReadWantsWriteOnInvalidSocket(cert);
 #endif // defined(ENABLE_TLS_SUPPORT)
 
     // Numbered after the TLS tests, which were written first.
@@ -1505,6 +2489,24 @@ int main(int, char**)
     result &= testDisconnectDuringDnsCancelsConnect();
     result &= testLateIpv6AfterIpv4Fails();
     result &= testDroppedBeforeOnConnectRuns();
+    result &= testReconnectTimerIgnoredWhileConnected();
+    result &= testUnusableAddressFamily();
+    result &= testTruncatedAddressRejected();
+    result &= testUdpAddressConnectsWithoutPeer();
+    result &= testRanOutOfAddressesRecollectsLateResults();
+    result &= testUnansweredAddressKeptUnderWatch();
+    result &= testDisconnectDuringAddressWaitLoop();
+    result &= testPendingConnectSucceedsWhileDnsPending();
+    result &= testSendAfterSocketClosedReportsSelectError();
+    result &= testReceiveAfterSocketClosedReportsSelectError();
+    result &= testSelectWakeDiscardedWhenSocketInvalidated();
+    result &= testDispatchAbandonedWhenSocketInvalidated();
+#if !defined(WIN32)
+    result &= testCheckConnectionsSocketErrors();
+    result &= testSocketExhaustionDuringConnect();
+    result &= testLateIpv6CollectedWhileIpv4AttemptInFlight();
+    result &= testStalledSendSelectErrorOnClosedSocket();
+#endif // !defined(WIN32)
 
     return result ? 0 : -1;
 }

@@ -306,6 +306,46 @@ bool destructionJoinsAndFreesTap()
     return true;
 }
 
+bool destructionWhileDroppingReportsDrops()
+{
+    // Two overfull bursts against a fast tap, separated by a pause long
+    // enough for the tap thread to catch up and report the first overflow:
+    // the first report notes that the tap has started dropping (dropping_
+    // goes true), and the second overflow - reported while TapStep is
+    // already in dropping state - exercises the "still dropping" side of
+    // the drop report. TapStep is then destroyed mid-backlog, so ~TapStep
+    // logs the lost audio instead of silently swallowing it.
+    std::atomic<bool> destroyed(false);
+    {
+        TapStep tapStep(SAMPLE_RATE, new RecordingStep(1ms, &destroyed));
+        auto input = makeRamp(27 * BLOCK);
+        int outputSamples = 0;
+        int outputSamples2 = 0;
+        tapStep.execute(input.data(), input.size(), &outputSamples);
+        // 27 blocks drain from the 250 ms buffer in ~24 ms at 1 block/ms;
+        // 300 ms is a wide margin for the tap thread to catch up and emit
+        // its first drop report.
+        std::this_thread::sleep_for(300ms);
+        tapStep.execute(input.data(), input.size(), &outputSamples2);
+        if (outputSamples != 27 * BLOCK)
+        {
+            std::cerr << "[outputSamples " << outputSamples << " != " << 27 * BLOCK << "]...";
+            return false;
+        }
+        if (outputSamples2 != 27 * BLOCK)
+        {
+            std::cerr << "[outputSamples2 " << outputSamples2 << " != " << 27 * BLOCK << "]...";
+            return false;
+        }
+    }
+    if (!destroyed)
+    {
+        std::cerr << "[tapped step not deleted]...";
+        return false;
+    }
+    return true;
+}
+
 } // namespace
 
 int main()
@@ -316,5 +356,6 @@ int main()
     TEST_CASE(burstThatFitsInBufferIsNotLost);
     TEST_CASE(destructionHandsOverWholeBlocksOnly);
     TEST_CASE(destructionJoinsAndFreesTap);
+    TEST_CASE(destructionWhileDroppingReportsDrops);
     return 0;
 }

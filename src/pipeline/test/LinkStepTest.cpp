@@ -4,6 +4,7 @@
 
 #include <memory>
 #include <vector>
+#include <new>
 
 #include "LinkStep.h"
 #include "PipelineTestCommon.h"
@@ -154,6 +155,51 @@ bool nullOrEmptyInputIgnored()
     return result;
 }
 
+bool absurdBufferSizeRejected()
+{
+    // A sample count too large to become an array of that many shorts must
+    // be rejected when LinkStep preallocates its one-second scratch buffer
+    // (the FIFO's own allocation only sees the truncated low bits).
+    bool rejected = false;
+    try
+    {
+        LinkStep link(8000, (size_t)0x800000000000BB80ULL);
+    }
+    catch (const std::bad_alloc&)
+    {
+        rejected = true;
+    }
+    if (!rejected)
+    {
+        std::cerr << "[absurd numSamples was accepted]...";
+        return false;
+    }
+    return true;
+}
+
+bool negativeRateOutputBufferRejected()
+{
+    // OutputStep preallocates a one-second output buffer from the link's
+    // sample rate; a nonsensical negative rate must make that allocation
+    // fail rather than corrupt memory.
+    LinkStep link(-100);
+    bool rejected = false;
+    try
+    {
+        link.getOutputPipelineStep();
+    }
+    catch (const std::bad_alloc&)
+    {
+        rejected = true;
+    }
+    if (!rejected)
+    {
+        std::cerr << "[negative link rate accepted by getOutputPipelineStep]...";
+        return false;
+    }
+    return true;
+}
+
 } // namespace
 
 int main()
@@ -165,5 +211,7 @@ int main()
     TEST_CASE(fullFifoDropsWholeBlock);
     TEST_CASE(clearFifoDiscards);
     TEST_CASE(nullOrEmptyInputIgnored);
+    TEST_CASE(absurdBufferSizeRejected);
+    TEST_CASE(negativeRateOutputBufferRejected);
     return 0;
 }

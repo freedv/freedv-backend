@@ -14,6 +14,12 @@
 #include <thread>
 #include <vector>
 
+#if !defined(_WIN32) && !defined(__APPLE__)
+#include <csignal>
+#include <cstring>
+#include <pthread.h>
+#endif // !defined(_WIN32) && !defined(__APPLE__)
+
 #include "../Semaphore.h"
 
 using namespace std::chrono_literals;
@@ -227,6 +233,76 @@ bool testConcurrentSignalers()
     return report(result);
 }
 
+#if !defined(_WIN32) && !defined(__APPLE__)
+void noopSignalHandler(int)
+{
+    // empty on purpose: with no SA_RESTART the interrupted sem_clockwait()/
+    // sem_wait() have to surface EINTR and let the code handle it themselves.
+}
+
+bool testWaitForRetriesAfterSignal()
+{
+    std::cout << "Test 7 (waitFor() retries when a signal interrupts it): ";
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sigemptyset(&sa.sa_mask);
+    sa.sa_handler = noopSignalHandler;
+    sigaction(SIGUSR1, &sa, nullptr);
+
+    Semaphore sem;
+    std::atomic<bool> returned(false);
+    std::promise<pthread_t> tidReady;
+    std::future<pthread_t> tid = tidReady.get_future();
+    std::thread waiter([&]() {
+        tidReady.set_value(pthread_self());
+        sem.waitFor(1000);
+        returned = true;
+    });
+
+    pthread_t waiterTid = tid.get();
+    pthread_kill(waiterTid, SIGUSR1); // interrupt sem_clockwait() -> EINTR -> retry
+    std::this_thread::sleep_for(50ms);
+    pthread_kill(waiterTid, SIGUSR1); // and again
+    sem.signal();                     // the retried wait must still take this signal early
+    waiter.join();
+
+    bool result = CHECK(returned.load());
+    return report(result);
+}
+
+bool testWaitReturnsAfterSignal()
+{
+    std::cout << "Test 8 (a signal interrupts a blocking wait() rather than hanging it): ";
+
+    Semaphore sem; // nobody signals this one
+    std::atomic<bool> returned(false);
+    std::promise<pthread_t> tidReady;
+    std::future<pthread_t> tid = tidReady.get_future();
+    std::thread waiter([&]() {
+        tidReady.set_value(pthread_self());
+        sem.wait();
+        returned = true;
+    });
+
+    std::this_thread::sleep_for(50ms);
+    pthread_kill(tid.get(), SIGUSR1); // interrupt sem_wait() -> EINTR -> error path returns
+
+    // If the signal didn't interrupt it, unblock the waiter before asserting
+    // so the test can't hang either way.
+    auto deadline = Clock::now() + 2s;
+    while (!returned && Clock::now() < deadline)
+    {
+        std::this_thread::sleep_for(5ms);
+    }
+    sem.signal();
+    waiter.join();
+
+    bool result = CHECK(returned.load());
+    return report(result);
+}
+#endif // !defined(_WIN32) && !defined(__APPLE__)
+
 } // namespace
 
 int main(int, char**)
@@ -239,6 +315,10 @@ int main(int, char**)
     result &= testWaitBlocksUntilSignaled();
     result &= testPingPong();
     result &= testConcurrentSignalers();
+#if !defined(_WIN32) && !defined(__APPLE__)
+    result &= testWaitForRetriesAfterSignal();
+    result &= testWaitReturnsAfterSignal();
+#endif // !defined(_WIN32) && !defined(__APPLE__)
 
     return result ? 0 : -1;
 }

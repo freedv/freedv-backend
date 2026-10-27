@@ -4,6 +4,7 @@
 #include <ctime>
 #include <iostream>
 #include <string>
+#include <sys/resource.h>
 
 #include "../../util/test/TestSocketCompat.h"
 
@@ -31,6 +32,11 @@ public:
     {
         reporter.serverHostname_ = host;
         reporter.serverPort_ = std::to_string(port);
+    }
+    static void setServerName(PskReporter& reporter, const std::string& host, const std::string& port)
+    {
+        reporter.serverHostname_ = host;
+        reporter.serverPort_ = port;
     }
 };
 
@@ -372,6 +378,129 @@ bool testDestructorFlushesPendingRecords()
     std::cout << (result ? "PASS" : "FAIL") << "\n";
     return result;
 }
+bool testRxDataSizeAlignedNoPadding()
+{
+    std::cout << "Test 10 (RX record data size is used as-is when already 4-byte aligned): ";
+
+    // 4 + (1+4) + (1+6) + (1+7) = 24 -> already aligned, nothing added.
+    PskReporter aligned("K6AQ", "DM12kw", "FreeDV1");
+    bool result = (PskReporterTest::rxDataSize(aligned) == 24);
+
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    return result;
+}
+
+bool testEncodeSenderRecordsWithEmptyList()
+{
+    std::cout << "Test 11 (encodeSenderRecords_ leaves the buffer alone for an empty list): ";
+
+    PskReporter reporter("K6AQ", "DM12kw", "FreeDV 1.3");
+    char buf[32];
+    memset(buf, 0x5A, sizeof(buf));
+
+    bool result = (PskReporterTest::txDataSize(reporter) == 0);
+    PskReporterTest::encodeTx(reporter, buf);
+
+    bool untouched = true;
+    for (size_t i = 0; i < sizeof(buf); i++)
+    {
+        untouched &= (buf[i] == (char)0x5A);
+    }
+    result &= untouched;
+
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    return result;
+}
+
+bool testReportCommonWithoutPendingRecords()
+{
+    std::cout << "Test 12 (reportCommon_ omits the TX format block when nothing is pending): ";
+
+    FakePskServer server;
+    PskReporter reporter("TEST1", "DM12kw", "FreeDV Test");
+    PskReporterTest::setServer(reporter, "127.0.0.1", server.port());
+
+    bool result = (PskReporterTest::recordCount(reporter) == 0);
+    result &= PskReporterTest::reportCommon(reporter);
+
+    std::string datagram = server.receive(2000);
+    result &= validHeader(datagram);
+    result &= (countOccurrences(datagram, "TEST1") == 1);
+    // The SenderRecord format header (0x99 0x93) is only present with TX data.
+    result &= (countOccurrences(datagram, std::string("\x99\x93", 2)) == 0);
+
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    return result;
+}
+
+bool testReportCommonUnresolvableServer()
+{
+    std::cout << "Test 13 (reportCommon_ fails when the server name cannot be resolved): ";
+
+    PskReporter reporter("TEST1", "DM12kw", "FreeDV Test");
+    reporter.addReceiveRecord("TEST2", "1600X", 14236000, 5);
+
+    // getaddrinfo is called with AI_NUMERICSERV, so a non-numeric service is
+    // rejected locally without any name lookup.
+    PskReporterTest::setServerName(reporter, "127.0.0.1", "psk-reporter");
+    bool result = (PskReporterTest::reportCommon(reporter) == false);
+
+    // Pending records are dropped by the failed attempt rather than retried.
+    result &= (PskReporterTest::recordCount(reporter) == 0);
+
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    return result;
+}
+
+bool testReportCommonSendFailure()
+{
+    std::cout << "Test 14 (reportCommon_ fails when the datagram cannot be sent): ";
+
+    PskReporter reporter("TEST1", "DM12kw", "FreeDV Test");
+    reporter.addReceiveRecord("TEST2", "1600X", 14236000, 5);
+
+    // Broadcasting to 255.255.255.255 needs SO_BROADCAST, which the reporter
+    // never sets, so sendto() fails with EACCES.
+    PskReporterTest::setServer(reporter, "255.255.255.255", 39000);
+    bool result = (PskReporterTest::reportCommon(reporter) == false);
+    result &= (PskReporterTest::recordCount(reporter) == 0);
+
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    return result;
+}
+
+bool testReportCommonSocketFailure()
+{
+    std::cout << "Test 15 (reportCommon_ fails when no descriptor is available): ";
+
+    PskReporter reporter("TEST1", "DM12kw", "FreeDV Test");
+    reporter.addReceiveRecord("TEST2", "1600X", 14236000, 5);
+    PskReporterTest::setServer(reporter, "127.0.0.1", 39000);
+
+    // Cap the descriptor limit at the three stdio descriptors so socket()
+    // returns EMFILE, then put the original limit back.
+    struct rlimit original;
+    bool result = (getrlimit(RLIMIT_NOFILE, &original) == 0);
+    struct rlimit lowered = original;
+    lowered.rlim_cur = 3;
+    result &= (setrlimit(RLIMIT_NOFILE, &lowered) == 0);
+
+    bool sendFailed = (PskReporterTest::reportCommon(reporter) == false);
+
+    result &= (setrlimit(RLIMIT_NOFILE, &original) == 0);
+    result &= sendFailed;
+
+    // A normal report works again once the limit is restored.
+    FakePskServer server;
+    PskReporterTest::setServer(reporter, "127.0.0.1", server.port());
+    reporter.addReceiveRecord("RESTORED", "1600X", 14236000, 5);
+    result &= PskReporterTest::reportCommon(reporter);
+    result &= (countOccurrences(server.receive(2000), "RESTORED") == 1);
+
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    return result;
+}
+
 
 } // namespace
 
@@ -388,6 +517,12 @@ int main(int argc, char** argv)
     result &= testAutoFlushAtFiftyRecords();
     result &= testDestroyRightAfterAutoFlush();
     result &= testDestructorFlushesPendingRecords();
+    result &= testRxDataSizeAlignedNoPadding();
+    result &= testEncodeSenderRecordsWithEmptyList();
+    result &= testReportCommonWithoutPendingRecords();
+    result &= testReportCommonUnresolvableServer();
+    result &= testReportCommonSendFailure();
+    result &= testReportCommonSocketFailure();
 
     return result ? 0 : -1;
 }
