@@ -119,6 +119,9 @@ if(UNIX AND NOT APPLE)
         -Wl,--wrap=SSL_set1_host)
     target_link_options(SemaphoreTest PRIVATE
         -Wl,--wrap=sem_init
+        -Wl,--wrap=sem_post
+        -Wl,--wrap=sem_wait
+        -Wl,--wrap=sem_destroy
         -Wl,--wrap=clock_gettime
         -Wl,--wrap=sem_clockwait)
 endif()

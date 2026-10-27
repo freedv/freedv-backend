@@ -128,7 +128,7 @@ void AudioPipeline::reloadResampler_(int index)
 {
     ResampleStep* resampleStep = resamplers_[index].get();
     bool createResampler = 
-        resampleStep == nullptr || resampleStep->getOutputSampleRate() == pipelineSteps_[index]->getInputSampleRate();
+        resampleStep == nullptr || resampleStep->getOutputSampleRate() != pipelineSteps_[index]->getInputSampleRate();
     
     if (index != 0 && !createResampler)
     {

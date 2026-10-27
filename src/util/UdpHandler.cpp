@@ -155,6 +155,15 @@ void UdpHandler::openImpl_(const char* sendIp, int sendPort)
             log_warn("cannot open socket (err=%d)", errno);
         }
 #endif // defined(WIN32)
+        if (socket_.load(std::memory_order_relaxed) == INVALID_SOCKET)
+        {
+            // Nothing to join a multicast group with.
+            if (result != nullptr)
+            {
+                freeaddrinfo(result);
+            }
+            return;
+        }
 
         // XXX (Windows): if the send address is multicast, we need to join
         // the associated multicast group in order to not get "unreachable" errors.
@@ -190,6 +199,12 @@ void UdpHandler::openImpl_(const char* sendIp, int sendPort)
                 log_warn("cannot open socket (err=%d)", errno);
             }
 #endif // defined(WIN32)
+            if (socket_.load(std::memory_order_relaxed) == INVALID_SOCKET)
+            {
+                // Nothing to bind, receive on or join a multicast group with.
+                freeaddrinfo(result);
+                return;
+            }
 
             auto err = ::bind(socket_.load(std::memory_order_relaxed), result->ai_addr, result->ai_addrlen);
             if (err != 0)

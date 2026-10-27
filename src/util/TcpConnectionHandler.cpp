@@ -602,86 +602,98 @@ next_fd:
                     log_warn("Unable to set TLS certificate locations: %s", errStr.c_str());
                 }
 
-                // Force >= TLS 1.2
+                // Force >= TLS 1.2. Without it, an older version could be
+                // negotiated: don't connect.
                 if (!SSL_CTX_set_min_proto_version(sslCtx_.load(std::memory_order_relaxed), TLS1_2_VERSION)) 
                 {
                     auto errStr = GetSSLError_();
-                    log_warn("Unable to mandate minimum TLS version: %s", errStr.c_str());
-                }
-
-                ssl_.store(SSL_new(sslCtx_.load(std::memory_order_relaxed)), std::memory_order_relaxed);
-                assert(ssl_.load(std::memory_order_relaxed) != nullptr);
-
-                if (!SSL_set_fd(ssl_.load(std::memory_order_relaxed), (int)socket_.load(std::memory_order_relaxed)))
-                {
-                    auto errStr = GetSSLError_();
-                    log_error("Unable to assign socket to SSL context: %s", errStr.c_str());
+                    log_error("Unable to mandate minimum TLS version: %s", errStr.c_str());
                     disconnectImpl_(false);
                     connSucceeded = false;
                 }
                 else
                 {
-                    // Set hostname for SSL negotiation
-                    SSL_set_tlsext_host_name(ssl_.load(std::memory_order_relaxed), host_.c_str());
-#if defined(OPENSSL_USE_VER_4_DEPRECATED_FNS)
-                    if (!SSL_set1_dnsname(ssl_.load(std::memory_order_relaxed), host_.c_str())) 
-#else
-                    if (!SSL_set1_host(ssl_.load(std::memory_order_relaxed), host_.c_str())) 
-#endif // defined(OPENSSL_USE_VER_4_DEPRECATED_FNS)
+                    ssl_.store(SSL_new(sslCtx_.load(std::memory_order_relaxed)), std::memory_order_relaxed);
+                    assert(ssl_.load(std::memory_order_relaxed) != nullptr);
+
+                    if (!SSL_set_fd(ssl_.load(std::memory_order_relaxed), (int)socket_.load(std::memory_order_relaxed)))
                     {
                         auto errStr = GetSSLError_();
-                        log_warn("Unable to assign hostname for certificate validation: %s", errStr.c_str());
+                        log_error("Unable to assign socket to SSL context: %s", errStr.c_str());
+                        disconnectImpl_(false);
+                        connSucceeded = false;
                     }
-
-                    // Attempt SSL negotiation. The server may never respond, so give up
-                    // if it takes too long or if a disconnect is requested; otherwise
-                    // the disconnect waits behind us until the server closes the socket.
-                    int sslRet = 0;
-                    auto handshakeDeadline = std::chrono::steady_clock::now() + TLS_HANDSHAKE_TIMEOUT;
-                    while ((sslRet = SSL_connect(ssl_.load(std::memory_order_relaxed))) != 1)
+                    else
                     {
-                        fd_set writeSet;
-                        fd_set readSet;
-                        FD_ZERO(&writeSet);
-                        FD_ZERO(&readSet);
-                        auto sslErr = SSL_get_error(ssl_.load(std::memory_order_relaxed), sslRet);
-                        if (sslErr == SSL_ERROR_WANT_READ || sslErr == SSL_ERROR_WANT_WRITE)
+                        // Set hostname for SSL negotiation. Without it, the
+                        // certificate is never checked against the hostname, so
+                        // any trusted certificate would do: don't connect.
+                        SSL_set_tlsext_host_name(ssl_.load(std::memory_order_relaxed), host_.c_str());
+#if defined(OPENSSL_USE_VER_4_DEPRECATED_FNS)
+                        bool hostnameSet = SSL_set1_dnsname(ssl_.load(std::memory_order_relaxed), host_.c_str()) == 1;
+#else
+                        bool hostnameSet = SSL_set1_host(ssl_.load(std::memory_order_relaxed), host_.c_str()) == 1;
+#endif // defined(OPENSSL_USE_VER_4_DEPRECATED_FNS)
+                        if (!hostnameSet)
                         {
-                            if (cancelConnect_.load(std::memory_order_relaxed))
-                            {
-                                log_info("TLS negotiation cancelled");
-                                disconnectImpl_(false);
-                                connSucceeded = false;
-                                break;
-                            }
-                            else if (std::chrono::steady_clock::now() >= handshakeDeadline)
-                            {
-                                log_error("TLS negotiation timed out");
-                                disconnectImpl_(false);
-                                connSucceeded = false;
-                                break;
-                            }
-
-                            // Block until we're able to continue.
-                            auto rawSock = socket_.load(std::memory_order_relaxed);
-                            if (sslErr == SSL_ERROR_WANT_READ) FD_SET(rawSock, &readSet);
-                            else FD_SET(rawSock, &writeSet);
-
-                            struct timeval tv = {0, SELECT_SLICE_US};
-                            select(socket_.load(std::memory_order_relaxed) + 1, &readSet, &writeSet, nullptr, &tv);
+                            auto errStr = GetSSLError_();
+                            log_error("Unable to assign hostname for certificate validation: %s", errStr.c_str());
+                            disconnectImpl_(false);
+                            connSucceeded = false;
                         }
                         else
                         {
-                            if (SSL_get_verify_result(ssl_.load(std::memory_order_relaxed)) != X509_V_OK)
+                            // Attempt SSL negotiation. The server may never respond, so give up
+                            // if it takes too long or if a disconnect is requested; otherwise
+                            // the disconnect waits behind us until the server closes the socket.
+                            int sslRet = 0;
+                            auto handshakeDeadline = std::chrono::steady_clock::now() + TLS_HANDSHAKE_TIMEOUT;
+                            while ((sslRet = SSL_connect(ssl_.load(std::memory_order_relaxed))) != 1)
                             {
-                                log_error("Certificate validation error: %s", X509_verify_cert_error_string(SSL_get_verify_result(ssl_.load(std::memory_order_relaxed))));
-                            }
+                                fd_set writeSet;
+                                fd_set readSet;
+                                FD_ZERO(&writeSet);
+                                FD_ZERO(&readSet);
+                                auto sslErr = SSL_get_error(ssl_.load(std::memory_order_relaxed), sslRet);
+                                if (sslErr == SSL_ERROR_WANT_READ || sslErr == SSL_ERROR_WANT_WRITE)
+                                {
+                                    if (cancelConnect_.load(std::memory_order_relaxed))
+                                    {
+                                        log_info("TLS negotiation cancelled");
+                                        disconnectImpl_(false);
+                                        connSucceeded = false;
+                                        break;
+                                    }
+                                    else if (std::chrono::steady_clock::now() >= handshakeDeadline)
+                                    {
+                                        log_error("TLS negotiation timed out");
+                                        disconnectImpl_(false);
+                                        connSucceeded = false;
+                                        break;
+                                    }
 
-                            auto errStr = GetSSLError_();
-                            log_error("Unable to negotiate TLS connection: %s", errStr.c_str());
-                            disconnectImpl_(false);
-                            connSucceeded = false;
-                            break;
+                                    // Block until we're able to continue.
+                                    auto rawSock = socket_.load(std::memory_order_relaxed);
+                                    if (sslErr == SSL_ERROR_WANT_READ) FD_SET(rawSock, &readSet);
+                                    else FD_SET(rawSock, &writeSet);
+
+                                    struct timeval tv = {0, SELECT_SLICE_US};
+                                    select(socket_.load(std::memory_order_relaxed) + 1, &readSet, &writeSet, nullptr, &tv);
+                                }
+                                else
+                                {
+                                    if (SSL_get_verify_result(ssl_.load(std::memory_order_relaxed)) != X509_V_OK)
+                                    {
+                                        log_error("Certificate validation error: %s", X509_verify_cert_error_string(SSL_get_verify_result(ssl_.load(std::memory_order_relaxed))));
+                                    }
+
+                                    auto errStr = GetSSLError_();
+                                    log_error("Unable to negotiate TLS connection: %s", errStr.c_str());
+                                    disconnectImpl_(false);
+                                    connSucceeded = false;
+                                    break;
+                                }
+                            }
                         }
                     }
                 }

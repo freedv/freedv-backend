@@ -41,6 +41,8 @@ std::atomic<unsigned long> semFaultThread_{0}; // pthread_self() of the arming t
 std::atomic<int> semInitFailOnce_{0};
 std::atomic<int> clockGettimeFailOnce_{0};
 std::atomic<int> semClockwaitFailOnce_{0};
+std::atomic<sem_t*> semFailedInit_{nullptr}; // the sem_t a failed sem_init() left uninitialized
+std::atomic<int> semFailedInitUses_{0};      // calls made on it since
 } // namespace
 
 extern "C" {
@@ -51,13 +53,44 @@ int __wrap_sem_init(sem_t* sem, int pshared, unsigned int value)
     if (semInitFailOnce_.load() && pthread_self() == (pthread_t)semFaultThread_.load())
     {
         semInitFailOnce_.store(0);
-        memset(sem, 0, sizeof(*sem)); // no real init happened; keep the bytes a
-                                      // valid never-signalled semaphore
+        memset(sem, 0xA5, sizeof(*sem)); // no real init happened: the bytes are garbage
+        semFailedInit_.store(sem);
+        semFailedInitUses_.store(0);
         errno = EINVAL;
         fprintf(stderr, "[fault] sem_init -> -1\n");
         return -1;
     }
     return __real_sem_init(sem, pshared, value);
+}
+
+// Nothing may use a semaphore that sem_init() failed to set up.
+static void noteSemUse_(sem_t* sem)
+{
+    if (sem == semFailedInit_.load())
+    {
+        semFailedInitUses_.fetch_add(1);
+    }
+}
+
+int __real_sem_post(sem_t* sem);
+int __wrap_sem_post(sem_t* sem)
+{
+    noteSemUse_(sem);
+    return __real_sem_post(sem);
+}
+
+int __real_sem_wait(sem_t* sem);
+int __wrap_sem_wait(sem_t* sem)
+{
+    noteSemUse_(sem);
+    return __real_sem_wait(sem);
+}
+
+int __real_sem_destroy(sem_t* sem);
+int __wrap_sem_destroy(sem_t* sem)
+{
+    noteSemUse_(sem);
+    return __real_sem_destroy(sem);
 }
 
 int __real_clock_gettime(clockid_t clk, struct timespec* tp);
@@ -78,6 +111,7 @@ int __wrap_clock_gettime(clockid_t clk, struct timespec* tp)
 int __real_sem_clockwait(sem_t* sem, clockid_t clk, const struct timespec* absTimeout);
 int __wrap_sem_clockwait(sem_t* sem, clockid_t clk, const struct timespec* absTimeout)
 {
+    noteSemUse_(sem);
     if (semClockwaitFailOnce_.load() && pthread_self() == (pthread_t)semFaultThread_.load())
     {
         semClockwaitFailOnce_.store(0);
@@ -340,11 +374,17 @@ bool testWaitForRetriesAfterSignal()
     return report(result);
 }
 
-bool testWaitReturnsAfterSignal()
+bool testWaitRetriesAfterSignal()
 {
-    std::cout << "Test 8 (a signal interrupts a blocking wait() rather than hanging it): ";
+    std::cout << "Test 8 (wait() keeps waiting when a signal interrupts it): ";
 
-    Semaphore sem; // nobody signals this one
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sigemptyset(&sa.sa_mask);
+    sa.sa_handler = noopSignalHandler; // no SA_RESTART: sem_wait() sees EINTR
+    sigaction(SIGUSR1, &sa, nullptr);
+
+    Semaphore sem;
     std::atomic<bool> returned(false);
     std::promise<pthread_t> tidReady;
     std::future<pthread_t> tid = tidReady.get_future();
@@ -354,34 +394,36 @@ bool testWaitReturnsAfterSignal()
         returned = true;
     });
 
+    pthread_t waiterTid = tid.get();
     std::this_thread::sleep_for(50ms);
-    pthread_kill(tid.get(), SIGUSR1); // interrupt sem_wait() -> EINTR -> error path returns
+    pthread_kill(waiterTid, SIGUSR1); // interrupt sem_wait() -> EINTR -> retry
+    std::this_thread::sleep_for(50ms);
+    pthread_kill(waiterTid, SIGUSR1); // and again
+    std::this_thread::sleep_for(200ms);
+    bool result = CHECK(!returned.load()); // nothing has signalled it yet
 
-    // If the signal didn't interrupt it, unblock the waiter before asserting
-    // so the test can't hang either way.
-    auto deadline = Clock::now() + 2s;
-    while (!returned && Clock::now() < deadline)
-    {
-        std::this_thread::sleep_for(5ms);
-    }
     sem.signal();
     waiter.join();
-
-    bool result = CHECK(returned.load());
+    result &= CHECK(returned.load());
     return report(result);
 }
 
 bool testFailedSemInitIsGraceful()
 {
-    std::cout << "Test 9 (a failing sem_init() is logged and leaves the semaphore inert, not fatal): ";
+    std::cout << "Test 9 (after a failing sem_init(), the semaphore is never used): ";
 
     semFaultThread_.store((unsigned long)pthread_self());
     semInitFailOnce_.store(1);
+    bool result = true;
     {
         Semaphore sem; // the shim fires inside the ctor, which logs the error
-        sem.waitFor(100); // the inert (never signalled) semaphore just times out
-    } // ~Semaphore posts/destroys the zeroed sem_ without hanging or crashing
-    bool result = CHECK(semInitFailOnce_.load() == 0); // the shim fired where intended
+        result &= CHECK(semInitFailOnce_.load() == 0); // the shim fired where intended
+        sem.signal();
+        sem.waitFor(100);
+        sem.wait(); // nothing to wait on: returns rather than blocking forever
+    } // ~Semaphore
+    result &= CHECK(semFailedInitUses_.load() == 0);
+    semFailedInit_.store(nullptr);
 
     // Semaphores constructed afterwards still work.
     Semaphore other;
@@ -439,7 +481,7 @@ int main(int, char**)
     result &= testConcurrentSignalers();
 #if !defined(_WIN32) && !defined(__APPLE__)
     result &= testWaitForRetriesAfterSignal();
-    result &= testWaitReturnsAfterSignal();
+    result &= testWaitRetriesAfterSignal();
     result &= testFailedSemInitIsGraceful();
     result &= testWaitForSurvivesClockFailure();
     result &= testWaitForReportsSemaphoreError();

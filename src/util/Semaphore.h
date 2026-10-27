@@ -50,6 +50,7 @@ private:
     dispatch_semaphore_t sem_;
 #else
     sem_t sem_;
+    bool valid_; // false if sem_init() failed: sem_ must not be used
 #endif // defined(_WIN32) || defined(__APPLE__)
 };
 

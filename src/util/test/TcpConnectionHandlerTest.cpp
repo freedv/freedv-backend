@@ -47,9 +47,9 @@ std::atomic<int> getnameinfoFailOnce_{0}; // armed by the getpeername shim itsel
 #if defined(ENABLE_TLS_SUPPORT)
 std::atomic<int> sslCtxNewFailOnce_{0};
 std::atomic<int> sslDefaultPathsWarnOnce_{0};
-std::atomic<int> sslMinProtoWarnOnce_{0};
+std::atomic<int> sslMinProtoFailOnce_{0};
 std::atomic<int> sslSetFdFailOnce_{0};
-std::atomic<int> sslSet1HostWarnOnce_{0};
+std::atomic<int> sslSet1HostFailOnce_{0};
 #endif // defined(ENABLE_TLS_SUPPORT)
 } // namespace
 
@@ -156,9 +156,9 @@ int __wrap_SSL_CTX_set_default_verify_paths(SSL_CTX* ctx)
 long __real_SSL_CTX_ctrl(SSL_CTX* ctx, int cmd, long larg, void* parg);
 long __wrap_SSL_CTX_ctrl(SSL_CTX* ctx, int cmd, long larg, void* parg)
 {
-    if (cmd == SSL_CTRL_SET_MIN_PROTO_VERSION && sslMinProtoWarnOnce_.load())
+    if (cmd == SSL_CTRL_SET_MIN_PROTO_VERSION && sslMinProtoFailOnce_.load())
     {
-        sslMinProtoWarnOnce_.store(0);
+        sslMinProtoFailOnce_.store(0);
         fprintf(stderr, "[fault] SSL_CTX_ctrl(SET_MIN_PROTO_VERSION) -> 0\n");
         return 0;
     }
@@ -179,7 +179,7 @@ int __wrap_SSL_set_fd(SSL* ssl, int fd)
 int __real_SSL_set1_host(SSL* ssl, const char* host);
 int __wrap_SSL_set1_host(SSL* ssl, const char* host)
 {
-    if (sslSet1HostWarnOnce_.exchange(0))
+    if (sslSet1HostFailOnce_.exchange(0))
     {
         fprintf(stderr, "[fault] SSL_set1_host -> 0\n");
         return 0;
@@ -2709,7 +2709,7 @@ bool testTlsSetFdFailure(TestCertificate& cert)
 
 bool testTlsWarnOnlySetupFailures(TestCertificate& cert)
 {
-    std::cout << "Test 69 (default_verify_paths / min_proto_version / set1_host failures are warn-only): ";
+    std::cout << "Test 69 (a default_verify_paths failure is warn-only): ";
 
     testSetEnv("SSL_CERT_FILE", cert.path.c_str());
 
@@ -2718,11 +2718,8 @@ bool testTlsWarnOnlySetupFailures(TestCertificate& cert)
 
     bool result = CHECK(server.valid());
     // The cert trust comes from SSL_CERT_FILE (loaded via SSL_CTX_load_verify
-    // _locations), so losing the default paths, the version floor and the
-    // hostname pin must all be survivable warnings.
+    // _locations), so losing the default paths only costs a warning.
     sslDefaultPathsWarnOnce_.store(1);
-    sslMinProtoWarnOnce_.store(1);
-    sslSet1HostWarnOnce_.store(1);
     conn.connect("localhost", server.port(), false, true);
     result &= CHECK(server.accept(ACCEPT_TIMEOUT_MS));
     setPeerRecvTimeout(server.peerFd(), 5);
@@ -2738,13 +2735,51 @@ bool testTlsWarnOnlySetupFailures(TestCertificate& cert)
 
     conn.disconnect().wait();
     result &= CHECK(tls.waitForShutdown());
-
-    // All three shims must have fired during this one TLS setup.
     result &= CHECK((sslDefaultPathsWarnOnce_.load() == 0));
-    result &= CHECK((sslMinProtoWarnOnce_.load() == 0));
-    result &= CHECK((sslSet1HostWarnOnce_.load() == 0));
 
     return report(result);
+}
+
+// A TLS setup step whose failure would leave the connection less secure than
+// asked for must end the attempt without onConnect_; a retry then connects.
+bool tlsSetupFailureRefusesConnection(TestCertificate& cert, std::atomic<int>& failOnce)
+{
+    testSetEnv("SSL_CERT_FILE", cert.path.c_str());
+
+    LoopbackTcpServer server;
+    TestConnection conn;
+
+    bool result = CHECK(server.valid());
+    failOnce.store(1);
+    auto fut = conn.connect("localhost", server.port(), false, true);
+    result &= CHECK((fut.wait_for(EVENT_TIMEOUT) == std::future_status::ready));
+    result &= CHECK((failOnce.load() == 0));
+    result &= CHECK((conn.connectCount() == 0));
+
+    LoopbackTcpServer server2;
+    result &= CHECK(server2.valid());
+    conn.connect("localhost", server2.port(), false, true);
+    result &= CHECK(server2.accept(ACCEPT_TIMEOUT_MS));
+    setPeerRecvTimeout(server2.peerFd(), 5);
+    TlsServerSession tls(cert);
+    result &= CHECK(tls.handshake(server2.peerFd()));
+    result &= CHECK(conn.waitForConnects(1));
+    conn.disconnect().wait();
+    result &= CHECK(tls.waitForShutdown());
+
+    return result;
+}
+
+bool testTlsMinProtoFailureRefusesConnection(TestCertificate& cert)
+{
+    std::cout << "Test 71 (no TLS 1.2 minimum: the attempt disconnects without onConnect_, a retry connects): ";
+    return report(tlsSetupFailureRefusesConnection(cert, sslMinProtoFailOnce_));
+}
+
+bool testTlsSet1HostFailureRefusesConnection(TestCertificate& cert)
+{
+    std::cout << "Test 72 (no hostname to check the certificate against: the attempt disconnects without onConnect_, a retry connects): ";
+    return report(tlsSetupFailureRefusesConnection(cert, sslSet1HostFailOnce_));
 }
 
 bool testTlsPeerNameWarnings(TestCertificate& cert)
@@ -2841,6 +2876,8 @@ int main(int, char**)
     result &= testTlsSetFdFailure(cert);
     result &= testTlsWarnOnlySetupFailures(cert);
     result &= testTlsPeerNameWarnings(cert);
+    result &= testTlsMinProtoFailureRefusesConnection(cert);
+    result &= testTlsSet1HostFailureRefusesConnection(cert);
 #endif // !defined(_WIN32) && !defined(__APPLE__)
 #endif // defined(ENABLE_TLS_SUPPORT)
 

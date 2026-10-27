@@ -4,7 +4,9 @@
 #include <ctime>
 #include <iostream>
 #include <string>
+#if !defined(_WIN32)
 #include <sys/resource.h>
+#endif // !defined(_WIN32)
 
 #include "../../util/test/TestSocketCompat.h"
 
@@ -469,6 +471,7 @@ bool testReportCommonSendFailure()
     return result;
 }
 
+#if !defined(_WIN32)
 bool testReportCommonSocketFailure()
 {
     std::cout << "Test 15 (reportCommon_ fails when no descriptor is available): ";
@@ -500,6 +503,7 @@ bool testReportCommonSocketFailure()
     std::cout << (result ? "PASS" : "FAIL") << "\n";
     return result;
 }
+#endif // !defined(_WIN32)
 
 
 } // namespace
@@ -522,7 +526,9 @@ int main(int argc, char** argv)
     result &= testReportCommonWithoutPendingRecords();
     result &= testReportCommonUnresolvableServer();
     result &= testReportCommonSendFailure();
+#if !defined(_WIN32)
     result &= testReportCommonSocketFailure();
+#endif // !defined(_WIN32)
 
     return result ? 0 : -1;
 }

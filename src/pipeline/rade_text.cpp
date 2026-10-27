@@ -516,6 +516,9 @@ void rade_text_generate_tx_string(rade_text_t ptr, const char *str, int strlengt
             syms[2 * index] = -1;
             syms[2 * index + 1] = 0;
         }
+        // tx_text bytes are 0 or 1 (see above).
+        debugString[2 * index] = '0' + *ptr;
+        debugString[2 * index + 1] = '0' + *(ptr + 1);
     }
 
     if (impl->enableStats)

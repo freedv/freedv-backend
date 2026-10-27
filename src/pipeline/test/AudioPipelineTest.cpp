@@ -448,30 +448,26 @@ private:
     int outputSampleRate_;
 };
 
-// reloadResampler_() with a live intermediate resampler: first a refresh
-// where the resampler's output still meets the step's input (line 131's
-// first operand false, second true), then a rebuild where the resampler
-// fits neither seam (line 131 fully false, line 133 taken, line 136's
-// rate-mismatch arm taken). Both end in freshly allocated resamplers.
-bool reloadResamplerRefreshThenRebuild()
+// reloadResampler_() with a live intermediate resampler: kept while it still
+// joins the steps either side of it, rebuilt once both steps' rates move so
+// it joins neither.
+bool reloadResamplerKeepThenRebuild()
 {
     AudioPipeline pipeline(8000, 48000);
     pipeline.appendPipelineStep(new MutableStep(8000, 8000));
     pipeline.appendPipelineStep(new MutableStep(16000, 16000));
 
-    bool result = pipeline.resamplers_[1] != nullptr;
-    result &= pipeline.resamplers_[1]->getInputSampleRate() == 8000;
-    result &= pipeline.resamplers_[1]->getOutputSampleRate() == 16000;
+    ResampleStep* original = pipeline.resamplers_[1].get();
+    bool result = original != nullptr;
+    result &= original->getInputSampleRate() == 8000;
+    result &= original->getOutputSampleRate() == 16000;
 
-    // Existing resampler's output matches the step's input: no seam gap.
+    // Nothing moved: the same resampler stays.
     pipeline.reloadResampler_(1);
-    result &= pipeline.resamplers_[1] != nullptr;
-    result &= pipeline.resamplers_[1]->getInputSampleRate() == 8000;
-    result &= pipeline.resamplers_[1]->getOutputSampleRate() == 16000;
+    result &= pipeline.resamplers_[1].get() == original;
 
     // Both step rates moved: the old resampler now matches neither its
     // predecessor's output nor its successor's input, forcing a rebuild.
-    pipeline.reloadResampler_(1);
     MutableStep* step0 = static_cast<MutableStep*>(pipeline.pipelineSteps_[0].get());
     MutableStep* step1 = static_cast<MutableStep*>(pipeline.pipelineSteps_[1].get());
     step0->setRates(8000, 22050);
@@ -483,7 +479,7 @@ bool reloadResamplerRefreshThenRebuild()
 
     if (!result)
     {
-        std::cerr << "[reloadResampler_ refresh/rebuild states wrong]...";
+        std::cerr << "[reloadResampler_ keep/rebuild states wrong]...";
     }
     return result;
 }
@@ -554,12 +550,36 @@ bool reloadResultResamplerEveryCondition()
     return result;
 }
 
-// Regression: the keep path of reloadResampler_() (the existing resampler
-// matches its predecessor's output seam, and its output does not equal the
-// step's input) must leave the resampler untouched. Historically it fell
-// through to re-wrapping the still-live raw pointer into the same unique_ptr
-// slot, which is a unique_ptr self-move: the object is destroyed, the slot
-// keeps a dangling pointer, and pipeline teardown double-frees it.
+// Only the step after a resampler changing its input rate: the resampler
+// no longer feeds it the rate it needs, so it must be rebuilt to match. (An
+// earlier version kept it, leaving a resampler whose output rate execute()
+// asserts against.)
+bool reloadResamplerFollowsNextStepsRate()
+{
+    AudioPipeline pipeline(8000, 48000);
+    pipeline.appendPipelineStep(new MutableStep(8000, 8000));
+    pipeline.appendPipelineStep(new MutableStep(16000, 16000));
+
+    MutableStep* step1 = static_cast<MutableStep*>(pipeline.pipelineSteps_[1].get());
+    step1->setRates(32000, 16000);
+    pipeline.reloadResampler_(1);
+
+    bool result = pipeline.resamplers_[1] != nullptr;
+    result &= pipeline.resamplers_[1]->getInputSampleRate() == 8000;
+    result &= pipeline.resamplers_[1]->getOutputSampleRate() == 32000;
+
+    if (!result)
+    {
+        std::cerr << "[reloadResampler_ left a resampler that doesn't feed the next step's rate]...";
+    }
+    return result;
+}
+
+// Regression: when reloadResampler_() keeps the existing resampler, it must
+// leave it untouched. Historically the keep path re-wrapped the still-live
+// raw pointer into the same unique_ptr slot, which is a unique_ptr
+// self-move: the object is destroyed, the slot keeps a dangling pointer, and
+// pipeline teardown double-frees it.
 bool reloadResamplerKeepPathIsSafe()
 {
     AudioPipeline pipeline(8000, 48000);
@@ -569,18 +589,17 @@ bool reloadResamplerKeepPathIsSafe()
     ResampleStep* original = pipeline.resamplers_[1].get();
     bool result = original != nullptr;
 
-    // Move step 1 so the resampler's output no longer matches the step's
-    // input (first reload condition false), while the resampler's input
-    // still matches step 0's output (second condition false): keep path.
-    MutableStep* step1 = static_cast<MutableStep*>(pipeline.pipelineSteps_[1].get());
-    step1->setRates(32000, 16000);
     pipeline.reloadResampler_(1);
-
     result &= pipeline.resamplers_[1].get() == original;
+    result &= original->getOutputSampleRate() == 16000; // still a live object
+
+    // A pass through the pipeline uses the kept resampler.
+    auto output = runOneSecond(pipeline);
+    result &= within10Percent("output", (int)output.size(), 48000);
 
     if (!result)
     {
-        std::cerr << "[reloadResampler_ keep path replaced the matching resampler]...";
+        std::cerr << "[reloadResampler_ keep path replaced or broke the matching resampler]...";
     }
     // Scope exit destroys the pipeline: with the self-move bug this
     // double-frees the resampler (ASan/heap-checker abort).
@@ -607,8 +626,9 @@ int main()
     TEST_CASE(appendWhileResultSamplerPresent);
     TEST_CASE(absurdStepRateRejectedAtBothJoinPoints);
     TEST_CASE(conversionHelperDivisorSpecialCases);
-    TEST_CASE(reloadResamplerRefreshThenRebuild);
+    TEST_CASE(reloadResamplerKeepThenRebuild);
     TEST_CASE(reloadResultResamplerEveryCondition);
+    TEST_CASE(reloadResamplerFollowsNextStepsRate);
     TEST_CASE(reloadResamplerKeepPathIsSafe);
     
     return 0;

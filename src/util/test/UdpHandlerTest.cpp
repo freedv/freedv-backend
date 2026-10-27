@@ -375,8 +375,8 @@ bool testSocketExhaustion()
             dummies.push_back(fd);
         }
 
-        // Host-empty open with a multicast send hint: socket() fails, yet the
-        // flow continues into the IPv4 group join on an invalid socket.
+        // Host-empty open with a multicast send hint: socket() fails, so
+        // there's no IPv4 group to join.
         {
             TestUdpHandler handler;
             auto fut = handler.open("", 0, MULTICAST_GROUP_V4, port1);
@@ -385,7 +385,7 @@ bool testSocketExhaustion()
             handler.close().wait();
         }
 
-        // Same again for IPv6: setsockopt(IPV6_JOIN_GROUP) on the failed socket.
+        // Same again for IPv6.
         {
             TestUdpHandler handler;
             auto fut = handler.open("", 0, MULTICAST_GROUP_V6, port2);
@@ -404,11 +404,10 @@ bool testSocketExhaustion()
             handler.close().wait();
         }
     }
-    catch (const std::exception&)
+    catch (const std::exception& e)
     {
-        // EMFILE surfacing from std::thread or promise machinery still counts
-        // as "surviving" as long as we can restore the limits below.
-        result = true;
+        std::cout << "[" << e.what() << "] ";
+        result = false;
     }
 
     for (int fd : dummies)
