@@ -34,15 +34,19 @@
 
 #include <cassert>
 #include <algorithm>
+#include <limits>
 #include "LinkStep.h"
 
 LinkStep::LinkStep(int outputSampleRate, size_t numSamples)
     : tmpBuffer_(nullptr)
     , sampleRate_(outputSampleRate)
-    , fifo_(numSamples)
+    , fifo_((int)numSamples)
 {
+    assert(outputSampleRate > 0);
+    // GenericFIFO's length is an int.
+    assert(numSamples > 0 && numSamples <= (size_t)std::numeric_limits<int>::max());
+
     tmpBuffer_ = new short[numSamples];
-    assert(tmpBuffer_ != nullptr);
 }
 
 LinkStep::~LinkStep()

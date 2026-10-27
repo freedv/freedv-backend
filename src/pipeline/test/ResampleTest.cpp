@@ -2,7 +2,6 @@
 #include "PipelineTestCommon.h"
 
 #include <vector>
-#include <new>
 
 #ifndef M_PI // not defined by every C library (e.g. on Windows)
 #define M_PI 3.14159265358979323846
@@ -122,27 +121,6 @@ bool linearResampleForPlots()
     return true;
 }
 
-bool negativeInputRateRejected()
-{
-    // A negative input rate can't size the resampler's one-second scratch
-    // array; the allocation must reject it.
-    bool rejected = false;
-    try
-    {
-        ResampleStep resampleStep(-10000, 48000);
-    }
-    catch (const std::bad_alloc&)
-    {
-        rejected = true;
-    }
-    if (!rejected)
-    {
-        std::cerr << "[negative input rate was accepted]...";
-        return false;
-    }
-    return true;
-}
-
 // Regression: feeding exactly one second of input at an integer upsample
 // ratio must not push more samples into the one-second output buffer than
 // it can hold. The linear converter emits ceil(input*ratio) per 10 ms
@@ -177,7 +155,6 @@ int main()
     TEST_CASE(resample8000To44100);
     TEST_CASE(resample48000To8000Tone);
     TEST_CASE(linearResampleForPlots);
-    TEST_CASE(negativeInputRateRejected);
     TEST_CASE(linearOneSecondFeedStaysWithinOutputBuffer);
     return 0;
 }

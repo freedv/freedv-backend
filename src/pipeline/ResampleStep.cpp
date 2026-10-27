@@ -42,15 +42,15 @@ ResampleStep::ResampleStep(int inputSampleRate, int outputSampleRate, bool forPl
     : inputSampleRate_(inputSampleRate)
     , outputSampleRate_(outputSampleRate)
 {
+    assert(inputSampleRate > 0 && outputSampleRate > 0);
+
     int maxInputLen = inputSampleRate * 10 / 1000;
     int maxOutputLen = outputSampleRate * 20 / 1000; // twice as much time just in case a block is bigger than usual
     int src_error = 0;
 
     // Pre-allocate buffers so we don't have to do so during real-time
-    // operation. All buffers are RAII members and src_new() runs last: if
-    // any new[] below throws (e.g. an absurd sample rate handed to the
-    // pipeline by a misconfigured step), ~ResampleStep never runs for the
-    // partially constructed object, so nothing claimed earlier can leak.
+    // operation. All buffers are RAII members and src_new() runs last, so
+    // nothing claimed earlier leaks if a later allocation throws.
     outputSamples_ = std::make_unique<short[]>(outputSampleRate);
 
     tempInput_ = std::make_unique<float[]>(maxInputLen);

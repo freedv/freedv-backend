@@ -3,7 +3,6 @@
 
 #include <memory>
 #include <vector>
-#include <new>
 
 // The resampler-reload internals (resamplers_, resultSampler_,
 // reloadResampler_(), reloadResultResampler_()) are only reachable through
@@ -156,21 +155,6 @@ private:
     int outputSampleRate_;
     int phase_ = 0;
     std::vector<short> buffer_;
-};
-
-// Claims an input sample rate no buffer could ever be sized for.
-class ImpossibleStep : public IPipelineStep
-{
-public:
-    virtual int getInputSampleRate() const FREEDV_NONBLOCKING { return -100000; }
-    virtual int getOutputSampleRate() const FREEDV_NONBLOCKING { return 8000; }
-    virtual short* execute(short* inputSamples, int numInputSamples, int* numOutputSamples) FREEDV_NONBLOCKING
-    {
-        (void)inputSamples;
-        (void)numInputSamples;
-        *numOutputSamples = 0;
-        return nullptr;
-    }
 };
 
 // Exercises IPipelineStep's protected float conversion helpers with an
@@ -346,50 +330,6 @@ bool appendWhileResultSamplerPresent()
     bool result = within10Percent("output", (int)output.size(), 48000);
     result &= toneIntact(output, 48000);
     return result;
-}
-
-// A step claiming an absurd (negative) input sample rate: the resampler
-// AudioPipeline builds to join it can't allocate buffers of that size, and
-// both join points must let that rejection propagate (the pipeline still
-// frees the step it had already taken ownership of).
-bool absurdStepRateRejectedAtBothJoinPoints()
-{
-    bool rejectedFirst = false;
-    bool rejectedLater = false;
-
-    {
-        AudioPipeline pipeline(8000, 8000);
-        try
-        {
-            pipeline.appendPipelineStep(new ImpossibleStep());
-        }
-        catch (const std::bad_alloc&)
-        {
-            rejectedFirst = true;
-        }
-    }
-
-    {
-        AudioPipeline pipeline(8000, 8000);
-        pipeline.appendPipelineStep(new CountingStep(8000));
-        try
-        {
-            pipeline.appendPipelineStep(new ImpossibleStep());
-        }
-        catch (const std::bad_alloc&)
-        {
-            rejectedLater = true;
-        }
-    }
-
-    if (!rejectedFirst || !rejectedLater)
-    {
-        std::cerr << "[absurd step rate " << (rejectedFirst ? "rejected" : "accepted")
-                  << " at the start, " << (rejectedLater ? "rejected" : "accepted")
-                  << " after a good step]...";
-        return false;
-    }
-    return true;
 }
 
 // The conversion helpers' divisor special cases: an ordinary divisor, and
@@ -624,7 +564,6 @@ int main()
     TEST_CASE(lastStepAtOutputRateNeedsNoResampler);
     TEST_CASE(dumpSetupDescribesResampledAndPlainSteps);
     TEST_CASE(appendWhileResultSamplerPresent);
-    TEST_CASE(absurdStepRateRejectedAtBothJoinPoints);
     TEST_CASE(conversionHelperDivisorSpecialCases);
     TEST_CASE(reloadResamplerKeepThenRebuild);
     TEST_CASE(reloadResultResamplerEveryCondition);

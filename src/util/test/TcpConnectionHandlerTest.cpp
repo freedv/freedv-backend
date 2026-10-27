@@ -26,6 +26,22 @@
 #if defined(ENABLE_TLS_SUPPORT)
 #include <openssl/ssl.h>
 #include "TestCertificate.h"
+
+namespace {
+// A socket BIO callback that makes every write report "try again later" (as
+// on a full socket buffer), however much room the OS has. Failing a write
+// before it happens leaves the BIO's ownership untouched.
+long failBioWrites_(BIO* b, int oper, const char*, size_t, int, long, int ret, size_t*)
+{
+    if (oper == BIO_CB_WRITE)
+    {
+        BIO_clear_retry_flags(b);
+        BIO_set_retry_write(b);
+        return -1;
+    }
+    return ret;
+}
+} // namespace
 #endif // defined(ENABLE_TLS_SUPPORT)
 // ---------------------------------------------------------------------------
 // --wrap fault-injection shims (Linux-only; see src/util/CMakeLists.txt).
@@ -49,6 +65,7 @@ std::atomic<int> sslCtxNewFailOnce_{0};
 std::atomic<int> sslDefaultPathsWarnOnce_{0};
 std::atomic<int> sslMinProtoFailOnce_{0};
 std::atomic<int> sslSetFdFailOnce_{0};
+std::atomic<int> sslBlockWritesOnSetFdOnce_{0}; // the handshake's very first write already stalls
 std::atomic<int> sslSet1HostFailOnce_{0};
 #endif // defined(ENABLE_TLS_SUPPORT)
 } // namespace
@@ -173,7 +190,14 @@ int __wrap_SSL_set_fd(SSL* ssl, int fd)
         fprintf(stderr, "[fault] SSL_set_fd -> 0\n");
         return 0;
     }
-    return __real_SSL_set_fd(ssl, fd);
+    int rv = __real_SSL_set_fd(ssl, fd);
+    if (rv == 1 && sslBlockWritesOnSetFdOnce_.exchange(0))
+    {
+        // Before SSL_connect() runs, so even the ClientHello can't be sent.
+        BIO_set_callback_ex(SSL_get_wbio(ssl), failBioWrites_);
+        fprintf(stderr, "[fault] SSL writes -> want write\n");
+    }
+    return rv;
 }
 
 int __real_SSL_set1_host(SSL* ssl, const char* host);
@@ -265,17 +289,8 @@ static void callCheckConnections(TcpConnectionHandler& conn, std::vector<int>& s
             return false;
         }
 
-        // The socket BIO (read and write share it). A callback that fails a
-        // write before it happens leaves the BIO's ownership untouched.
-        BIO_set_callback_ex(SSL_get_rbio(ssl), [](BIO* b, int oper, const char*, size_t, int, long, int ret, size_t*) -> long {
-            if (oper == BIO_CB_WRITE)
-            {
-                BIO_clear_retry_flags(b);
-                BIO_set_retry_write(b);
-                return -1;
-            }
-            return ret;
-        });
+        // The socket BIO (read and write share it).
+        BIO_set_callback_ex(SSL_get_rbio(ssl), failBioWrites_);
         return true;
     }
 // Nulls out the SSL object while the connection still believes it has TLS.
@@ -1281,8 +1296,12 @@ bool testPendingConnectSucceedsWhileDnsPending()
         return report(true);
     }
 
+    // Connect until one connect stays pending: the backlog is then full,
+    // with exactly one filler waiting to take the first freed slot. (How
+    // many connections listen(4) holds differs: 5 on Linux, 4 on macOS.)
     std::vector<int> fillers;
-    for (int i = 0; i < 6; i++)
+    bool fillerPending = false;
+    while (!fillerPending && fillers.size() < 64)
     {
         int f = testOpenSocket(AF_INET6, SOCK_STREAM);
         testSetNonBlocking(f);
@@ -1293,16 +1312,19 @@ bool testPendingConnectSucceedsWhileDnsPending()
         inet_pton(AF_INET6, "::1", &to.sin6_addr);
         ::connect(f, (struct sockaddr*)&to, sizeof(to));
         fillers.push_back(f);
+        fillerPending = !testWaitWritable(f, 200);
     }
+    result &= CHECK(fillerPending);
 
     ScriptedDnsConnection conn({1500ms, {{"::1", filled6.port()}}}, {4000ms, {}});
     auto connectFuture = conn.connect("scripted.test", 1, false);
-    // Free one backlog slot only while DNS is still "pending", so the stored
-    // in-flight attempt must be rescued by the watch loop.
+    // The first freed backlog slot goes to the waiting filler. The second is
+    // freed only while DNS is still "pending" and the handler's attempt is
+    // in flight, so that attempt must be rescued by the watch loop.
     result &= CHECK(connectFuture.wait_for(1000ms) == std::future_status::timeout);
     result &= CHECK(filled6.accept(ACCEPT_TIMEOUT_MS));
     result &= CHECK(connectFuture.wait_for(1000ms) == std::future_status::timeout);
-    result &= CHECK(filled6.accept(ACCEPT_TIMEOUT_MS)); // the handler's own connect
+    result &= CHECK(filled6.accept(ACCEPT_TIMEOUT_MS)); // room for the handler's connect
     result &= CHECK(conn.waitForConnects(1, 4s));
     result &= CHECK(conn.disconnectCount() == 0);
     for (int f : fillers)
@@ -1562,16 +1584,10 @@ bool testStalledSendSelectErrorOnClosedSocket()
 
     testCloseSocket(TcpConnectionHandlerTest::clientSocket(conn)); // fd gone, number stays "valid"
 
-    if (sendFuture.wait_for(EVENT_TIMEOUT) == std::future_status::ready)
-    {
-        // select() failed on the dead number and the pass ended as an error.
-        return report(result);
-    }
-
-    std::cout << "SKIP (send loop kept waiting; a cancel ends it) ";
-    auto disconnectFuture = conn.disconnect(); // cancelConnect_ must end the wait
+    // select() fails on the dead number and the pass ends as an error, with
+    // nobody having to cancel it.
     result &= CHECK(sendFuture.wait_for(EVENT_TIMEOUT) == std::future_status::ready);
-    result &= CHECK(disconnectFuture.wait_for(EVENT_TIMEOUT) == std::future_status::ready);
+    conn.disconnect().wait();
     return report(result);
 }
 #endif // !defined(WIN32)
@@ -2221,38 +2237,6 @@ bool testTlsWithoutCertEnvVars(TestCertificate& cert)
     return report(result);
 }
 
-bool testTlsHandshakeWantsWrite(TestCertificate& cert)
-{
-    std::cout << "Test 55 (TLS handshake stalled wanting to write: disconnect cancels it): ";
-    testSetEnv("SSL_CERT_FILE", cert.path.c_str());
-    LoopbackTcpServer server;
-    TestConnection conn;
-    bool result = CHECK(server.valid());
-    auto connectFuture = conn.connect("localhost", server.port(), false, true);
-    result &= CHECK(server.accept(ACCEPT_TIMEOUT_MS)); // TCP accepted, TLS never answered
-
-    // Once the handshake's SSL object exists, make the client's TLS writes
-    // report "try again", so SSL_connect() stalls wanting to write.
-    auto start = std::chrono::steady_clock::now();
-    while (!TcpConnectionHandlerTest::blockSslWrites(conn) &&
-           std::chrono::steady_clock::now() - start < EVENT_TIMEOUT)
-    {
-        std::this_thread::sleep_for(10ms);
-    }
-    if (!TcpConnectionHandlerTest::sslWantsWrite(conn))
-    {
-        std::cout << "SKIP (handshake past its first write) ";
-        conn.disconnect().wait();
-        return report(result);
-    }
-
-    auto disconnectFuture = conn.disconnect(); // must break out of the loop
-    result &= CHECK(connectFuture.wait_for(EVENT_TIMEOUT) == std::future_status::ready);
-    result &= CHECK(disconnectFuture.wait_for(EVENT_TIMEOUT) == std::future_status::ready);
-    result &= CHECK(conn.connectCount() == 0);
-    return report(result);
-}
-
 bool testTlsFlaggedWithoutSslObject()
 {
     std::cout << "Test 56 (TLS flagged but no SSL object: helpers bail out, plain path used): ";
@@ -2707,6 +2691,33 @@ bool testTlsSetFdFailure(TestCertificate& cert)
     return report(result);
 }
 
+bool testTlsHandshakeWantsWrite(TestCertificate& cert)
+{
+    std::cout << "Test 55 (TLS handshake stalled wanting to write: disconnect cancels it): ";
+    testSetEnv("SSL_CERT_FILE", cert.path.c_str());
+    LoopbackTcpServer server;
+    TestConnection conn;
+    bool result = CHECK(server.valid());
+    sslBlockWritesOnSetFdOnce_.store(1); // SSL_connect() stalls wanting to write from the start
+    auto connectFuture = conn.connect("localhost", server.port(), false, true);
+    result &= CHECK(server.accept(ACCEPT_TIMEOUT_MS)); // TCP accepted, TLS never answered
+
+    auto start = std::chrono::steady_clock::now();
+    while (!TcpConnectionHandlerTest::sslWantsWrite(conn) &&
+           std::chrono::steady_clock::now() - start < EVENT_TIMEOUT)
+    {
+        std::this_thread::sleep_for(10ms);
+    }
+    result &= CHECK(sslBlockWritesOnSetFdOnce_.load() == 0);
+    result &= CHECK(TcpConnectionHandlerTest::sslWantsWrite(conn));
+
+    auto disconnectFuture = conn.disconnect(); // must break out of the loop
+    result &= CHECK(connectFuture.wait_for(EVENT_TIMEOUT) == std::future_status::ready);
+    result &= CHECK(disconnectFuture.wait_for(EVENT_TIMEOUT) == std::future_status::ready);
+    result &= CHECK(conn.connectCount() == 0);
+    return report(result);
+}
+
 bool testTlsWarnOnlySetupFailures(TestCertificate& cert)
 {
     std::cout << "Test 69 (a default_verify_paths failure is warn-only): ";
@@ -2865,7 +2876,6 @@ int main(int, char**)
     result &= testTlsBurstToSlowReceiver(cert);
     result &= testTlsCertDirEnv(cert);
     result &= testTlsWithoutCertEnvVars(cert);
-    result &= testTlsHandshakeWantsWrite(cert);
     result &= testTlsHelloRetryRequestStallsWrite(cert);
     result &= testTlsFlaggedWithoutSslObject();
     result &= testTlsSendLosesSslObjectMidWait(cert);
@@ -2874,6 +2884,7 @@ int main(int, char**)
 #if !defined(_WIN32) && !defined(__APPLE__)
     result &= testTlsSslCtxAllocationFailure(cert);
     result &= testTlsSetFdFailure(cert);
+    result &= testTlsHandshakeWantsWrite(cert);
     result &= testTlsWarnOnlySetupFailures(cert);
     result &= testTlsPeerNameWarnings(cert);
     result &= testTlsMinProtoFailureRefusesConnection(cert);
