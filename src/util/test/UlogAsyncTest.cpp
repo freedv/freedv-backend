@@ -596,6 +596,8 @@ bool testConversionClassificationEdges()
     std::cout << "Test 13 (%c, %p, unterminated '*' specs, trailing %n, multi-digit precision): ";
 
     int probe = 0;
+    char expectedPtr[64];
+    snprintf(expectedPtr, sizeof(expectedPtr), "ptr %p end", (void*)&probe); // %p's form is the platform's
     std::string out = captureStderr([&]() {
         log_info("chr %c end", 'A');
         log_info("ptr %p end", &probe);
@@ -609,7 +611,7 @@ bool testConversionClassificationEdges()
     });
 
     bool result = contains(out, "chr A end") &&
-                  contains(out, "ptr 0x") &&
+                  contains(out, expectedPtr) &&
                   contains(out, "star at end <?>") &&
                   contains(out, "star mid <?>") &&
                   contains(out, "dotstar at end <?>") &&
@@ -666,7 +668,7 @@ bool testCapBoundaryAppend()
     return result;
 }
 
-// flush() polls (empty ring && consumer idle) up to 2000 times and gives up;
+// flush() polls (empty ring && consumer idle) for up to 2 s and gives up;
 // with a producer logging nonstop it must still return rather than hang.
 // (Whether it uses up its whole budget depends on whether the consumer ever
 // catches up, which is down to scheduling, so that isn't asserted.)
