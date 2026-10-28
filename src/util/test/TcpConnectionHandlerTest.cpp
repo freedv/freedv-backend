@@ -1532,9 +1532,9 @@ bool testLateIpv6CollectedWhileIpv4AttemptInFlight()
     LoopbackTcpServer server6(AF_INET6);
     if (skipWithoutIpv6(server6)) return true;
 
-    // A listener whose single backlog slot is already taken: the IPv4 attempt
-    // stays pending through the whole 250 ms check, which is long enough for
-    // the (150 ms) IPv6 lookup to publish its answer before the hop back to
+    // A listener whose backlog is already full: the IPv4 attempt stays
+    // pending through the whole 250 ms check, which is long enough for the
+    // (150 ms) IPv6 lookup to publish its answer before the hop back to
     // index 0, where the already-ready future must be collected without
     // blocking.
     int full4 = testOpenSocket(AF_INET, SOCK_STREAM);
@@ -1546,10 +1546,22 @@ bool testLateIpv6CollectedWhileIpv4AttemptInFlight()
     result &= CHECK(bind(full4, (struct sockaddr*)&addr, sizeof(addr)) == 0);
     socklen_t addrLen = sizeof(addr);
     result &= CHECK(getsockname(full4, (struct sockaddr*)&addr, &addrLen) == 0);
-    result &= CHECK(listen(full4, 0) == 0);
-    int filler = testOpenSocket(AF_INET, SOCK_STREAM);
-    result &= CHECK(filler >= 0);
-    result &= CHECK(::connect(filler, (struct sockaddr*)&addr, sizeof(addr)) == 0); // occupies the slot
+    result &= CHECK(listen(full4, 1) == 0);
+
+    // Connect until one connect stays pending, as in Test 45: how many
+    // connections listen(1) holds differs (2 on Linux, 1 on macOS). (macOS
+    // doesn't limit listen(0) at all.)
+    std::vector<int> fillers;
+    bool fillerPending = false;
+    while (!fillerPending && fillers.size() < 64)
+    {
+        int f = testOpenSocket(AF_INET, SOCK_STREAM);
+        testSetNonBlocking(f);
+        ::connect(f, (struct sockaddr*)&addr, sizeof(addr));
+        fillers.push_back(f);
+        fillerPending = !testWaitWritable(f, 200);
+    }
+    result &= CHECK(fillerPending);
 
     ScriptedDnsConnection conn({150ms, {{"::1", server6.port()}}},
                                 {0ms, {{"127.0.0.1", ntohs(addr.sin_port)}}});
@@ -1558,7 +1570,10 @@ bool testLateIpv6CollectedWhileIpv4AttemptInFlight()
     result &= CHECK(server6.accept(ACCEPT_TIMEOUT_MS)); // the IPv6 attempt connects once collected
     result &= CHECK(conn.waitForConnects(1));
 
-    testCloseSocket(filler);
+    for (int f : fillers)
+    {
+        testCloseSocket(f);
+    }
     testCloseSocket(full4);
     return report(result);
 }
@@ -2398,7 +2413,7 @@ bool testTlsHelloRetryRequestStallsWrite(TestCertificate& cert)
     bool wireOk = true;
     while (wireOk && got < 5)
     {
-        ssize_t n = ::recv(peer, hello + got, sizeof(hello) - got, 0);
+        ssize_t n = ::recv(peer, (char*)hello + got, sizeof(hello) - got, 0);
         if (n <= 0) wireOk = false; else got += int(n);
     }
     if (wireOk)
@@ -2406,7 +2421,7 @@ bool testTlsHelloRetryRequestStallsWrite(TestCertificate& cert)
         int recLen = (hello[3] << 8) | hello[4];
         while (wireOk && got < 5 + recLen && got < int(sizeof(hello)))
         {
-            ssize_t n = ::recv(peer, hello + got, sizeof(hello) - got, 0);
+            ssize_t n = ::recv(peer, (char*)hello + got, sizeof(hello) - got, 0);
             if (n <= 0) wireOk = false; else got += int(n);
         }
     }
@@ -2535,7 +2550,7 @@ bool testTlsHelloRetryRequestStallsWrite(TestCertificate& cert)
     // report "try again", so the handshake loop stalls wanting to write and
     // arms its select() waits on the write side.
     result &= CHECK(TcpConnectionHandlerTest::blockSslWrites(conn));
-    result &= CHECK((int)::send(peer, hrr, hrrLen, 0) == hrrLen);
+    result &= CHECK((int)::send(peer, (const char*)hrr, hrrLen, 0) == hrrLen);
 
     auto start = std::chrono::steady_clock::now();
     while (!TcpConnectionHandlerTest::sslWantsWrite(conn) &&
