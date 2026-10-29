@@ -47,6 +47,7 @@ LinkStep::LinkStep(int outputSampleRate, size_t numSamples)
     assert(numSamples > 0 && numSamples <= (size_t)std::numeric_limits<int>::max());
 
     tmpBuffer_ = new short[numSamples];
+    assert(tmpBuffer_ != nullptr);
 }
 
 LinkStep::~LinkStep()

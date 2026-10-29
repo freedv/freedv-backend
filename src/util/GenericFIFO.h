@@ -141,6 +141,7 @@ GenericFIFO<T>::GenericFIFO(int len, T* inBuf)
     if (ownBuffer_)
     {
         buf = new T[nelem];
+        assert(buf != nullptr);
     }
 }
 

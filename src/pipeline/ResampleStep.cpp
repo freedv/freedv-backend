@@ -52,10 +52,13 @@ ResampleStep::ResampleStep(int inputSampleRate, int outputSampleRate, bool forPl
     // operation. All buffers are RAII members and src_new() runs last, so
     // nothing claimed earlier leaks if a later allocation throws.
     outputSamples_ = std::make_unique<short[]>(outputSampleRate);
+    assert(outputSamples_ != nullptr);
 
     tempInput_ = std::make_unique<float[]>(maxInputLen);
+    assert(tempInput_ != nullptr);
 
     tempOutput_ = std::make_unique<float[]>(maxOutputLen);
+    assert(tempOutput_ != nullptr);
 
     resampleState_ = src_new(forPlotsOnly ? SRC_LINEAR : SRC_SINC_MEDIUM_QUALITY, 1, &src_error);
     assert(resampleState_ != nullptr);

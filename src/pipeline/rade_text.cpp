@@ -414,6 +414,7 @@ void rade_text_rx(rade_text_t ptr, float *syms, int symSize)
 rade_text_t rade_text_create()
 {
     rade_text_impl_t *ret = new RadeTextImpl();
+    assert(ret != NULL);
 
     return (rade_text_t)ret;
 }

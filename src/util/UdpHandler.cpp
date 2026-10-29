@@ -345,7 +345,7 @@ void UdpHandler::joinMulticastGroup_(struct addrinfo* addr)
 #endif // defined(WIN32)
             }
     }
-    else  // resolveIpAddress_ hints AF_INET/AF_INET6 only
+    else if (addr->ai_family == AF_INET)
     {
         struct ip_mreq multicastRequest;  /* Multicast address join structure */
 
@@ -426,5 +426,8 @@ void UdpHandler::joinMulticastGroup_(struct addrinfo* addr)
 #endif // defined(WIN32)
         }
     }
-    // (no third family: resolveIpAddress_ restricts results to AF_INET/AF_INET6)
+    else
+    {
+        assert(0); // should not reach here
+    }
 }

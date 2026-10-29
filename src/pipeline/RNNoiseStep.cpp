@@ -53,6 +53,7 @@ RNNoiseStep::RNNoiseStep()
 
     // Pre-allocate buffers so we don't have to do so during real-time operation.
     outputSamples_ = std::make_unique<short[]>(RNNOISE_SAMPLE_RATE);
+    assert(outputSamples_ != nullptr);
 }
 
 RNNoiseStep::~RNNoiseStep()

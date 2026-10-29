@@ -81,6 +81,7 @@ AgcStep::AgcStep(int sampleRate)
     , inputSampleFifo_(MAX_AGC_SAMPLES + 1)
 {
     numSamplesPerRun_ = std::min(MAX_AGC_SAMPLES, sampleRate_ / TEN_MS_DIVIDER); // 10ms blocks, 160 max samples
+    assert(numSamplesPerRun_ > 0);
 
     // Configure WebRTC as solely a limiter (i.e. no AGC)
     agcState_ = WebRtcAgc_Create();
@@ -105,8 +106,10 @@ AgcStep::AgcStep(int sampleRate)
     // Sized for the rate we actually run at: an unsupported sampleRate falls
     // back to 48 kHz, and callers then send audio at that rate.
     outputSamples_ = std::make_unique<short[]>(sampleRate_);
+    assert(outputSamples_ != nullptr);
 
     tmpInput_ = std::make_unique<short[]>(numSamplesPerRun_);
+    assert(tmpInput_ != nullptr);
 }
 
 AgcStep::~AgcStep()

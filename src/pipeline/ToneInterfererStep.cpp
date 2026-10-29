@@ -54,6 +54,7 @@ ToneInterfererStep::ToneInterfererStep(
 {
     // Pre-allocate buffers so we don't have to do so during real-time operation.
     outputSamples_ = std::make_unique<short[]>(sampleRate_);
+    assert(outputSamples_ != nullptr);
 }
 
 ToneInterfererStep::~ToneInterfererStep()
