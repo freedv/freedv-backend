@@ -59,9 +59,13 @@ struct TestCertificate
         X509_gmtime_adj(X509_getm_notAfter(cert), 3600);
         X509_set_pubkey(cert, key);
 
-        X509_NAME* name = X509_get_subject_name(cert);
+        // Build the name separately: OpenSSL 4's X509_get_subject_name()
+        // returns a const name that can't be added to.
+        X509_NAME* name = X509_NAME_new();
         X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, (const unsigned char*)"localhost", -1, -1, 0);
+        X509_set_subject_name(cert, name);
         X509_set_issuer_name(cert, name);
+        X509_NAME_free(name);
 
         X509V3_CTX extCtx;
         X509V3_set_ctx_nodb(&extCtx);
