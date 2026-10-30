@@ -60,8 +60,6 @@ using namespace std::chrono_literals;
 
 #define FEATURE_FIFO_SIZE ((RADE_SPEECH_SAMPLE_RATE / LPCNET_FRAME_SIZE) * rade_n_features_in_out(dv_))
 
-const int RADE_SCALING_FACTOR = 16383;
-
 // Additional silence added at the end of the EOO block to ensure that it actually gets
 // transmitted out over the air. This was determined experimentally using the FlexRadio
 // waveform and OTA testing to be 200ms. Other radios (especially ones directly connected
@@ -80,9 +78,10 @@ int RADETransmitStep::eooLengthInSamples() const FREEDV_NONBLOCKING
     FREEDV_END_VERIFIED_SAFE
 }
 
-RADETransmitStep::RADETransmitStep(struct rade* dv, LPCNetEncState* encState)
+RADETransmitStep::RADETransmitStep(struct rade* dv, LPCNetEncState* encState, rade_text_t textPtr)
     : dv_(dv)
     , encState_(encState)
+    , textPtr_(textPtr)
     , inputSampleFifo_(LPCNET_FRAME_SIZE + 1)
     , featureList_(nullptr)
     , featureListIdx_(0)
@@ -222,13 +221,19 @@ short* RADETransmitStep::execute(short* inputSamples, int numInputSamples, int* 
                     // RADE TX handling
                     int numOut = 0;
                     FREEDV_BEGIN_VERIFIED_SAFE
+                        if (textPtr_ != nullptr)
+                        {
+                            // Stream one bit of the (continuously repeating) text
+                            // payload per modem frame (~25 bits/s).
+                            rade_tx_set_data_symbol(dv_, rade_text_tx_next_symbol(textPtr_));
+                        }
                         numOut = rade_tx(dv_, radeOut_, &featureList_[0]);
                     FREEDV_END_VERIFIED_SAFE
 
                     for (int index = 0; index < numOut; index++)
                     {
                         // We only need the real component for TX.
-                        radeOutShort_[index] = radeOut_[index].real * RADE_SCALING_FACTOR;
+                        radeOutShort_[index] = radeOut_[index].real * RADE_INT16_SCALE;
                     }
                     outputSampleFifo_.write(radeOutShort_, numOut);
                     *numOutputSamples = outputSampleFifo_.numUsed();
@@ -259,7 +264,7 @@ void RADETransmitStep::restartVocoder() FREEDV_NONBLOCKING
     memset(eooOutShort_, 0, sizeof(short) * (numEOOSamples + NUM_SAMPLES_SILENCE));
     for (int index = 0; index < numEOOSamples; index++)
     {
-        eooOutShort_[index] = eooOut_[index].real * RADE_SCALING_FACTOR;
+        eooOutShort_[index] = eooOut_[index].real * RADE_INT16_SCALE;
     }
 
     if (outputSampleFifo_.write(eooOutShort_, numEOOSamples + NUM_SAMPLES_SILENCE) != 0)

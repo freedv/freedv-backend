@@ -85,6 +85,7 @@ public:
         , deferReset_(false)
         , radeText_(radeText)
         , txStep_(nullptr)
+        , disableProcessing_(false)
     { 
         assert(inputSampleRate_ > 0);
         assert(outputSampleRate_ > 0);
@@ -105,6 +106,13 @@ public:
         // Free allocated buffer
         stop();
         inputSamples_ = nullptr;
+    }
+
+    // Disables all audio processing. Intended for use only for tests.
+    // Must be called prior to start().
+    void disableProcessing()
+    {
+        disableProcessing_ = true;
     }
 
     void start()
@@ -151,6 +159,7 @@ private:
     rade_text_t radeText_;
     std::thread thread_;
     RADETransmitStep* txStep_;
+    bool disableProcessing_;
     std::atomic<signed char> snr_;
     std::atomic<int> sync_;
 

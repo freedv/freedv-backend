@@ -1,7 +1,7 @@
 // Two transmissions in a row through MinimalTxRxThread: when TX starts
 // again after a gap, the thread must reset its pipeline and empty its input
 // FIFO (so audio queued while not transmitting isn't sent), and each
-// transmission must end with its own end-of-over carrying the callsign.
+// transmission must deliver the callsign (RADE V2 streams it throughout).
 
 #include <atomic>
 #include <chrono>
@@ -120,17 +120,21 @@ std::vector<short> transmit(paCallBackData& cbData, const std::vector<short>& sp
 
 bool secondTransmissionStartsClean()
 {
-    auto speech = loadSpeech16k(10.0);
-    if (speech.size() < (size_t)(10 * SPEECH_RATE))
+    // Each transmission is 15 s: RADE V2 sends the callsign continuously,
+    // one cycle every ~4.5 s, but from a cold start the receiver needs about
+    // 9-12 s of signal for its first decode (8 s gave none).
+    const int OVER_SECONDS = 15;
+    auto speech = loadSpeech16k(2.0 * OVER_SECONDS);
+    if (speech.size() < (size_t)(2 * OVER_SECONDS * SPEECH_RATE))
     {
         std::cerr << "[could not load the speech sample]...";
         return false;
     }
-    std::vector<short> firstOver(speech.begin(), speech.begin() + 5 * SPEECH_RATE);
-    std::vector<short> secondOver(speech.begin() + 5 * SPEECH_RATE, speech.end());
+    std::vector<short> firstOver(speech.begin(), speech.begin() + OVER_SECONDS * SPEECH_RATE);
+    std::vector<short> secondOver(speech.begin() + OVER_SECONDS * SPEECH_RATE, speech.end());
 
     char modelFile[1] = {0};
-    struct rade* rade = rade_open(modelFile, RADE_USE_C_ENCODER | RADE_USE_C_DECODER);
+    struct rade* rade = rade_open(modelFile, RADE_USE_C_ENCODER | RADE_USE_C_DECODER | RADE_MODE_V2);
     LPCNetEncState* encState = lpcnet_encoder_create();
     FARGANState fargan;
     {
@@ -140,9 +144,7 @@ bool secondTransmissionStartsClean()
         fargan_cont(&fargan, zeros, inFeatures);
     }
     rade_text_t radeText = rade_text_create();
-    std::vector<float> eooSyms(rade_n_eoo_bits(rade));
-    rade_text_generate_tx_string(radeText, "K6AQ", 4, eooSyms.data(), (int)eooSyms.size());
-    rade_tx_set_eoo_bits(rade, eooSyms.data());
+    rade_text_generate_tx_string(radeText, "K6AQ", 4);
     CallsignsReceived = 0;
     rade_text_set_rx_callback(radeText, [](rade_text_t, const char* txt, int length, void*) {
         if (length == 4 && strncmp(txt, "K6AQ", 4) == 0) CallsignsReceived++;
@@ -152,7 +154,7 @@ bool secondTransmissionStartsClean()
     // Room for a whole transmission, so its speech is queued at once and the
     // thread can never run dry mid-transmission (it would send silence,
     // making the transmission longer, on a slow or busy machine).
-    cbData.infifo1 = new GenericFIFO<short>(8 * SPEECH_RATE);
+    cbData.infifo1 = new GenericFIFO<short>((OVER_SECONDS + 2) * SPEECH_RATE);
     cbData.outfifo1 = nullptr; // sized once the TX thread knows its frame size
     cbData.infifo2 = new GenericFIFO<short>(MODEM_RATE);
     cbData.outfifo2 = new GenericFIFO<short>(SPEECH_RATE);
@@ -186,33 +188,40 @@ bool secondTransmissionStartsClean()
     auto modem2 = transmit(cbData, secondOver);
     txThread->stop();
 
-    // Receive both transmissions, with a second of silence between them.
-    std::vector<short> modem = modem1;
-    modem.insert(modem.end(), MODEM_RATE, 0);
-    modem.insert(modem.end(), modem2.begin(), modem2.end());
-    modem.insert(modem.end(), 2 * MODEM_RATE, 0); // flush the receiver
+    // Receive the transmissions one at a time (with silence after each, so
+    // the receiver drops sync between them), counting the callsigns each
+    // delivers.
     std::vector<short> received;
-    feed(cbData.infifo2, modem.data(), modem.size(), MODEM_CHUNK, cbData.outfifo2, received);
-    auto deadline = std::chrono::steady_clock::now() + 60s;
-    while (cbData.infifo2->numUsed() > 0 && std::chrono::steady_clock::now() < deadline)
-    {
-        std::this_thread::sleep_for(10ms);
+    auto receiveOver = [&](const std::vector<short>& over) {
+        std::vector<short> modem = over;
+        modem.insert(modem.end(), 2 * MODEM_RATE, 0);
+        feed(cbData.infifo2, modem.data(), modem.size(), MODEM_CHUNK, cbData.outfifo2, received);
+        auto deadline = std::chrono::steady_clock::now() + 60s;
+        while (cbData.infifo2->numUsed() > 0 && std::chrono::steady_clock::now() < deadline)
+        {
+            std::this_thread::sleep_for(10ms);
+            drainInto(cbData.outfifo2, received);
+        }
+        std::this_thread::sleep_for(500ms);
         drainInto(cbData.outfifo2, received);
-    }
-    std::this_thread::sleep_for(500ms);
-    drainInto(cbData.outfifo2, received);
+        return CallsignsReceived;
+    };
+    int callsignsAfterFirst = receiveOver(modem1);
+    int callsignsAfterSecond = receiveOver(modem2);
     rxThread->stop();
 
     double seconds1 = (double)modem1.size() / MODEM_RATE;
     double seconds2 = (double)modem2.size() / MODEM_RATE;
     double receivedSeconds = (double)received.size() / SPEECH_RATE;
-    // Each transmission is 5 s of speech plus the end-of-over burst.
-    bool result = seconds1 >= 5.0 && std::abs(seconds2 - seconds1) < 0.3 && CallsignsReceived == 2 &&
-                  receivedSeconds > 8.0 && receivedSeconds < 14.0;
+    // Each transmission is its speech plus the end-of-over burst.
+    bool result = seconds1 >= OVER_SECONDS && std::abs(seconds2 - seconds1) < 0.3 &&
+                  callsignsAfterFirst >= 1 && callsignsAfterSecond > callsignsAfterFirst &&
+                  receivedSeconds > 1.6 * OVER_SECONDS && receivedSeconds < 3.0 * OVER_SECONDS;
     if (!result)
     {
         std::cerr << "[transmissions " << seconds1 << " s and " << seconds2 << " s of modem audio, "
-                  << CallsignsReceived << " callsigns received, " << receivedSeconds << " s of speech back]...";
+                  << callsignsAfterFirst << " callsign(s) from the first, " << (callsignsAfterSecond - callsignsAfterFirst)
+                  << " from the second, " << receivedSeconds << " s of speech back]...";
     }
 
     txThread.reset();

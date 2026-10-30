@@ -69,6 +69,26 @@ target_link_libraries(RadeTextTest PRIVATE rade opus samplerate)
 
 DefineUnitTest(RadeTextUnitTest)
 
+# Monte Carlo evaluation of rade_text receive combining (not run by ctest;
+# see test/RadeTextSim.cpp). Compiles rade_text.cpp directly and always
+# optimizes since the simulation is too slow to be useful at -O0.
+add_executable(RadeTextSim test/RadeTextSim.cpp rade_text.cpp)
+target_compile_options(RadeTextSim PRIVATE -O2)
+find_package(Threads REQUIRED)
+target_link_libraries(RadeTextSim PRIVATE fdv_util Threads::Threads)
+target_include_directories(RadeTextSim PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/..)
+
+# Time-to-decode of rade_text callsigns through the real RADE V2 modem and a
+# simulated HF channel (not run by ctest; see test/RadeTextOtaSim.cpp).
+# Linked like RadeTextTest: fdv_audio_pipeline must come first, otherwise
+# configuring a clean tree fails because the rade IMPORTED target's include
+# directory doesn't exist until build_rade has run.
+add_executable(RadeTextOtaSim test/RadeTextOtaSim.cpp)
+target_compile_options(RadeTextOtaSim PRIVATE -O2)
+target_link_libraries(RadeTextOtaSim PRIVATE fdv_audio_pipeline fdv_util rade opus)
+target_include_directories(RadeTextOtaSim PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/..)
+set_target_properties(RadeTextOtaSim PROPERTIES BUILD_RPATH "${CMAKE_BUILD_RPATH};${rade_BINARY_DIR}/src")
+
 DefineUnitTest(RadeStepResetTest)
 target_link_libraries(RadeStepResetTest PRIVATE rade opus samplerate)
 DefineUnitTest(RadeLoopbackTest)
