@@ -10,9 +10,13 @@ The Markdown goes to $GITHUB_STEP_SUMMARY if set, otherwise stdout. The
 llvm-profdata and llvm-cov commands can be overridden with the LLVM_PROFDATA
 and LLVM_COV environment variables (e.g. LLVM_COV="xcrun llvm-cov").
 
-Third-party code, the tests themselves and the standalone LDPC tools are left
-out. llvm-cov only knows about files linked into a test, so backend sources
-that were compiled but never linked into one are listed separately.
+Third-party code (including the vendored ulog.c logging backend), the tests
+themselves and the standalone LDPC tools are left out. llvm-cov only knows
+about files linked into a test, so backend sources that were compiled but
+never linked into one are listed separately.
+
+As in freedv-gui, branches on assert() lines aren't counted: their failing
+side only runs when an assertion fails. The HTML report still shows them.
 """
 import glob
 import json
@@ -24,7 +28,10 @@ import subprocess
 import sys
 
 SOURCE_DIR = os.path.realpath(os.path.join(os.path.dirname(__file__), '..', '..', 'src'))
-EXCLUDE = r'3rdparty|/test/|Test\.cpp$|ldpc_(en|de)code\.c(pp)?$|util/timespec\.[ch]$|util/logging/libfmemopen|websocketpp/'
+EXCLUDE = r'3rdparty|/test/|Test\.cpp$|ldpc_(en|de)code\.c(pp)?$|util/timespec\.[ch]$|util/logging/libfmemopen|util/logging/ulog\.c$|websocketpp/'
+# Lines whose branches aren't counted (freedv-gui's coverage job passes the
+# same pattern to gcovr's --exclude-branches-by-pattern).
+BRANCH_EXCLUSIONS = r'\bassert\s*\('
 
 
 def tool(env_name, default):
@@ -61,6 +68,71 @@ def compiled_sources(build_dir):
     return sources
 
 
+def excluded_branches(export, measured):
+    """{file: {branch: [true side run, false side run]}} for the branches
+    that start on a line matching BRANCH_EXCLUSIONS. A branch is identified
+    by its function, location and position among the branches there (e.g.
+    each operand of assert(a && b) has a branch at the assert). Like
+    llvm-cov, a template's instantiations count as one function: those
+    starting at the same place."""
+    sources = {}
+
+    def source_line(path, line):
+        if path not in sources:
+            try:
+                with open(path, errors='replace') as fh:
+                    sources[path] = fh.read().split('\n')
+            except OSError:
+                sources[path] = []
+        lines = sources[path]
+        return lines[line - 1] if line <= len(lines) else ''
+
+    excluded = {}
+    for function in export['functions']:
+        if not function['regions']:
+            continue
+        start = function['regions'][0]
+        group = (function['filenames'][start[6]], start[0], start[1])
+        seen = {}
+        # Branch: [line start, column start, line end, column end, true count, false count,
+        #          file id, expanded file id, kind]
+        for branch in function['branches']:
+            path = os.path.realpath(function['filenames'][branch[6]])
+            if path not in measured or not re.search(BRANCH_EXCLUSIONS, source_line(path, branch[0])):
+                continue
+            where = (branch[0], branch[1])
+            seen[where] = seen.get(where, -1) + 1
+            sides = excluded.setdefault(path, {}).setdefault((group, where, seen[where]), [False, False])
+            sides[0] |= branch[4] > 0
+            sides[1] |= branch[5] > 0
+    return excluded
+
+
+def folded_sides(llvm_cov, cov_args, filenames):
+    """{(file, line, column): sides} for branch sides llvm-cov leaves out of
+    its counts because their condition is a constant (e.g. assert(0)). Only
+    llvm-cov show reports these, as "Folded"."""
+    if not filenames:
+        return {}
+    text = subprocess.run(llvm_cov + ['show', '-show-branches=count', '-show-instantiations=false'] +
+                          cov_args + filenames, capture_output=True, text=True, check=True).stdout
+    folded = {}
+    # With more than one file, each file's listing starts with its path.
+    current = os.path.realpath(filenames[0]) if len(filenames) == 1 else None
+    for line in text.split('\n'):
+        if line.startswith('/') and line.endswith(':'):
+            current = os.path.realpath(line[:-1])
+            continue
+        # e.g. "Branch (431:9): [True: 0, Folded]": the false side is folded.
+        m = re.search(r'Branch \((\d+):(\d+)\): \[([^,\]]*), ([^\]]*)\]', line)
+        if m:
+            sides = folded.setdefault((current, int(m.group(1)), int(m.group(2))), set())
+            for side in (0, 1):
+                if m.group(3 + side).strip() == 'Folded':
+                    sides.add(side)
+    return folded
+
+
 def percent(summary):
     count = summary['count']
     return 100.0 * summary['covered'] / count if count else None
@@ -91,7 +163,7 @@ def main():
 
     # Filter on resolved paths: the build may see the tree through a symlink.
     llvm_cov = tool('LLVM_COV', 'llvm-cov')
-    export = json.loads(subprocess.run(llvm_cov + ['export', '-summary-only'] + cov_args,
+    export = json.loads(subprocess.run(llvm_cov + ['export', '-skip-expansions'] + cov_args,
                                        capture_output=True, text=True, check=True).stdout)['data'][0]
     measured = {}
     for f in export['files']:
@@ -100,6 +172,21 @@ def main():
             rel = os.path.relpath(path, SOURCE_DIR)
             if not re.search(EXCLUDE, rel):
                 measured[rel] = f
+
+    # Take the excluded branches off llvm-cov's own counts, rather than
+    # recounting: its file totals also cover macro expansions and merge a
+    # template's instantiations.
+    paths = {os.path.realpath(f['filename']): rel for rel, f in measured.items()}
+    excluded = excluded_branches(export, paths)
+    folded = folded_sides(llvm_cov, cov_args, [measured[paths[path]]['filename'] for path in sorted(excluded)
+                                               if any(not all(sides) for sides in excluded[path].values())])
+    for path, branches in excluded.items():
+        summary = measured[paths[path]]['summary']['branches']
+        for (_, (line, column), _), sides in branches.items():
+            for side, run in enumerate(sides):
+                if side not in folded.get((path, line, column), ()):
+                    summary['count'] -= 1
+                    summary['covered'] -= run
     files = sorted((name, f['summary']) for name, f in measured.items())
     totals = {}
     for kind in ('lines', 'functions', 'branches'):
@@ -116,8 +203,9 @@ def main():
     out.append('## Backend code coverage')
     out.append('')
     out.append(f'{platform.system()}, clang source-based coverage, {len(binaries)} test programs. '
-               'Third-party code and the tests themselves are excluded. The line-by-line '
-               'report is in the `coverage-html` artifact of this run.')
+               'Third-party code and the tests themselves are excluded, as are the branches on '
+               '`assert()` lines. The line-by-line report is in the `coverage-html` artifact '
+               'of this run.')
     out.append('')
     out.append('| | Covered |')
     out.append('|---|---|')

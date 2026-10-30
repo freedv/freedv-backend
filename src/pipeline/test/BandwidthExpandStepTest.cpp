@@ -203,11 +203,27 @@ bool largeBlockMatchesSmallBlocks()
     return true;
 }
 
+bool nullInputProducesNoOutput()
+{
+    // execute() with a null buffer must produce nothing: the feeder checks
+    // the pointer before handing samples to the frame FIFO.
+    BandwidthExpandStep step;
+    int numOut = -1;
+    step.execute(nullptr, 2 * FRAME, &numOut);
+    if (numOut != 0)
+    {
+        std::cerr << "[null input produced " << numOut << " output samples]...";
+        return false;
+    }
+    return true;
+}
+
 int main()
 {
     TEST_CASE(outputComesInWholeFrames);
     TEST_CASE(speechBandPassesAtOriginalLevel);
     TEST_CASE(addsContentAboveInputBand);
     TEST_CASE(largeBlockMatchesSmallBlocks);
+    TEST_CASE(nullInputProducesNoOutput);
     return 0;
 }

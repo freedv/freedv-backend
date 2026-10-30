@@ -30,6 +30,7 @@ public:
     static std::string message(const FreeDVReporter& reporter) { return reporter.message_; }
     static bool hidden(const FreeDVReporter& reporter) { return reporter.hidden_; }
     static bool fullyConnected(const FreeDVReporter& reporter) { return reporter.isFullyConnected_.load(std::memory_order_relaxed); }
+    static std::string hostname(const FreeDVReporter& reporter) { return reporter.hostname_; }
 };
 
 namespace {
@@ -614,6 +615,112 @@ bool testEventsWithoutHandlersIgnored()
     std::cout << (result ? "PASS" : "FAIL") << "\n";
     return result;
 }
+bool testDefaultHostnameWhenEmpty()
+{
+    std::cout << "Test 15 (empty hostname falls back to the default reporter server): ";
+
+    FreeDVReporter emptyHostname("", "N1DQ", "CN98", "FreeDV Test", false);
+    FreeDVReporter explicitHostname("127.0.0.1:8080", "N1DQ", "CN98", "FreeDV Test", false);
+
+    bool result = (FreeDVReporterTest::hostname(emptyHostname) == FREEDV_REPORTER_DEFAULT_HOSTNAME);
+    result &= (FreeDVReporterTest::hostname(explicitHostname) == "127.0.0.1:8080");
+
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    return result;
+}
+
+bool testDeleteThroughReporterInterface()
+{
+    std::cout << "Test 16 (reporter heap-allocated and deleted through IReporter*): ";
+
+    IReporter* reporter = new FreeDVReporter("127.0.0.1:8080", "N1DQ", "CN98", "FreeDV Test", false);
+    bool result = (reporter != nullptr);
+
+    // Calls through the base pointer prove the object is a live reporter
+    // before the deleting destructor runs.
+    reporter->freqChange(14236000);
+    reporter->send();
+    delete reporter;
+
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    return result;
+}
+
+bool testShowOurselvesWithoutCallback()
+{
+    std::cout << "Test 17 (showOurselves_ clears hidden even with no about_to_show_self callback): ";
+
+    FreeDVReporter reporter("127.0.0.1:8080", "N1DQ", "CN98", "FreeDV Test", false);
+    bool called = false;
+    reporter.setAboutToShowSelfFn([&]() { called = true; });
+    reporter.hideFromView();
+
+    bool result = FreeDVReporterTest::hidden(reporter);
+    reporter.showOurselves();
+    result &= called;
+    result &= !FreeDVReporterTest::hidden(reporter);
+
+    // Same sequence with the callback left unset: no crash, state still updated.
+    FreeDVReporter noCallback("127.0.0.1:8080", "N1DQ", "CN98", "FreeDV Test", false);
+    noCallback.hideFromView();
+    result &= FreeDVReporterTest::hidden(noCallback);
+    noCallback.showOurselves();
+    result &= !FreeDVReporterTest::hidden(noCallback);
+
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    return result;
+}
+
+bool testBulkUpdateWithNonArrayPayloads()
+{
+    std::cout << "Test 18 (bulk_update ignores payloads that are not arrays of event entries): ";
+
+    FreeDVReporter reporter("127.0.0.1:8080", "N1DQ", "CN98", "FreeDV Test", false);
+    int calls = 0;
+    countAllEvents(reporter, calls);
+
+    bool result = true;
+
+    // A whole payload that isn't an array at all.
+    for (const char* payload : {"42", "\"bulk\"", "{}", "null", "[]", "true"})
+    {
+        withParsedJson(payload, [&](yyjson_val* root) { FreeDVReporterTest::fireBulkUpdate(reporter, root); });
+    }
+
+    // Entries inside the payload that aren't arrays.
+    withParsedJson(R"([ "garbage", 42, null, {}, [], ["freq_change"] ])",
+        [&](yyjson_val* root) { FreeDVReporterTest::fireBulkUpdate(reporter, root); });
+
+    // No payload at all: the server sent the event with no arguments.
+    FreeDVReporterTest::fireBulkUpdate(reporter, nullptr);
+
+    // Nothing reached the application callbacks and no state was touched.
+    result &= (calls == 0);
+    result &= (FreeDVReporterTest::mode(reporter) == "");
+    result &= !FreeDVReporterTest::fullyConnected(reporter);
+
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    return result;
+}
+
+bool testHostnameWithoutPortDefaultsToServerPort()
+{
+    std::cout << "Test 19 (hostname with no port falls back to the server port): ";
+
+    // "127.0.0.1:" carries no port field, so connect_() keeps its default and
+    // still starts the (loopback) connection attempt. Nothing here waits on
+    // the handshake: the gate must simply still be closed on return.
+    FreeDVReporter noPort("127.0.0.1:", "N1DQ", "CN98", "FreeDV Test", false);
+    bool result = (FreeDVReporterTest::hostname(noPort) == "127.0.0.1:");
+    result &= !FreeDVReporterTest::fullyConnected(noPort);
+
+    noPort.connect();
+    result &= !FreeDVReporterTest::fullyConnected(noPort);
+
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    return result;
+}
+
 
 } // namespace
 
@@ -635,6 +742,11 @@ int main(int argc, char** argv)
     result &= testNonObjectPayloadsIgnored();
     result &= testTxReportWithoutLastTx();
     result &= testEventsWithoutHandlersIgnored();
+    result &= testDefaultHostnameWhenEmpty();
+    result &= testDeleteThroughReporterInterface();
+    result &= testShowOurselvesWithoutCallback();
+    result &= testBulkUpdateWithNonArrayPayloads();
+    result &= testHostnameWithoutPortDefaultsToServerPort();
 
     return result ? 0 : -1;
 }

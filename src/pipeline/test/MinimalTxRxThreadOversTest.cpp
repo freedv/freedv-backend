@@ -115,6 +115,21 @@ std::vector<short> transmit(paCallBackData& cbData, const std::vector<short>& sp
     drainInto(cbData.outfifo1, modem);
     return modem;
 }
+// A helper whose mustStopWork() can be raised from the test, so we can
+// watch the processing loops leave through the helper check instead of
+// their FIFO guards.
+class FlippableRealtimeHelper : public IRealtimeHelper
+{
+public:
+    virtual void setHelperRealTime() override { /* empty */ }
+    virtual void startRealTimeWork() override { /* empty */ }
+    virtual void stopRealTimeWork(bool fastMode = false) override { (void)fastMode; }
+    virtual void clearHelperRealTime() override { /* empty */ }
+    virtual bool mustStopWork() FREEDV_NONBLOCKING override { return stopNow.load(std::memory_order_acquire); }
+
+    std::atomic<bool> stopNow{false};
+};
+
 
 } // namespace
 
@@ -225,10 +240,112 @@ bool secondTransmissionStartsClean()
     return result;
 }
 
+bool threadGuardsStopOnHelperAndFullOutputFifo()
+{
+    char modelFile[1] = {0};
+    struct rade* rade = rade_open(modelFile, RADE_USE_C_ENCODER | RADE_USE_C_DECODER);
+    LPCNetEncState* encState = lpcnet_encoder_create();
+    FARGANState fargan;
+    {
+        float zeros[320] = {0};
+        float inFeatures[5 * NB_TOTAL_FEATURES] = {0};
+        fargan_init(&fargan);
+        fargan_cont(&fargan, zeros, inFeatures);
+    }
+    rade_text_t radeText = rade_text_create();
+
+    paCallBackData cbData;
+    cbData.infifo1 = new GenericFIFO<short>(SPEECH_RATE);      // stays quiet: TX sends silence
+    cbData.outfifo1 = nullptr; // sized once the TX thread knows its frame size
+    cbData.infifo2 = new GenericFIFO<short>(MODEM_RATE);
+    // too small to ever hold a whole modem second of decode: RX must
+    // run into its output-space guard
+    cbData.outfifo2 = new GenericFIFO<short>(MODEM_RATE + 2000);
+    auto txHelper = std::make_shared<FlippableRealtimeHelper>();
+    auto rxHelper = std::make_shared<FlippableRealtimeHelper>();
+    auto txThread = std::make_unique<MinimalTxRxThread>(true, SPEECH_RATE, MODEM_RATE, txHelper, rade, encState, &fargan, radeText, &cbData);
+    auto rxThread = std::make_unique<MinimalTxRxThread>(false, MODEM_RATE, SPEECH_RATE, rxHelper, rade, encState, &fargan, radeText, &cbData);
+    txThread->start(); rxThread->start();
+    txThread->waitForReady(); rxThread->waitForReady();
+
+    int txFrame = txThread->getTxNNomModemSamples();
+    int rxFrame = rxThread->getRxNumSpeechSamples();
+    std::vector<short> junk(SPEECH_RATE, 0);
+    cbData.outfifo1 = new GenericFIFO<short>(txFrame + 1);     // room for exactly one modem frame
+
+    txThread->signalToStart(); rxThread->signalToStart();
+    endingTx.store(false, std::memory_order_release);
+    g_tx.store(true, std::memory_order_release);
+
+    // TX: silence flows until the one-frame output FIFO is blocked.
+    auto deadline = std::chrono::steady_clock::now() + 5s;
+    while (cbData.outfifo1->numUsed() == 0 && std::chrono::steady_clock::now() < deadline)
+    {
+        std::this_thread::sleep_for(1ms);
+    }
+    bool txBlocked = cbData.outfifo1->numUsed() > 0;
+
+    // Emptying the FIFO restores room, but the helper must now hold the
+    // loop before it processes anything, even with a full mic frame waiting.
+    std::vector<short> drained;
+    drainInto(cbData.outfifo1, drained);
+    txHelper->stopNow.store(true, std::memory_order_release);
+    cbData.infifo1->write(junk.data(), 2 * SPEECH_CHUNK);
+    std::this_thread::sleep_for(500ms);
+    bool txIdle = cbData.infifo1->numUsed() == 2 * SPEECH_CHUNK;
+    g_tx.store(false, std::memory_order_release);
+
+    // Nothing was queued during TX.  RX empties both its FIFOs once when
+    // TX ends, so repeat the fill until one of them survives that reset:
+    // outfifo2 is filled until RX's own speech frame no longer fits, and
+    // the modem audio queued behind it must then stay unread.
+    bool rxFrozen = false;
+    for (int attempt = 0; attempt < 6 && !rxFrozen; attempt++)
+    {
+        cbData.infifo2->reset();
+        cbData.outfifo2->reset();
+        std::this_thread::sleep_for(100ms);
+        cbData.outfifo2->write(junk.data(), MODEM_RATE + rxFrame - rxFrame / 2 - 1);
+        cbData.infifo2->write(junk.data(), MODEM_CHUNK);
+        std::this_thread::sleep_for(400ms);
+        rxFrozen = cbData.infifo2->numUsed() == MODEM_CHUNK &&
+                   cbData.outfifo2->numUsed() > 0;
+    }
+
+    // With room restored, only the helper stands between RX and the audio.
+    rxHelper->stopNow.store(true, std::memory_order_release);
+    drainInto(cbData.outfifo2, drained);
+    std::this_thread::sleep_for(500ms);
+    bool rxIdle = cbData.infifo2->numUsed() == MODEM_CHUNK && cbData.outfifo2->numUsed() == 0;
+
+    txThread->stop();
+    rxThread->stop();
+
+    bool result = txBlocked && txIdle && rxFrozen && rxIdle;
+    if (!result)
+    {
+        std::cerr << "[txBlocked=" << txBlocked << " txIdle=" << txIdle << " rxFrozen=" << rxFrozen
+                  << " rxIdle=" << rxIdle << " infifo1=" << cbData.infifo1->numUsed()
+                  << " outfifo1=" << cbData.outfifo1->numUsed() << " infifo2=" << cbData.infifo2->numUsed()
+                  << " outfifo2=" << cbData.outfifo2->numUsed() << " (rxFrame=" << rxFrame << ")]...";
+    }
+
+    txThread.reset();
+    rxThread.reset();
+    delete cbData.infifo1; delete cbData.outfifo1;
+    delete cbData.infifo2; delete cbData.outfifo2;
+    rade_text_destroy(radeText);
+    lpcnet_encoder_destroy(encState);
+    rade_close(rade);
+    return result;
+}
+
+
 int main()
 {
     rade_initialize();
     TEST_CASE(secondTransmissionStartsClean);
+    TEST_CASE(threadGuardsStopOnHelperAndFullOutputFifo);
     rade_finalize();
     return 0;
 }

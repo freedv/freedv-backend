@@ -105,6 +105,22 @@ bool resample44100To8000() { return resampleToneCommon(44100, 8000); }
 bool resample8000To44100() { return resampleToneCommon(8000, 44100); }
 bool resample48000To8000Tone() { return resampleToneCommon(48000, 8000); }
 
+bool linearResampleForPlots()
+{
+    // The linear variant (for plots only) must resample just like the
+    // default one, at the expected output count.
+    ResampleStep resampleStep(8000, 48000, true);
+    auto inputSineWave = std::unique_ptr<short[]>(generateOneSecondSineWave(2000, 8000), std::default_delete<short[]>());
+    int numOutputSamples = 0;
+    resampleStep.execute(inputSineWave.get(), 8000, &numOutputSamples);
+    if (numOutputSamples < 48000 * 0.9 || numOutputSamples > 48000 * 1.1)
+    {
+        std::cerr << "[linear resampling produced " << numOutputSamples << " samples, expected 48000]...";
+        return false;
+    }
+    return true;
+}
+
 // Regression: feeding exactly one second of input at an integer upsample
 // ratio must not push more samples into the one-second output buffer than
 // it can hold. The linear converter emits ceil(input*ratio) per 10 ms
@@ -138,6 +154,7 @@ int main()
     TEST_CASE(resample44100To8000);
     TEST_CASE(resample8000To44100);
     TEST_CASE(resample48000To8000Tone);
+    TEST_CASE(linearResampleForPlots);
     TEST_CASE(linearOneSecondFeedStaysWithinOutputBuffer);
     return 0;
 }

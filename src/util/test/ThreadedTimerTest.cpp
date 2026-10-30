@@ -201,5 +201,55 @@ int main(int argc, char** argv)
     std::cout << (testResult ? "PASS" : "FAIL") << "\n";
     result &= testResult;
 
+    // A timer registered without any callback must be fired safely too
+    // (fire_() has to tolerate an empty std::function).
+    std::cout << "Test 9 (Timer with no callback fires and stops cleanly): ";
+    {
+        ThreadedTimer noCallback;
+        noCallback.setTimeout(10);
+        noCallback.setRepeat(true);
+        noCallback.start();
+        std::this_thread::sleep_for(100ms);
+        testResult = noCallback.isRunning();
+        noCallback.setCallback(nullptr); // explicit empty callback; still no crash
+        std::this_thread::sleep_for(50ms);
+        noCallback.stop();
+        testResult &= !noCallback.isRunning();
+    }
+    std::cout << (testResult ? "PASS" : "FAIL") << "\n";
+    result &= testResult;
+
+    // A one-shot timer that stops itself from inside its callback: the
+    // callback runs on the timer server's own thread, so the unregister
+    // path has to skip the firing-done wait (it would be waiting on its
+    // own firing) and just drop the entry.
+    std::cout << "Test 10 (One-shot timer stops itself from its callback): ";
+    {
+        std::atomic<int> calls(0);
+        ThreadedTimer selfStop(10, [&](ThreadedTimer& t) {
+            calls++;
+            t.stop();
+        }, false);
+        selfStop.start();
+
+        auto deadline = std::chrono::steady_clock::now() + 5s;
+        while ((calls.load() == 0 || selfStop.isRunning()) &&
+               std::chrono::steady_clock::now() < deadline)
+        {
+            std::this_thread::yield();
+        }
+        testResult = calls.load() == 1 && !selfStop.isRunning();
+
+        // With its entry already erased, the timer cannot fire again; the
+        // destructor's own stop() (from the main thread) must also stay a
+        // no-op.
+        int afterStop = calls.load();
+        std::this_thread::sleep_for(200ms);
+        testResult &= calls.load() == afterStop && !selfStop.isRunning();
+        std::cout << "(calls = " << calls.load() << ") ";
+    }
+    std::cout << (testResult ? "PASS" : "FAIL") << "\n";
+    result &= testResult;
+
     return result ? 0 : -1;
 }
