@@ -878,7 +878,11 @@ extern "C" void ulog_async_flush(void)
     }
 
     Semaphore* sem = g_sem.load(std::memory_order_acquire);
-    for (int i = 0; i < 2000; ++i)
+
+    // A time limit rather than a number of polls: a 1 ms sleep can take
+    // ~15 ms on Windows, which made 2000 polls up to half a minute there.
+    auto giveUpAt = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < giveUpAt)
     {
         if (sem != nullptr)
         {

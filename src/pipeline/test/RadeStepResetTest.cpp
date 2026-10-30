@@ -263,6 +263,36 @@ bool rxStateAccessors()
     return result;
 }
 
+// Regression: feeding far more modem audio than the RX step's output buffer
+// can hold in a single execute() call must stop at the buffer's capacity.
+// One rade_rx call supplies up to rade_n_features_in_out(dv_) features and,
+// together with whatever pendingFeatures_ already holds, can complete several
+// LPCNET frames at once; the loop guard used to reserve room for only one
+// frame per call, so the last accepted iteration could memcpy past the end
+// of outputSamples_.
+bool rxSingleExecuteClampsAtOutputCapacity()
+{
+    RadeSession session;
+    std::unique_ptr<RADETransmitStep> tx(session.makeTx());
+    std::unique_ptr<RADEReceiveStep> rx(session.makeRx());
+
+    std::vector<short> modem = run(*tx, makeSpeechLike(RADE_SPEECH_SAMPLE_RATE, 10.0f));
+    bool result = modem.size() > static_cast<size_t>(rx->getOutputSampleRate());
+
+    int numOut = 0;
+    short* out = rx->execute(modem.data(), static_cast<int>(modem.size()), &numOut);
+    result &= out != nullptr;
+    result &= numOut > 0;
+    result &= numOut <= rx->getOutputSampleRate();
+
+    if (!result)
+    {
+        std::cerr << "[" << numOut << " samples from a single-execute rx run, "
+                  << "outside the 0.." << rx->getOutputSampleRate() << " range]...";
+    }
+    return result;
+}
+
 } // namespace
 
 int main()
@@ -274,6 +304,7 @@ int main()
     TEST_CASE(txResetDiscardsQueuedEoo);
     TEST_CASE(rxResetDiscardsBufferedSamples);
     TEST_CASE(rxStateAccessors);
+    TEST_CASE(rxSingleExecuteClampsAtOutputCapacity);
 
     rade_finalize();
     return 0;

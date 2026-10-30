@@ -62,6 +62,10 @@ void ThreadedObject::enqueue_(std::function<void()> fn, int) // NOLINT
 {
     if (suppressEnqueue_.load(std::memory_order_relaxed)) return;
 
+    // Nothing to run (calling it would throw), as the other implementation
+    // skips.
+    if (!fn) return;
+
     // note: timeout not implemented
     numQueued_.fetch_add(1, std::memory_order_relaxed);
     dispatch_async(queue_, ^() {
