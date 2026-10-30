@@ -1,9 +1,15 @@
-#include "AudioPipeline.h"
 #include "PipelineTestCommon.h"
 #include "LevelAdjustStep.h"
 
 #include <memory>
 #include <vector>
+
+// reloadResampler_() and resamplers_ are private. Exposing them in this test
+// translation unit (access control does not change object layout or
+// linkage) lets the tests drive the resampler reload directly.
+#define private public
+#include "AudioPipeline.h"
+#undef private
 
 static bool passthroughCommon(int inputSampleRate, int outputSampleRate)
 {
@@ -264,6 +270,90 @@ bool lastStepAtOutputRateNeedsNoResampler()
     return result;
 }
 
+class MutableStep : public IPipelineStep
+{
+public:
+    MutableStep(int inputSampleRate, int outputSampleRate)
+        : inputSampleRate_(inputSampleRate)
+        , outputSampleRate_(outputSampleRate)
+    {
+    }
+
+    void setRates(int inputSampleRate, int outputSampleRate)
+    {
+        inputSampleRate_ = inputSampleRate;
+        outputSampleRate_ = outputSampleRate;
+    }
+
+    virtual int getInputSampleRate() const FREEDV_NONBLOCKING { return inputSampleRate_; }
+    virtual int getOutputSampleRate() const FREEDV_NONBLOCKING { return outputSampleRate_; }
+    virtual short* execute(short* inputSamples, int numInputSamples, int* numOutputSamples) FREEDV_NONBLOCKING
+    {
+        *numOutputSamples = numInputSamples;
+        return inputSamples;
+    }
+
+private:
+    int inputSampleRate_;
+    int outputSampleRate_;
+};
+
+// Only the step after a resampler changing its input rate: the resampler
+// no longer feeds it the rate it needs, so it must be rebuilt to match. (An
+// earlier version kept it, leaving a resampler whose output rate execute()
+// asserts against.)
+bool reloadResamplerFollowsNextStepsRate()
+{
+    AudioPipeline pipeline(8000, 48000);
+    pipeline.appendPipelineStep(new MutableStep(8000, 8000));
+    pipeline.appendPipelineStep(new MutableStep(16000, 16000));
+
+    MutableStep* step1 = static_cast<MutableStep*>(pipeline.pipelineSteps_[1].get());
+    step1->setRates(32000, 16000);
+    pipeline.reloadResampler_(1);
+
+    bool result = pipeline.resamplers_[1] != nullptr;
+    result &= pipeline.resamplers_[1]->getInputSampleRate() == 8000;
+    result &= pipeline.resamplers_[1]->getOutputSampleRate() == 32000;
+
+    if (!result)
+    {
+        std::cerr << "[reloadResampler_ left a resampler that doesn't feed the next step's rate]...";
+    }
+    return result;
+}
+
+// Regression: when reloadResampler_() keeps the existing resampler, it must
+// leave it untouched. Historically the keep path re-wrapped the still-live
+// raw pointer into the same unique_ptr slot, which is a unique_ptr
+// self-move: the object is destroyed, the slot keeps a dangling pointer, and
+// pipeline teardown double-frees it.
+bool reloadResamplerKeepPathIsSafe()
+{
+    AudioPipeline pipeline(8000, 48000);
+    pipeline.appendPipelineStep(new MutableStep(8000, 8000));
+    pipeline.appendPipelineStep(new MutableStep(16000, 16000));
+
+    ResampleStep* original = pipeline.resamplers_[1].get();
+    bool result = original != nullptr;
+
+    pipeline.reloadResampler_(1);
+    result &= pipeline.resamplers_[1].get() == original;
+    result &= original->getOutputSampleRate() == 16000; // still a live object
+
+    // A pass through the pipeline uses the kept resampler.
+    auto output = runOneSecond(pipeline);
+    result &= within10Percent("output", (int)output.size(), 48000);
+
+    if (!result)
+    {
+        std::cerr << "[reloadResampler_ keep path replaced or broke the matching resampler]...";
+    }
+    // Scope exit destroys the pipeline: with the self-move bug this
+    // double-frees the resampler (ASan/heap-checker abort).
+    return result;
+}
+
 int main()
 {
     TEST_CASE(passthrough);
@@ -280,6 +370,8 @@ int main()
     TEST_CASE(eachStepGetsItsOwnRate);
     TEST_CASE(stepThatChangesRate);
     TEST_CASE(lastStepAtOutputRateNeedsNoResampler);
+    TEST_CASE(reloadResamplerFollowsNextStepsRate);
+    TEST_CASE(reloadResamplerKeepPathIsSafe);
     
     return 0;
 }

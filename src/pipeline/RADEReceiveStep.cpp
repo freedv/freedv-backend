@@ -193,8 +193,18 @@ short* RADEReceiveStep::execute(short* inputSamples, int numInputSamples, int* n
 
     int   nout = 0;
     short* outputSamplePtr = outputSamples_.get();
-    while ((*numOutputSamples + LPCNET_FRAME_SIZE) < maxSamples)
+    while (true)
     {
+        // One rade_rx() call can emit up to rade_n_features_in_out(dv_)
+        // features; combined with whatever pendingFeatures_ already holds,
+        // that can complete several LPCNET frames at once. Reserve room for
+        // every frame a single call can produce before running it, so the
+        // frame memcpy below can never write past the end of outputSamples_.
+        int maxFramesPerCall = (pendingFeaturesIdx_ + rade_n_features_in_out(dv_)) / NB_TOTAL_FEATURES;
+        if (*numOutputSamples + maxFramesPerCall * LPCNET_FRAME_SIZE >= maxSamples)
+        {
+            break;
+        }
         FREEDV_BEGIN_VERIFIED_SAFE 
         int   nin = rade_nin(dv_);
         assert(nin <= rade_nin_max(dv_));

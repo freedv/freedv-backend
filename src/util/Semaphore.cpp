@@ -46,7 +46,8 @@ Semaphore::Semaphore()
         log_error("Could not set up semaphore");
     }
 #else
-    if (sem_init(&sem_, 0, 0) < 0)
+    valid_ = sem_init(&sem_, 0, 0) == 0;
+    if (!valid_)
     {
         log_error("Could not set up semaphore (errno = %d)", errno);
     }
@@ -70,8 +71,11 @@ Semaphore::~Semaphore()
         dispatch_release(sem_);
     }
 #else
-    sem_post(&sem_);
-    sem_destroy(&sem_);
+    if (valid_)
+    {
+        sem_post(&sem_);
+        sem_destroy(&sem_);
+    }
 #endif // defined(_WIN32) || defined(__APPLE__)
 }
 
@@ -90,7 +94,10 @@ void Semaphore::signal() FREEDV_NONBLOCKING
         dispatch_semaphore_signal(sem_);
     }
 #else
-    sem_post(&sem_);
+    if (valid_)
+    {
+        sem_post(&sem_);
+    }
 #endif // defined(_WIN32) || defined(__APPLE__)
 
     FREEDV_END_VERIFIED_SAFE
@@ -114,7 +121,7 @@ void Semaphore::waitFor(int timeMilliseconds)
     }
 #else
     struct timespec ts;
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) == -1)
+    if (!valid_ || clock_gettime(CLOCK_MONOTONIC, &ts) == -1)
     {
         return;
     }
@@ -149,7 +156,19 @@ void Semaphore::wait()
         dispatch_semaphore_wait(sem_, DISPATCH_TIME_FOREVER);
     }
 #else
-    if (sem_wait(&sem_) < 0)
+    if (!valid_)
+    {
+        return;
+    }
+
+    // A signal handler running on this thread interrupts the wait without
+    // the semaphore having been signalled: keep waiting.
+    int rv = 0;
+    while ((rv = sem_wait(&sem_)) == -1 && errno == EINTR)
+    {
+        // empty
+    }
+    if (rv == -1)
     {
         log_error("Could not wait on semaphore (errno = %d)", errno);
     }
