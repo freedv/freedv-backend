@@ -83,6 +83,7 @@ void MinimalTxRxThread::initializePipeline_()
     if (m_tx)
     {
         txStep_ = new RADETransmitStep(rade_, encState_);
+        txStep_->setNarrowbandInput(inputSampleRate_ <= 8000);
         auto agcStep = new AgcStep(txStep_->getInputSampleRate());
         auto rnnoiseStep = new RNNoiseStep();
         pipeline_->appendPipelineStep(rnnoiseStep);
