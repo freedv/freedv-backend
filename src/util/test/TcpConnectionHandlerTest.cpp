@@ -1521,6 +1521,9 @@ bool testSocketExhaustionDuringConnect()
     auto retryFuture = conn2.connect(SCRIPTED_HOST, 1, false);
     result &= CHECK(retryFuture.wait_for(EVENT_TIMEOUT) == std::future_status::ready);
     result &= CHECK(server4.accept(ACCEPT_TIMEOUT_MS));
+    // onConnect_() is queued behind the connect task, so it can still be
+    // pending once the future is ready.
+    result &= CHECK(conn2.waitForConnects(1));
     result &= CHECK(conn2.connectCount() == 1);
     return report(result);
 }
