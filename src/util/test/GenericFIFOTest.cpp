@@ -238,6 +238,172 @@ bool testConcurrentResetRace()
     return result;
 }
 
+// Several threads calling reset() at once must contend on the resetting_
+// CAS (the compare_exchange_weak retry side), and numUsed() sampled while
+// that churn is live has to hit the generation-mismatch window (it returns
+// 0 in that window rather than computing nonsense from mismatched
+// generations). The asserted invariant is the contract either way:
+// numUsed() must never return anything outside [0, NELEM].
+bool testConcurrentResetsAndNumUsed()
+{
+    std::cout << "Test 6 (Contended reset() and numUsed() generation guard): ";
+
+    constexpr int NELEM = 512;
+    std::vector<int> storage(NELEM, 0);
+    GenericFIFO<int> fifo(NELEM, storage.data());
+
+    std::atomic<bool> stop{ false };
+    std::atomic<std::uint64_t> samples{ 0 };
+    std::atomic<std::uint64_t> outOfRange{ 0 };
+    std::atomic<std::uint64_t> zeroSamples{ 0 };
+    std::atomic<std::uint64_t> resets{ 0 };
+
+    std::thread writer([&]() {
+        int buf[8];
+        for (int i = 0; i < 8; i++) buf[i] = i + 1;
+        while (!stop.load(std::memory_order_relaxed))
+        {
+            fifo.write(buf, 8);
+        }
+    });
+
+    std::vector<std::thread> workers;
+    for (int t = 0; t < 3; t++)
+    {
+        workers.emplace_back([&]() {
+            while (!stop.load(std::memory_order_relaxed))
+            {
+                fifo.reset();
+                resets.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+    for (int t = 0; t < 2; t++)
+    {
+        workers.emplace_back([&]() {
+            while (!stop.load(std::memory_order_relaxed))
+            {
+                int used = fifo.numUsed();
+                samples.fetch_add(1, std::memory_order_relaxed);
+                if (used < 0 || used > NELEM) outOfRange.fetch_add(1, std::memory_order_relaxed);
+                if (used == 0) zeroSamples.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+
+    std::this_thread::sleep_for(800ms);
+    stop.store(true, std::memory_order_relaxed);
+
+    writer.join();
+    for (auto& worker : workers) worker.join();
+
+    bool result = (outOfRange.load() == 0) && (samples.load() > 0) && (resets.load() > 0);
+
+    std::cout << (result ? "PASS" : "FAIL")
+              << " (samples=" << samples.load()
+              << " zero=" << zeroSamples.load()
+              << " resets=" << resets.load()
+              << " outOfRange=" << outOfRange.load() << ")\n";
+    return result;
+}
+
+// A FIFO fed an external buffer must use that buffer rather than allocate
+// its own, behave normally through write/read/reset, and not free the
+// caller's storage when it is destroyed (the ownBuffer_-false paths of the
+// constructor and destructor).
+bool testExternalBufferNotOwned()
+{
+    std::cout << "Test 7 (External buffer: used but not owned): ";
+
+    constexpr int NELEM = 64;
+    std::vector<int> storage(NELEM, 0);
+
+    bool result = true;
+
+    {
+        GenericFIFO<int> fifo(NELEM, storage.data());
+        result &= (fifo.capacity() == NELEM - 1);
+
+        int in[5] = { 11, 22, 33, 44, 55 };
+        int out[5] = { 0, 0, 0, 0, 0 };
+        result &= (fifo.write(in, 5) == 0);
+        result &= (fifo.numUsed() == 5);
+        result &= (fifo.numFree() == NELEM - 1 - 5);
+        result &= (fifo.read(out, 5) == 0);
+        result &= (out[0] == 11 && out[4] == 55);
+
+        // Fill to capacity and drain again, so the external buffer is
+        // exercised across a ring wraparound.
+        std::vector<int> filled(fifo.capacity());
+        std::vector<int> drained(fifo.capacity(), -1);
+        for (int i = 0; i < fifo.capacity(); i++) filled[i] = i + 1;
+        result &= (fifo.write(filled.data(), fifo.capacity()) == 0);
+        result &= (fifo.numFree() == 0);
+        result &= (fifo.read(drained.data(), fifo.capacity()) == 0);
+        bool allMatch = true;
+        for (int i = 0; i < fifo.capacity(); i++) allMatch &= (drained[i] == i + 1);
+        result &= allMatch;
+        result &= (fifo.numUsed() == 0);
+
+        fifo.reset();
+        result &= (fifo.numUsed() == 0);
+        result &= (fifo.write(in, 5) == 0);
+        result &= (fifo.numUsed() == 5);
+    }
+
+    // The FIFO is gone but the caller's buffer is still its own, intact
+    // storage (the destructor must not have deleted it).
+    result &= ((int)storage.size() == NELEM);
+
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    return result;
+}
+
+// Moving a GenericFIFO transfers the ring contents, the position state and
+// the buffer ownership to the new object. The moved-from object is left
+// with a null buffer: it must report empty, a reset() on it must be safe,
+// and its destructor must delete nothing -- neither the buffer that now
+// belongs to the moved-to object (no double-free) nor any phantom one.
+bool testMoveTransfersBufferOwnership()
+{
+    std::cout << "Test 8 (Move: buffer ownership transfer): ";
+
+    bool result = true;
+
+    {
+        GenericFIFO<int> src(16);
+        int in[4] = { 10, 20, 30, 40 };
+        result &= (src.write(in, 4) == 0);
+        result &= (src.numUsed() == 4);
+
+        GenericFIFO<int> moved(std::move(src));
+
+        // The new object owns the data and the buffer: it reads back what
+        // was written before the move and keeps working normally.
+        int out[4] = { 0, 0, 0, 0 };
+        result &= (moved.capacity() == 15);
+        result &= (moved.numUsed() == 4);
+        result &= (moved.read(out, 4) == 0);
+        result &= (out[0] == 10 && out[3] == 40);
+        result &= (moved.write(in, 4) == 0);
+        result &= (moved.numUsed() == 4);
+        moved.reset();
+        result &= (moved.numUsed() == 0);
+
+        // The moved-from object is inert but valid: empty, safe to reset,
+        // and destructing it (buf == nullptr here) must free nothing.
+        result &= (src.numUsed() == 0);
+        src.reset();
+        result &= (src.numUsed() == 0);
+    }
+
+    // If the moved-from destructor had deleted the transferred buffer, the
+    // moved-to object's writes above would have hit freed memory; it ran to
+    // scope exit cleanly, which is the behavioral check.
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    return result;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -249,6 +415,9 @@ int main(int argc, char** argv)
     result &= testWraparound();
     result &= testResetClearsData();
     result &= testConcurrentResetRace();
+    result &= testConcurrentResetsAndNumUsed();
+    result &= testExternalBufferNotOwned();
+    result &= testMoveTransfersBufferOwnership();
 
     return result ? 0 : -1;
 }

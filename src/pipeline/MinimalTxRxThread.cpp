@@ -313,7 +313,9 @@ void MinimalTxRxThread::txProcessing_(IRealtimeHelper* helper) noexcept
                 }
 
                 auto outputSamples = pipeline_->execute(inputPtr, 0, &nout);
-                if (nout > 0 && outputSamples != nullptr)
+                // AudioPipeline steps return their pre-allocated (ctor-asserted)
+                // member buffers, never nullptr.
+                if (nout > 0)
                 {
                     if (cbData_->outfifo1->write(outputSamples, nout) != 0)
                     {
@@ -334,10 +336,8 @@ void MinimalTxRxThread::txProcessing_(IRealtimeHelper* helper) noexcept
             
             auto outputSamples = pipeline_->execute(inputPtr, nsam_in_48, &nout);
             
-            if (outputSamples != nullptr)
-            {
-                cbData_->outfifo1->write(outputSamples, nout);
-            }
+            // Pipeline output buffers are never nullptr (see above).
+            cbData_->outfifo1->write(outputSamples, nout);
             
 #if defined(ENABLE_PROCESSING_STATS)
             endTimer_();
@@ -395,7 +395,7 @@ void MinimalTxRxThread::rxProcessing_(IRealtimeHelper* helper) noexcept
         // send latest squelch level to FreeDV API, as it handles squelch internally
         auto outputSamples = pipeline_->execute(inputSamples_.get(), nsam, &nout);
         
-        if (nout > 0 && outputSamples != nullptr)
+        if (nout > 0)
         {
             outFifo->write(outputSamples, nout);
         }

@@ -42,6 +42,8 @@ ResampleStep::ResampleStep(int inputSampleRate, int outputSampleRate, bool forPl
     : inputSampleRate_(inputSampleRate)
     , outputSampleRate_(outputSampleRate)
 {
+    assert(inputSampleRate > 0 && outputSampleRate > 0);
+
     int maxInputLen = inputSampleRate * 10 / 1000;
     int maxOutputLen = outputSampleRate * 20 / 1000; // twice as much time just in case a block is bigger than usual
     int src_error = 0;

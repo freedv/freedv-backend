@@ -218,7 +218,10 @@ short* RADEReceiveStep::execute(short* inputSamples, int numInputSamples, int* n
             inputSamples += samplesToWrite;
         }
 
-        if (inputSampleFifo_.read(inputBuf_, nin) != 0 && numInputSamples == 0)
+        // FIFO capacity is rade_nin_max(dv)+1, so a failed read (numUsed < nin)
+        // implies the write above drained all remaining input samples:
+        // numInputSamples == 0 is guaranteed whenever the read fails.
+        if (inputSampleFifo_.read(inputBuf_, nin) != 0)
         {
             break;
         }

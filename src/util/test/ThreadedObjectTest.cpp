@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "../ThreadedObject.h"
+#include "../Semaphore.h"
 
 using namespace std::chrono_literals;
 
@@ -73,10 +74,27 @@ public:
     }
 
     void enqueue(std::function<void()> fn) { enqueue_(std::move(fn)); }
+
+    void enqueueTimeout(std::function<void()> fn, int timeoutMilliseconds)
+    {
+        enqueue_(std::move(fn), timeoutMilliseconds);
+    }
+
     void waitAll() { waitForAllTasksComplete_(); }
 
 private:
     std::shared_ptr<Tracker> tracker_;
+};
+
+class ChildObject : public ThreadedObject
+{
+public:
+    explicit ChildObject(ThreadedObject* parent)
+        : ThreadedObject("ChildObject", parent)
+    {
+    }
+
+    void enqueueTask(std::function<void()> fn) { enqueue_(std::move(fn)); }
 };
 
 bool testOrdering()
@@ -200,6 +218,172 @@ bool testWaitFromOwnTask()
 }
 #endif // !defined(__APPLE__)
 
+bool testChildEnqueuesOnParent()
+{
+    std::cout << "Test 5 (child objects enqueue on their parent's thread): ";
+
+    // A ThreadedObject created with a parent never spawns its own thread; its
+    // tasks are handed to the parent instead, and its destructor has nothing
+    // to join.
+    auto tracker = std::make_shared<Tracker>();
+    std::atomic<int> ran{0};
+    std::thread::id taskThread;
+    {
+        TestObject parent(tracker);
+        ChildObject child(&parent);
+        child.enqueueTask([&]() {
+            ran = 1;
+            taskThread = std::this_thread::get_id();
+        });
+        parent.waitAll();
+    }
+
+    bool result = CHECK(ran == 1);
+    result &= CHECK(taskThread != std::this_thread::get_id());
+    result &= CHECK(tracker->violations == 0);
+    return report(result);
+}
+
+bool testNullTaskIsSkipped()
+{
+    std::cout << "Test 6 (an empty task is dequeued and skipped, not run): ";
+
+    auto tracker = std::make_shared<Tracker>();
+    std::atomic<bool> before{false};
+    std::atomic<bool> after{false};
+    {
+        TestObject obj(tracker);
+        obj.enqueue([&]() { before = true; });
+        obj.enqueue(std::function<void()>());
+        obj.enqueue([&]() { after = true; });
+        obj.waitAll();
+    }
+
+    bool result = CHECK(before.load());
+    result &= CHECK(after.load());
+    result &= CHECK(tracker->violations == 0);
+    return report(result);
+}
+
+bool testEnqueueSuppressedWhileWaiting()
+{
+    std::cout << "Test 7 (enqueue is suppressed while another thread waits for tasks): ";
+
+    // While waitForAllTasksComplete_() is spinning, new enqueues are dropped:
+    // the object is on its way out, so nothing may be added behind the wait.
+    auto tracker = std::make_shared<Tracker>();
+    Semaphore hold;
+    std::atomic<bool> started{false};
+    std::atomic<int> probesRun{0};
+    {
+        TestObject obj(tracker);
+        obj.enqueue([&]() {
+            started = true;
+            hold.wait();
+        });
+        auto deadline = std::chrono::steady_clock::now() + 5s;
+        while (!started && std::chrono::steady_clock::now() < deadline)
+        {
+            std::this_thread::sleep_for(1ms);
+        }
+
+        std::thread waiter([&]() { obj.waitAll(); });
+        std::this_thread::sleep_for(30ms); // the waiter has set the suppression flag by now
+
+        for (int i = 0; i < 20; i++)
+        {
+            obj.enqueue([&]() { probesRun++; }); // dropped: suppression is on
+        }
+
+        hold.signal();
+        waiter.join();
+
+        obj.enqueue([&]() { probesRun++; }); // suppression is cleared once the wait returned
+        obj.waitAll();
+    }
+
+    bool result = CHECK(started.load());
+    result &= CHECK(probesRun == 1);
+    result &= CHECK(tracker->violations == 0);
+    return report(result);
+}
+
+bool testLongWaitWarnsButFinishes()
+{
+    std::cout << "Test 8 (waiting over 2 s for a task warns but still waits): ";
+
+    // The waiter logs a warning after 2 s but must keep waiting, not give up.
+    auto tracker = std::make_shared<Tracker>();
+    Semaphore hold;
+    std::atomic<bool> finished{false};
+    {
+        TestObject obj(tracker);
+        obj.enqueue([&]() {
+            hold.wait();
+            finished = true;
+        });
+        std::this_thread::sleep_for(50ms); // let the task start
+
+        std::thread waiter([&]() { obj.waitAll(); });
+        for (int i = 0; i < 12; i++)
+        {
+            std::this_thread::sleep_for(200ms); // keep it blocked for > 2 s total
+        }
+        hold.signal();
+        waiter.join();
+    }
+
+    bool result = CHECK(finished.load());
+    result &= CHECK(tracker->violations == 0);
+    return report(result);
+}
+
+bool testTimeoutEnqueueUnderContention()
+{
+    std::cout << "Test 9 (timeout enqueues under heavy contention): ";
+
+    // Four threads hammer the same queue with timed enqueues (two with a
+    // generous timeout, two with 1 ms so they give up when they collide).
+    // Whether a given attempt retries, succeeds or gives up is timing-dependent
+    // and deliberately not asserted -- what must hold is that the object
+    // survives the storm, a good number of tasks ran, and normal enqueueing
+    // works again afterwards.
+    auto tracker = std::make_shared<Tracker>();
+    std::atomic<int> ran{0};
+    {
+        TestObject obj(tracker);
+        std::vector<std::thread> hammers;
+        for (int t = 0; t < 4; t++)
+        {
+            int timeout = (t % 2 == 0) ? 500 : 1;
+            hammers.push_back(std::thread([&obj, &ran, timeout]() {
+                for (int i = 0; i < 2500; i++)
+                {
+                    obj.enqueueTimeout([&]() { ran.fetch_add(1); }, timeout);
+                }
+            }));
+        }
+        for (auto& hammer : hammers)
+        {
+            hammer.join();
+        }
+        obj.waitAll();
+    }
+
+    bool result = CHECK(ran > 100);
+
+    // The object must still be usable afterwards.
+    auto tracker2 = std::make_shared<Tracker>();
+    {
+        TestObject fresh(tracker2);
+        std::atomic<bool> worked{false};
+        fresh.enqueue([&]() { worked = true; });
+        fresh.waitAll();
+        result &= CHECK(worked.load());
+    }
+    return report(result);
+}
+
 } // namespace
 
 int main(int, char**)
@@ -212,6 +396,12 @@ int main(int, char**)
 #if !defined(__APPLE__)
     result &= testWaitFromOwnTask();
 #endif // !defined(__APPLE__)
+
+    result &= testChildEnqueuesOnParent();
+    result &= testNullTaskIsSkipped();
+    result &= testEnqueueSuppressedWhileWaiting();
+    result &= testLongWaitWarnsButFinishes();
+    result &= testTimeoutEnqueueUnderContention();
 
     return result ? 0 : -1;
 }
