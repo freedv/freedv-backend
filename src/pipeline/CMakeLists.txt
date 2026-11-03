@@ -10,12 +10,14 @@ add_library(fdv_audio_pipeline STATIC
     MinimalTxRxThread.cpp
     MuteStep.cpp
     RADEReceiveStep.cpp
+    RADEFeatureExpander.cpp
     RADETransmitStep.cpp
     ResampleStep.cpp
     RNNoiseStep.cpp
     TapStep.cpp
     ToneInterfererStep.cpp
     rade_text.cpp
+    rade_bwe_data.c
     ldpc_encode.cpp
     ldpc_decode.cpp
 )
@@ -88,6 +90,9 @@ target_compile_options(RadeTextOtaSim PRIVATE -O2)
 target_link_libraries(RadeTextOtaSim PRIVATE fdv_audio_pipeline fdv_util rade opus)
 target_include_directories(RadeTextOtaSim PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/..)
 set_target_properties(RadeTextOtaSim PROPERTIES BUILD_RPATH "${CMAKE_BUILD_RPATH};${rade_BINARY_DIR}/src")
+
+DefineUnitTest(RADEFeatureExpanderTest)
+target_link_libraries(RADEFeatureExpanderTest PRIVATE rade opus)
 
 DefineUnitTest(RadeStepResetTest)
 target_link_libraries(RadeStepResetTest PRIVATE rade opus samplerate)

@@ -38,6 +38,7 @@
 #include <cstdio>
 #include <thread>
 #include <atomic>
+#include <memory>
 
 extern "C"
 {
@@ -47,6 +48,7 @@ extern "C"
 
 #include "IPipelineStep.h"
 #include "rade_text.h"
+#include "RADEFeatureExpander.h"
 #include "../util/GenericFIFO.h"
 #include "../util/Semaphore.h"
 
@@ -75,6 +77,10 @@ public:
     // is in terms of number of samples at RADE_MODEM_SAMPLE_RATE (8000 Hz).
     int eooLengthInSamples() const FREEDV_NONBLOCKING;
 
+    // Set when the mic only gives 8 kHz audio: RADEFeatureExpander then
+    // fills in the high band of the features before they're encoded.
+    void setNarrowbandInput(bool narrowband) FREEDV_NONBLOCKING;
+
 private:
     struct rade* dv_;
     LPCNetEncState* encState_;
@@ -84,6 +90,10 @@ private:
     float* featureList_;
     int featureListIdx_;
     int arch_;
+
+    std::unique_ptr<RADEFeatureExpander> featureExpander_;
+    std::atomic<bool> narrowbandInput_;
+    bool expanderActive_;
 
     FILE* featuresFile_;
 
