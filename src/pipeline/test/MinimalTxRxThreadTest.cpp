@@ -112,7 +112,7 @@ static bool runLossCheck(const char* txFeat, const char* rxFeat)
         RADE_SRC_DIR + "/loss.py " +
         txFeat + " " +
         rxFeat +
-        " --loss_test 0.15 2>&1";
+        " --loss_test 0.0895 --clip_start 100 --clip_end 300 2>&1";
 
     log_info("Running: %s", cmd.c_str());
 
@@ -196,12 +196,14 @@ static bool runPipeline(
     auto txThread  = std::make_unique<MinimalTxRxThread>(
         true, speechRate, modemRate,
         txHelper, rade, encState, fargan, radeText, &cbData);
+    txThread->disableProcessing();
 
     // Create RX thread (modemRate in → speechRate out)
     auto rxHelper = std::make_shared<MinimalRealtimeHelper>();
     auto rxThread  = std::make_unique<MinimalTxRxThread>(
         false, modemRate, speechRate,
         rxHelper, rade, encState, fargan, radeText, &cbData);
+    rxThread->disableProcessing();
 
     // Start both threads and let them initialise
     txThread->start(); rxThread->start();
@@ -451,7 +453,7 @@ int main()
         // Fresh RADE / LPCNet / FARGAN state per test to avoid any
         // carry-over between configurations.
         char modelFile[1] = {0};
-        struct rade* rade = rade_open(modelFile, RADE_USE_C_ENCODER | RADE_USE_C_DECODER);
+        struct rade* rade = rade_open(modelFile, RADE_USE_C_ENCODER | RADE_USE_C_DECODER | RADE_MODE_V2);
         assert(rade != nullptr);
 
         LPCNetEncState* encState = lpcnet_encoder_create();
@@ -468,12 +470,7 @@ int main()
         rade_text_t radeText = rade_text_create();
         assert(radeText != nullptr);
 
-        int nsyms = rade_n_eoo_bits(rade);
-        float* eooSyms = new float[nsyms];
-        assert(eooSyms);
-                
-        rade_text_generate_tx_string(radeText, "K6AQ", 4, eooSyms, nsyms);
-        rade_tx_set_eoo_bits(rade, eooSyms);
+        rade_text_generate_tx_string(radeText, "K6AQ", 4);
 
         // Must start false: it used to start true, so the check passed even
         // if the callsign never arrived.
@@ -493,7 +490,6 @@ int main()
         rade_text_destroy(radeText);
         rade_close(rade);
         lpcnet_encoder_destroy(encState);
-        delete[] eooSyms;
 
         // The received speech must be about as long as what was sent, and
         // (past the first second, while RX acquires) at about its level.

@@ -38,8 +38,6 @@
 #include <array>
 #include <cstdint>
 
-#include "rade_api.h"
-
 struct LDPCDecodeResult {
     std::array<uint8_t, 112> message{}; // decoded message bits (0 or 1)
     bool  converged;                    // true if all parity checks are satisfied
@@ -48,52 +46,49 @@ struct LDPCDecodeResult {
 
 // Soft-decision LDPC(112,56) decoder using sum-product belief propagation.
 //
-// QPSK bit mapping (sequential Gray-coded):
-//   bit 2k   -> sym[k].real  (I component)
-//   bit 2k+1 -> sym[k].imag  (Q component)
+// BPSK bit mapping (one real symbol per bit):
+//   bit k -> sym[k]
+//   s = +a  ->  bit 0
+//   s = -a  ->  bit 1
 //
 // LLR model (AWGN with known fading):
-//   LLR = 2 * amplitude * received_component / noise_var
+//   LLR = 2 * amplitude * received_symbol / noise_var
 //   positive LLR => bit is more likely 0
 //   negative LLR => bit is more likely 1
 //
 // Parameters:
-//   syms       - 56 received QPSK symbols
+//   syms       - 112 received BPSK symbols
 //   amplitudes - per-symbol channel fading amplitude (use 1.0 for flat/unfaded channel)
-//   noise_var  - noise variance per I/Q component (sigma^2 of the AWGN)
+//   noise_var  - noise variance per symbol (sigma^2 of the AWGN)
 //   max_iter   - maximum belief-propagation iterations (default 30)
-LDPCDecodeResult ldpc_decode(const RADE_COMP* syms,
-                              const float*    amplitudes,
-                              float           noise_var,
-                              int             max_iter = 30);
+LDPCDecodeResult ldpc_decode(const float* syms,
+                              const float* amplitudes,
+                              float        noise_var,
+                              int          max_iter = 30);
 
-// Compute 112 channel LLRs from 56 received QPSK symbols using the
-// Simplified-MAX-Log-MAP (a.k.a. Max-Log-MAP) algorithm.
+// Compute 112 channel LLRs from 112 received BPSK symbols.
 //
-// The algorithm approximates the exact MAP log-likelihood ratio by replacing
-// the log-sum-exp over all constellation points sharing a bit value with a
-// plain max (equivalently, minimum squared Euclidean distance):
+// For BPSK the MAP log-likelihood ratio has an exact closed form (unlike
+// higher-order constellations, no log-sum-exp approximation is needed since
+// each bit value corresponds to exactly one constellation point):
 //
-//   LLR_b ≈ min_{s: b=1} ||r - a·s||² / (2σ²)
-//          - min_{s: b=0} ||r - a·s||² / (2σ²)
+//   LLR = 2 * a · r / σ²
 //
-// QPSK constellation and bit mapping (bit 2k = I, bit 2k+1 = Q):
-//   s = ( a,  0)  ->  bits (0,0)
-//   s = ( 0,  a)  ->  bits (0,1)
-//   s = ( 0, -a)  ->  bits (1,0)
-//   s = (-a,  0)  ->  bits (1,1)
+// BPSK constellation and bit mapping:
+//   s = +a  ->  bit 0
+//   s = -a  ->  bit 1
 //
 // Sign convention: positive LLR => bit more likely 0,
 //                 negative LLR => bit more likely 1.
 //
 // Parameters:
-//   syms       - 56 received QPSK symbols
+//   syms       - 112 received BPSK symbols
 //   amplitudes - per-symbol channel fading amplitude (use 1.0 for flat channel)
-//   noise_var  - noise variance per I/Q component (sigma^2 of the AWGN)
+//   noise_var  - noise variance per symbol (sigma^2 of the AWGN)
 //   llr_out    - caller-allocated output buffer of 112 floats
-void ldpc_linear_log_map(const RADE_COMP* syms,
-                         const float*    amplitudes,
-                         float           noise_var,
-                         float*          llr_out);
+void ldpc_linear_log_map(const float* syms,
+                         const float* amplitudes,
+                         float        noise_var,
+                         float*       llr_out);
 
 #endif // LDPC_DECODE_H
