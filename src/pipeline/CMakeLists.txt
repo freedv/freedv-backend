@@ -10,12 +10,14 @@ add_library(fdv_audio_pipeline STATIC
     MinimalTxRxThread.cpp
     MuteStep.cpp
     RADEReceiveStep.cpp
+    RADEFeatureExpander.cpp
     RADETransmitStep.cpp
     ResampleStep.cpp
     RNNoiseStep.cpp
     TapStep.cpp
     ToneInterfererStep.cpp
     rade_text.cpp
+    rade_bwe_data.c
     ldpc_encode.cpp
     ldpc_decode.cpp
 )
@@ -68,6 +70,9 @@ DefineUnitTest(RadeTextTest)
 target_link_libraries(RadeTextTest PRIVATE rade opus samplerate)
 
 DefineUnitTest(RadeTextUnitTest)
+
+DefineUnitTest(RADEFeatureExpanderTest)
+target_link_libraries(RADEFeatureExpanderTest PRIVATE rade opus)
 
 DefineUnitTest(RadeStepResetTest)
 target_link_libraries(RadeStepResetTest PRIVATE rade opus samplerate)

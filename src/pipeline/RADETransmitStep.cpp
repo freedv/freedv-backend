@@ -86,6 +86,8 @@ RADETransmitStep::RADETransmitStep(struct rade* dv, LPCNetEncState* encState)
     , inputSampleFifo_(LPCNET_FRAME_SIZE + 1)
     , featureList_(nullptr)
     , featureListIdx_(0)
+    , narrowbandInput_(false)
+    , expanderActive_(false)
     , featuresFile_(nullptr)
     , exitingFeatureThread_(false)
 {
@@ -127,6 +129,9 @@ RADETransmitStep::RADETransmitStep(struct rade* dv, LPCNetEncState* encState)
     assert(featureList_ != nullptr);
 
     arch_ = opus_select_arch();
+
+    featureExpander_ = std::make_unique<RADEFeatureExpander>();
+    assert(featureExpander_ != nullptr);
 }
 
 RADETransmitStep::~RADETransmitStep()
@@ -202,6 +207,20 @@ short* RADETransmitStep::execute(short* inputSamples, int numInputSamples, int* 
             FREEDV_BEGIN_VERIFIED_SAFE
             lpcnet_compute_single_frame_features(encState_, pcm, features, arch_);
             FREEDV_END_VERIFIED_SAFE
+
+            if (narrowbandInput_.load(std::memory_order_acquire))
+            {
+                if (!expanderActive_)
+                {
+                    featureExpander_->reset();
+                    expanderActive_ = true;
+                }
+                featureExpander_->process(features);
+            }
+            else
+            {
+                expanderActive_ = false;
+            }
             
             if (featuresFile_)
             {
@@ -270,11 +289,17 @@ void RADETransmitStep::restartVocoder() FREEDV_NONBLOCKING
     }
 }
 
+void RADETransmitStep::setNarrowbandInput(bool narrowband) FREEDV_NONBLOCKING
+{
+    narrowbandInput_.store(narrowband, std::memory_order_release);
+}
+
 void RADETransmitStep::reset() FREEDV_NONBLOCKING
 {
     inputSampleFifo_.reset();
     outputSampleFifo_.reset();
     featureListIdx_ = 0;
+    expanderActive_ = false;
 }
 
 void RADETransmitStep::utFeatureThreadEntry_()
