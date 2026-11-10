@@ -135,7 +135,7 @@ jobs:
       env:
         ASAN_OPTIONS: halt_on_error=1:detect_stack_use_after_return=1
         UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
-        TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1:suppressions=${{ github.workspace }}/.github/tsan_suppressions.txt
+        TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
       run: |
         cd build
         ctest --output-on-failure --timeout 1800
