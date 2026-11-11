@@ -268,17 +268,12 @@ jobs:
   # never compile, and for Windows' 32-bit long. ThreadSanitizer and
   # LeakSanitizer aren't available for Windows. x86_64 only: llvm-mingw has
   # no ASan for aarch64.
-  #
-  # -fsanitize=function is left out: LibreSSL, which only the Windows build
-  # compiles from source, calls element free functions through a generic
-  # void (*)(void*) pointer (crypto/stack/stack.c), harmless on every ABI we
-  # build for but reported on every TLS connection. A UBSan suppression for
-  # it didn't take effect in this combined ASan+UBSan build. The Linux and
-  # macOS jobs still run that check on all of the backend's own code.
+  # LibreSSL, which only the Windows build compiles from source, is built
+  # without UBSan (see cmake/BuildLibreSSL.cmake).
   build-windows-sanitizers:
     runs-on: ubuntu-24.04
     env:
-      SANITIZER_FLAGS: -fsanitize=address,undefined -fno-sanitize=function -fno-sanitize-recover=undefined -fno-omit-frame-pointer
+      SANITIZER_FLAGS: -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer
     steps:
     - uses: actions/checkout@v6
 
@@ -295,8 +290,8 @@ jobs:
         cmake -DCMAKE_TOOLCHAIN_FILE=${{ github.workspace }}/cross-compile/freedv-mingw-llvm-x86_64.cmake \
           -DCMAKE_BUILD_TYPE=RelWithDebInfo \
           -DCMAKE_C_FLAGS="$SANITIZER_FLAGS" -DCMAKE_CXX_FLAGS="$SANITIZER_FLAGS" \
-          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined -fno-sanitize=function" \
-          -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address,undefined -fno-sanitize=function" \
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined" \
+          -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address,undefined" \
           -DBUILD_BACKEND_UNITTESTS=1 ..
 
     - name: Build backend and tests
