@@ -18,12 +18,8 @@
 #include <mutex>
 #include <vector>
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
-
 #include "../SocketIoClient.h"
+#include "TestSocketCompat.h"
 #include "yyjson.h"
 
 // SocketIoClient.h names SocketIoClientTest as a friend, so the class that
@@ -85,12 +81,12 @@ class EarlyWriteServer
 {
 public:
     explicit EarlyWriteServer(int connections)
-        : fd_(::socket(AF_INET, SOCK_STREAM, 0))
+        : fd_(testOpenSocket(AF_INET, SOCK_STREAM))
         , port_(0)
         , remaining_(connections)
     {
         int one = 1;
-        setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        testSetSockOpt(fd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
         addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -104,23 +100,27 @@ public:
         thread_ = std::thread([this]() {
             while (remaining_-- > 0)
             {
-                int client = accept(fd_, nullptr, nullptr);
+                int client = testAccept(fd_);
                 if (client < 0)
                 {
                     return;
                 }
                 static const char OPEN[] = "0{\"pingInterval\":25000,\"pingTimeout\":20000}";
-                send(client, OPEN, sizeof(OPEN) - 1, 0);
+                send(client, OPEN, (int)(sizeof(OPEN) - 1), 0);
                 std::this_thread::sleep_for(std::chrono::milliseconds(20));
-                close(client);
+                testCloseSocket(client);
             }
         });
     }
 
     ~EarlyWriteServer()
     {
+#if defined(_WIN32)
+        shutdown(fd_, SD_BOTH);
+#else
         shutdown(fd_, SHUT_RDWR);
-        close(fd_);
+#endif // defined(_WIN32)
+        testCloseSocket(fd_); // also wakes a pending accept()
         thread_.join();
     }
 
@@ -143,6 +143,17 @@ class SocketIoOrderProbe : public SocketIoClient
 public:
     std::atomic<bool> connectionAtFirstFrame{false};
     std::atomic<int> frames{0};
+
+    // Shut down here, as ~SocketIoClient() does, but while this class's
+    // onReceive_() override is still the one a queued dispatch would call:
+    // left to the base destructor, the worker can make that virtual call
+    // while this object's vptr is being reset (TSan: race on vptr).
+    ~SocketIoOrderProbe() override
+    {
+        enableReconnect_.store(false, std::memory_order_relaxed);
+        disconnect().wait();
+        waitForAllTasksComplete_();
+    }
 
 protected:
     void onReceive_(char* buf, int length) override

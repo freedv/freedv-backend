@@ -316,7 +316,11 @@ bool threadGuardsStopOnHelperAndFullOutputFifo()
     }
 
     // With room restored, only the helper stands between RX and the audio.
+    // Stop first, then let a pass that tested the helper just before the
+    // store finish: it would otherwise find the room the drain makes and take
+    // the queued modem audio (seen on macOS CI).
     rxHelper->stopNow.store(true, std::memory_order_release);
+    std::this_thread::sleep_for(100ms);
     drainInto(cbData.outfifo2, drained);
     std::this_thread::sleep_for(500ms);
     bool rxIdle = cbData.infifo2->numUsed() == MODEM_CHUNK && cbData.outfifo2->numUsed() == 0;
