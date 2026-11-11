@@ -52,6 +52,14 @@ public:
     virtual void reset() FREEDV_NONBLOCKING override;
     
 private:
+    // tempInput_[0] is a guard slot rather than data. With one channel,
+    // libsamplerate's SRC_LINEAR converter reads data_in[-1] when it starts
+    // writing before it has consumed anything from the buffer it was just
+    // given -- which happens on short calls (one sample at any ratio, two
+    // when upsampling) -- so the data starts at tempInput_[1] and the slot
+    // ahead of it carries the sample that preceded the chunk.
+    static constexpr int INPUT_GUARD_SAMPLES = 1;
+
     int inputSampleRate_;
     int outputSampleRate_;
     SRC_STATE* resampleState_;
@@ -59,6 +67,7 @@ private:
     std::unique_ptr<float[]> tempInput_;
     std::unique_ptr<float[]> tempOutput_;
     std::unique_ptr<short[]> outputSamples_;
+    float lastInputSample_;
 };
 
 #endif // AUDIO_PIPELINE__RESAMPLE_STEP_H

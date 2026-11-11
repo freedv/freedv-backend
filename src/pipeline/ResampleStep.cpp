@@ -41,6 +41,7 @@
 ResampleStep::ResampleStep(int inputSampleRate, int outputSampleRate, bool forPlotsOnly)
     : inputSampleRate_(inputSampleRate)
     , outputSampleRate_(outputSampleRate)
+    , lastInputSample_(0.0f)
 {
     assert(inputSampleRate > 0 && outputSampleRate > 0);
 
@@ -54,7 +55,7 @@ ResampleStep::ResampleStep(int inputSampleRate, int outputSampleRate, bool forPl
     outputSamples_ = std::make_unique<short[]>(outputSampleRate);
     assert(outputSamples_ != nullptr);
 
-    tempInput_ = std::make_unique<float[]>(maxInputLen);
+    tempInput_ = std::make_unique<float[]>(INPUT_GUARD_SAMPLES + maxInputLen);
     assert(tempInput_ != nullptr);
 
     tempOutput_ = std::make_unique<float[]>(maxOutputLen);
@@ -121,12 +122,16 @@ short* ResampleStep::execute(short* inputSamples, int numInputSamples, int* numO
         // libsamplerate is unlikely to use RT-unsafe constructs in normal use
         // (verified with RTsan-enabled automated testing). Verified on 2025-09-30.
         FREEDV_BEGIN_VERIFIED_SAFE
-        src_short_to_float_array(inputPtr, tempInput_.get(), inputSize);
+        // Fill the guard slot with the sample that came before this chunk, so
+        // the converter's data_in[-1] read stays in bounds and interpolates
+        // against real audio.
+        tempInput_[0] = lastInputSample_;
+        src_short_to_float_array(inputPtr, tempInput_.get() + INPUT_GUARD_SAMPLES, inputSize);
         FREEDV_END_VERIFIED_SAFE
 
         //ConvertToFloatSampleType_<float, short>(inputPtr, tempInput_, inputSize);
 
-        src_data.data_in = tempInput_.get();
+        src_data.data_in = tempInput_.get() + INPUT_GUARD_SAMPLES;
         src_data.data_out = tempOutput_.get();
         src_data.input_frames = inputSize;
         src_data.output_frames = outputRoom;
@@ -154,6 +159,7 @@ short* ResampleStep::execute(short* inputSamples, int numInputSamples, int* numO
         inputPtr += src_data.input_frames_used;
         numInputSamples -= src_data.input_frames_used;
         *numOutputSamples += src_data.output_frames_gen;
+        lastInputSample_ = tempInput_[INPUT_GUARD_SAMPLES + inputSize - 1];
         if (src_data.input_frames_used == 0)
         {
             // src_process consumed nothing with room still in the buffer:
@@ -168,4 +174,5 @@ short* ResampleStep::execute(short* inputSamples, int numInputSamples, int* numO
 void ResampleStep::reset() FREEDV_NONBLOCKING
 {
     src_reset(resampleState_);
+    lastInputSample_ = 0.0f;
 }

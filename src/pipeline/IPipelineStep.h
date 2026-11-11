@@ -43,7 +43,13 @@ class IPipelineStep
 {
 public:
     virtual ~IPipelineStep();
-    
+
+    // Threading: nothing here is locked. execute() and reset() belong to the
+    // thread that runs the pipeline and must not run concurrently from two
+    // threads -- a caller that wants a reset while audio is flowing hands it
+    // to that thread instead of calling reset() itself. The sample rate
+    // getters read values fixed at construction, so they are safe anywhere.
+
     // Returns required input sample rate.
     virtual int getInputSampleRate() const FREEDV_NONBLOCKING = 0;
     
@@ -58,7 +64,8 @@ public:
     // Returns: Array of int16 values corresponding to result audio.
     virtual short* execute(short* inputSamples, int numInputSamples, int* numOutputSamples) FREEDV_NONBLOCKING = 0;
     
-    // Resets internal state of the pipeline step.
+    // Resets internal state of the pipeline step, from the same thread as
+    // execute().
     virtual void reset() FREEDV_NONBLOCKING { /* empty */ }
 
 protected:
