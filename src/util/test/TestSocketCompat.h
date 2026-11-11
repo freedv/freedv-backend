@@ -161,6 +161,21 @@ inline void testSetNonBlocking(int fd)
 #endif // defined(_WIN32)
 }
 
+// Whether the socket becomes writable (e.g. a non-blocking connect
+// completes) within timeoutMs.
+inline bool testWaitWritable(int fd, int timeoutMs)
+{
+    fd_set writeSet;
+    FD_ZERO(&writeSet);
+#if defined(_WIN32)
+    FD_SET((SOCKET)fd, &writeSet);
+#else
+    FD_SET(fd, &writeSet);
+#endif // defined(_WIN32)
+    struct timeval tv = {timeoutMs / 1000, (timeoutMs % 1000) * 1000};
+    return ::select(fd + 1, nullptr, &writeSet, nullptr, &tv) > 0;
+}
+
 inline void testSetEnv(const char* name, const char* value)
 {
 #if defined(_WIN32)

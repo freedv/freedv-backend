@@ -298,6 +298,155 @@ bool agcUnsupportedRateRunsAt48k()
     return true;
 }
 
+// 16 kHz and 32 kHz are natively supported rates: the AGC must keep them
+// (no 48 kHz fallback) and still regulate toward -23 LUFS at those rates.
+bool agcNativeRates16kAnd32k()
+{
+    const int rates[] = { 16000, 32000 };
+    for (int rate : rates)
+    {
+        AgcStep step(rate);
+        if (step.getInputSampleRate() != rate || step.getOutputSampleRate() != rate)
+        {
+            std::cerr << "[" << rate << " Hz AGC runs at " << step.getInputSampleRate() << " Hz]...";
+            return false;
+        }
+
+        double amplitude = findAmplitudeForLoudness(AGC_TARGET_LUFS, TEST_TONE_FREQ_HZ, rate);
+        auto input = generateSineWave(amplitude, TEST_TONE_FREQ_HZ, 1.0, rate);
+        auto output = runThroughAgc(step, input, rate / 100);
+        if ((int)output.size() != rate)
+        {
+            std::cerr << "[" << output.size() << " samples back from " << rate << " at " << rate << " Hz]...";
+            return false;
+        }
+
+        double outputLufs = measureLoudnessLufs(&output[output.size() - rate / 2], rate / 2, rate);
+        if (std::abs(outputLufs - AGC_TARGET_LUFS) > 3.0)
+        {
+            std::cerr << "[" << rate << " Hz output at " << outputLufs << " LUFS, expected about " << AGC_TARGET_LUFS << "]...";
+            return false;
+        }
+    }
+    return true;
+}
+
+// Pure silence: every momentary measurement comes back as -HUGE_VAL, so the
+// measurement-validity chain must reject it at the "not -HUGE_VAL" step and
+// the gain stays gated (silence in, silence out). Also verifies execute()
+// with zero input samples is a no-op.
+bool agcSilenceMeasurementsAreRejected()
+{
+    constexpr int sampleRate = 48000;
+
+    AgcStep step(sampleRate);
+
+    std::vector<short> oneSample(1, 0);
+    int zeroInputOutput = -1;
+    step.execute(oneSample.data(), 0, &zeroInputOutput);
+    if (zeroInputOutput != 0)
+    {
+        std::cerr << "[execute() with 0 input samples returned " << zeroInputOutput << " output samples]...";
+        return false;
+    }
+
+    std::vector<short> silence(sampleRate, 0); // 1 s: ten 10 ms blocks, five loudness updates
+    auto output = runThroughAgc(step, silence, sampleRate / 10);
+
+    if ((int)output.size() != sampleRate)
+    {
+        std::cerr << "[got " << output.size() << " samples back from " << sampleRate << "]...";
+        return false;
+    }
+
+    for (size_t i = 0; i < output.size(); i++)
+    {
+        if (output[i] != 0)
+        {
+            std::cerr << "[silence in, nonzero sample " << output[i] << " out at " << i << "]...";
+            return false;
+        }
+    }
+
+    return true;
+}
+
+// A tone at -28 LUFS: quieter than the target, but above the -33 LUFS
+// silence gate. The measurement must pass the gate's loudness threshold and
+// the release ramp must start lifting the signal (by roughly 2 dB in 4 s of
+// 6 s-constant ramping; the assertion only requires at least 1 dB).
+bool agcQuietAboveGateStartsGainRamp()
+{
+    constexpr int sampleRate = 8000;
+    constexpr double RAW_LUFS = -28.0;
+
+    AgcStep step(sampleRate);
+
+    double amplitude = findAmplitudeForLoudness(RAW_LUFS, TEST_TONE_FREQ_HZ, sampleRate);
+    auto quietSignal = generateSineWave(amplitude, TEST_TONE_FREQ_HZ, 4.0, sampleRate);
+
+    double rawLufs = measureLoudnessLufs(quietSignal.data() + sampleRate, sampleRate, sampleRate);
+    if (rawLufs <= -33.0 || rawLufs >= AGC_TARGET_LUFS)
+    {
+        std::cerr << "[test signal is " << rawLufs << " LUFS, expected between the -33 gate and "
+                   << AGC_TARGET_LUFS << "]...";
+        return false;
+    }
+
+    auto output = runThroughAgc(step, quietSignal, sampleRate / 10);
+    if ((int)output.size() != 4 * sampleRate)
+    {
+        std::cerr << "[got " << output.size() << " samples back from " << 4 * sampleRate << "]...";
+        return false;
+    }
+
+    double outLufs = measureLoudnessLufs(&output[output.size() - sampleRate], sampleRate, sampleRate);
+    if (outLufs < rawLufs + 1.0)
+    {
+        std::cerr << "[quiet-above-gate signal was not ramped up: raw=" << rawLufs
+                   << " output=" << outLufs << "]...";
+        return false;
+    }
+
+    return true;
+}
+
+// execute() pre-allocates one second of output; handing it more than that in a
+// single call used to write past the end of that buffer (ASan
+// heap-buffer-overflow, found by fuzzing execute() with random block sizes). It
+// must stop at the buffer's capacity and drop the rest of the block.
+bool agcSingleCallStaysWithinOutputBuffer()
+{
+    const int sampleRate = 16000;
+    AgcStep step(sampleRate);
+
+    std::vector<short> input(sampleRate * 3);
+    for (std::size_t n = 0; n < input.size(); n++)
+    {
+        input[n] = static_cast<short>(
+            10000.0 * std::cos(2.0 * M_PI * TEST_TONE_FREQ_HZ * n / sampleRate));
+    }
+
+    int numOutputSamples = 0;
+    short* result = step.execute(input.data(), static_cast<int>(input.size()), &numOutputSamples);
+
+    if (numOutputSamples <= 0 || numOutputSamples > sampleRate)
+    {
+        std::cerr << "[" << numOutputSamples << " samples returned from a "
+                  << sampleRate << " sample buffer]...";
+        return false;
+    }
+
+    // Reading back what it reports is the actual ASan check.
+    if (result[numOutputSamples - 1] == 0)
+    {
+        std::cerr << "[last returned sample is silent]...";
+        return false;
+    }
+
+    return true;
+}
+
 int main()
 {
     TEST_CASE(agcConvergesLoudSignalToTargetLoudness);
@@ -306,5 +455,9 @@ int main()
     TEST_CASE(agcResetReturnsGainToUnity);
     TEST_CASE(agcLimitsCutToTwentyDb);
     TEST_CASE(agcUnsupportedRateRunsAt48k);
+    TEST_CASE(agcNativeRates16kAnd32k);
+    TEST_CASE(agcSilenceMeasurementsAreRejected);
+    TEST_CASE(agcQuietAboveGateStartsGainRamp);
+    TEST_CASE(agcSingleCallStaysWithinOutputBuffer);
     return 0;
 }

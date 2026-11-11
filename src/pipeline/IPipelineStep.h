@@ -43,7 +43,13 @@ class IPipelineStep
 {
 public:
     virtual ~IPipelineStep();
-    
+
+    // Threading: nothing here is locked. execute() and reset() belong to the
+    // thread that runs the pipeline and must not run concurrently from two
+    // threads -- a caller that wants a reset while audio is flowing hands it
+    // to that thread instead of calling reset() itself. The sample rate
+    // getters read values fixed at construction, so they are safe anywhere.
+
     // Returns required input sample rate.
     virtual int getInputSampleRate() const FREEDV_NONBLOCKING = 0;
     
@@ -58,7 +64,8 @@ public:
     // Returns: Array of int16 values corresponding to result audio.
     virtual short* execute(short* inputSamples, int numInputSamples, int* numOutputSamples) FREEDV_NONBLOCKING = 0;
     
-    // Resets internal state of the pipeline step.
+    // Resets internal state of the pipeline step, from the same thread as
+    // execute().
     virtual void reset() FREEDV_NONBLOCKING { /* empty */ }
 
 protected:
@@ -86,14 +93,14 @@ void IPipelineStep::ConvertSingleSampleToFloatSampleType_(SrcType* sourceSamples
     static_assert(SampleDivisor != 0);
 
     // Iterate through samples, performing division (if needed) and typecasting
-    if (SampleDivisor == 1)
+    if constexpr (SampleDivisor == 1)
     {
         destSamples[0] = (DstType)sourceSamples[0];
     }
     else
     {
         auto divider = SampleDivisor + 1;
-        if (SampleDivisor != std::numeric_limits<DstType>::max())
+        if constexpr (SampleDivisor != std::numeric_limits<DstType>::max())
         {
             divider = SampleDivisor;
         }
@@ -112,7 +119,7 @@ void IPipelineStep::ConvertToFloatSampleType_(SrcType* sourceSamples, DstType* d
     static_assert(SampleDivisor != 0);
 
     // Iterate through samples, performing division (if needed) and typecasting
-    if (SampleDivisor == 1)
+    if constexpr (SampleDivisor == 1)
     {
         for (std::size_t index = 0; index < numSamples; index++)
         {
@@ -122,7 +129,7 @@ void IPipelineStep::ConvertToFloatSampleType_(SrcType* sourceSamples, DstType* d
     else
     {
         auto divider = SampleDivisor + 1;
-        if (SampleDivisor != std::numeric_limits<SrcType>::max())
+        if constexpr (SampleDivisor != std::numeric_limits<SrcType>::max())
         {
             divider = SampleDivisor;
         }
@@ -141,7 +148,7 @@ void IPipelineStep::ConvertSingleSampleToIntSampleType_(SrcType* sourceSamples, 
     static_assert(std::numeric_limits<DstType>::is_integer);
 
     // Iterate through samples, performing multiplication (if needed) and typecasting
-    if (SampleMultiplier == 1)
+    if constexpr (SampleMultiplier == 1)
     {
         destSamples[0] = (DstType)sourceSamples[0];
     }
@@ -151,7 +158,14 @@ void IPipelineStep::ConvertSingleSampleToIntSampleType_(SrcType* sourceSamples, 
         constexpr auto MAX_DST_TYPE_VAL = std::numeric_limits<DstType>::max();
         constexpr auto multiplier = (SampleMultiplier != MAX_DST_TYPE_VAL) ? SampleMultiplier : (SampleMultiplier + 1);
         SrcType temp = sourceSamples[0] * multiplier;
-        if (temp <= MIN_DST_TYPE_VAL)
+        if (temp != temp)
+        {
+            // NaN compares false against both limits below, and casting it to
+            // an integer is undefined behaviour (UBSan float-cast-overflow).
+            // A NaN sample can only come from a NaN gain, so emit silence.
+            destSamples[0] = 0;
+        }
+        else if (temp <= MIN_DST_TYPE_VAL)
         {
             destSamples[0] = MIN_DST_TYPE_VAL;
         }
@@ -174,7 +188,7 @@ void IPipelineStep::ConvertToIntSampleType_(SrcType* sourceSamples, DstType* des
     static_assert(std::numeric_limits<DstType>::is_integer);
 
     // Iterate through samples, performing multiplication (if needed) and typecasting
-    if (SampleMultiplier == 1)
+    if constexpr (SampleMultiplier == 1)
     {
         for (std::size_t index = 0; index < numSamples; index++)
         {
@@ -189,7 +203,13 @@ void IPipelineStep::ConvertToIntSampleType_(SrcType* sourceSamples, DstType* des
         for (std::size_t index = 0; index < numSamples; index++)
         {
             SrcType temp = sourceSamples[index] * multiplier;
-            if (temp <= MIN_DST_TYPE_VAL)
+            if (temp != temp)
+            {
+                // See ConvertSingleSampleToIntSampleType_: NaN must not reach
+                // the integer cast, which is undefined behaviour.
+                destSamples[index] = 0;
+            }
+            else if (temp <= MIN_DST_TYPE_VAL)
             {
                 destSamples[index] = MIN_DST_TYPE_VAL;
             }

@@ -75,8 +75,13 @@ extern std::string utTxFeatureFile;
 
 int RADETransmitStep::eooLengthInSamples() const FREEDV_NONBLOCKING
 {
+    return EooLengthInSamples(dv_);
+}
+
+int RADETransmitStep::EooLengthInSamples(struct rade* dv) FREEDV_NONBLOCKING
+{
     FREEDV_BEGIN_VERIFIED_SAFE
-        return rade_n_tx_eoo_out(dv_) + NUM_SAMPLES_SILENCE;
+        return rade_n_tx_eoo_out(dv) + NUM_SAMPLES_SILENCE;
     FREEDV_END_VERIFIED_SAFE
 }
 

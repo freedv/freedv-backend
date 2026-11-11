@@ -162,16 +162,18 @@ static void convert_ota_string_to_callsign_(const char *input, char *output, int
     {
         if (input[index] == 0)
             break;
-
-        if (input[index] >= 1 && input[index] <= 9)
+        // Input bytes come only from ldpc_decode's bit packing (six 0/1 bits
+        // per byte), so they are always in {1..63} once the 0 break above is
+        // passed: each lower bound is implied by the preceding else.
+        if (input[index] <= 9)
         {
             output[outidx++] = input[index] + 37;
         }
-        else if (input[index] >= 10 && input[index] <= 19)
+        else if (input[index] <= 19)
         {
             output[outidx++] = input[index] - 10 + '0';
         }
-        else if (input[index] >= 20 && input[index] <= 45)
+        else if (input[index] <= 45)
         {
             output[outidx++] = input[index] - 20 + 'A';
         }
@@ -432,8 +434,14 @@ void rade_text_generate_tx_string(rade_text_t ptr, const char *str, int strlengt
     char tmp[RADE_TEXT_MAX_RAW_LENGTH + 1];
     memset(tmp, 0, RADE_TEXT_MAX_RAW_LENGTH + 1);
 
-    convert_callsign_to_ota_string_(str, &tmp[RADE_TEXT_CRC_LENGTH],
-                                    strlength < RADE_TEXT_MAX_LENGTH ? strlength : RADE_TEXT_MAX_LENGTH);
+    // strlength is caller-supplied: clamp it into [0, RADE_TEXT_MAX_LENGTH]. A
+    // negative value otherwise becomes a huge (size_t) loop bound in
+    // convert_callsign_to_ota_string_, which then copies input until it finds a
+    // NUL and writes past the end of `tmp` (ASan stack-buffer-overflow).
+    int textLength = strlength < 0
+        ? 0
+        : (strlength < RADE_TEXT_MAX_LENGTH ? strlength : RADE_TEXT_MAX_LENGTH);
+    convert_callsign_to_ota_string_(str, &tmp[RADE_TEXT_CRC_LENGTH], textLength);
 
     int txt_length = strlen(&tmp[RADE_TEXT_CRC_LENGTH]);
     if (txt_length >= RADE_TEXT_MAX_LENGTH)
@@ -496,23 +504,28 @@ void rade_text_generate_tx_string(rade_text_t ptr, const char *str, int strlengt
             syms[2 * index] = 1;
             syms[2 * index + 1] = 0;
         }
-        else if (*ptr == 0 && *(ptr + 1) == 1)
+        else if (*ptr == 0)
         {
+            // tx_text bytes are packed bits ({0,1} only: memset + interleave
+            // of 0/1 message+parity bits), so *(ptr+1) == 1 is forced here.
             syms[2 * index] = 0;
             syms[2 * index + 1] = 1;
         }
-        else if (*ptr == 1 && *(ptr + 1) == 0)
+        else if (*(ptr + 1) == 0)
         {
+            // *ptr == 1 is forced by the two arms above plus the bit domain.
             syms[2 * index] = 0;
             syms[2 * index + 1] = -1;
         }
-        else if (*ptr == 1 && *(ptr + 1) == 1)
+        else
         {
+            // Remaining pair is (1, 1).
             syms[2 * index] = -1;
             syms[2 * index + 1] = 0;
         }
-        debugString[2 * index] = impl->tx_text[2 * index] ? '1' : '0';
-        debugString[2 * index + 1] = impl->tx_text[2 * index + 1] ? '1' : '0';
+        // tx_text bytes are 0 or 1 (see above).
+        debugString[2 * index] = '0' + *ptr;
+        debugString[2 * index + 1] = '0' + *(ptr + 1);
     }
 
     if (impl->enableStats)

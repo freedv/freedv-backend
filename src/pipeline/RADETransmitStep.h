@@ -74,6 +74,10 @@ public:
     // is in terms of number of samples at RADE_MODEM_SAMPLE_RATE (8000 Hz).
     int eooLengthInSamples() const FREEDV_NONBLOCKING;
 
+    // The same figure for a step built on `dv`, for callers that need it
+    // before (or without) a step to ask.
+    static int EooLengthInSamples(struct rade* dv) FREEDV_NONBLOCKING;
+
 private:
     struct rade* dv_;
     LPCNetEncState* encState_;

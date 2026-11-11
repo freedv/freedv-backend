@@ -432,19 +432,20 @@ void serializeArgs(const char* fmt, va_list ap, Record& rec) FREEDV_NONBLOCKING
         parseSpec(p, s);
         p += s.totalLen;
 
-        if (s.kind == AK_NONE)
-        {
-            continue;
-        }
-        if (s.kind == AK_UNSUPPORTED)
-        {
-            rec.truncated = true;
-            break;
-        }
-
+        // All kind dispatch lives in the switch below. With AK_NONE and
+        // AK_UNSUPPORTED as explicit cases it covers every ArgKind value
+        // parseSpec can return -- which is also why the former `if` guards
+        // here and the former `default:` arm further down were dead.
         bool ok = true;
         switch (s.kind)
         {
+            case AK_NONE:
+                break; // "%%" carries no argument; ok stays true
+            case AK_UNSUPPORTED:
+                // The `if (!ok)` path below flags the record and stops the
+                // format scan -- the same effect as the old early break.
+                ok = false;
+                break;
             case AK_S64:
             {
                 long long v;
@@ -525,9 +526,6 @@ void serializeArgs(const char* fmt, va_list ap, Record& rec) FREEDV_NONBLOCKING
                 }
                 break;
             }
-            default:
-                ok = false;
-                break;
         }
 
         if (!ok)
@@ -606,29 +604,31 @@ void renderMessage(const Record& rec, char* out, std::size_t cap)
         parseSpec(p, s);
         p += s.totalLen;
 
-        if (s.kind == AK_NONE)
-        {
-            appendLiteral(out, cap, used, '%');
-            continue;
-        }
-        if (s.kind == AK_UNSUPPORTED || argsExhausted)
-        {
-            std::size_t n = std::snprintf(out + used, cap - used, "%s", "<?>");
-            if (n > 0 && used + n < cap) used += n;
-            argsExhausted = true;
-            continue;
-        }
-
         // Rebuild a single-conversion spec: '%' + prefix + normalized length
         // modifier + conversion char. Every integer is widened to long long,
         // so "ll" makes the snprintf call portable regardless of the original
         // z/j/t/l modifier.
         char spec[kSpecPrefixMax + 8];
-        std::size_t remain = cap > used ? cap - used : 0;
+        // used <= cap - 1 at every point here: renderMessage starts used at
+        // 0 and every update (appendLiteral's guarded store, the fit-checked
+        // `used += n` below, and the truncation clamp beside it) keeps used
+        // at most cap - 1, so the ternary's ": 0" arm was unreachable.
+        std::size_t remain = cap - used;
         std::size_t n = 0;
 
         switch (s.kind)
         {
+            case AK_NONE:
+                // A literal "%%" prints a percent even once arguments have
+                // run out; it consumes none.
+                appendLiteral(out, cap, used, '%');
+                continue;
+            case AK_UNSUPPORTED:
+                // Not reproducible from the captured arguments: mark the
+                // record exhausted so this conversion, and every later one,
+                // takes the shared "<?>" append below.
+                argsExhausted = true;
+                break;
             case AK_S64:
             {
                 long long v = 0;
@@ -691,8 +691,6 @@ void renderMessage(const Record& rec, char* out, std::size_t cap)
                 n = std::snprintf(out + used, remain, spec, strArg);
                 break;
             }
-            default:
-                break;
         }
 
         if (argsExhausted)
@@ -714,9 +712,13 @@ void renderMessage(const Record& rec, char* out, std::size_t cap)
 
     if (rec.truncated)
     {
-        std::size_t n = std::snprintf(out + used, cap > used ? cap - used : 0,
+        // Both the `cap > used ?` ternary and the `n > 0` test were dead:
+        // used never exceeds cap - 1 (see the remain computation above),
+        // and the format here is a pure literal, so snprintf() always
+        // returns the message length -- a positive count.
+        std::size_t n = std::snprintf(out + used, cap - used,
                                      " [ulog_async: truncated]");
-        if (n > 0 && used + n < cap) used += n;
+        if (used + n < cap) used += n;
     }
     (void)used;
 }
