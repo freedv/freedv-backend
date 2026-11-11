@@ -60,10 +60,13 @@ int MinimalTxRxThread::getTxNNomModemSamples() const
 {
     // txStep_ exists only on a TX thread, and only once that thread's worker
     // has built the pipeline, so the UI thread can ask before it's there (or
-    // of an RX thread). Fall back to the EOO length on its own then.
+    // of an RX thread). The step's figure depends only on rade_, so work it
+    // out the same way then: the bare EOO length would be 200 ms short (the
+    // silence after the EOO), and a FIFO sized from it too small.
     auto txStep = txStep_.load(std::memory_order_acquire);
     return std::max(rade_n_tx_out(rade_),
-                    txStep != nullptr ? txStep->eooLengthInSamples() : rade_n_tx_eoo_out(rade_));
+                    txStep != nullptr ? txStep->eooLengthInSamples()
+                                      : RADETransmitStep::EooLengthInSamples(rade_));
 }
 
 int MinimalTxRxThread::getRxNumSpeechSamples() const
