@@ -299,10 +299,13 @@ static void nullSsl(TcpConnectionHandler& conn)
     conn.ssl_.store(nullptr, std::memory_order_relaxed);
 }
 
-// Flags the connection as TLS without ever negotiating TLS.
-static void fakeUsingTls(TcpConnectionHandler& conn)
+// Takes the SSL object away from a live TLS connection, leaving it flagged
+// as TLS with no SSL object. (usingTLS_ itself can't be changed on a live
+// connection: the receive thread reads it unsynchronized.) The caller frees
+// the returned object once the connection is closed.
+static SSL* takeSsl(TcpConnectionHandler& conn)
 {
-    conn.usingTLS_ = true;
+    return conn.ssl_.exchange(nullptr, std::memory_order_relaxed);
 }
 
 static int callSslWrite(TcpConnectionHandler& conn, int& sslErr)
@@ -2325,34 +2328,51 @@ bool testTlsWithoutCertEnvVars(TestCertificate& cert)
     return report(result);
 }
 
-bool testTlsFlaggedWithoutSslObject()
+bool testTlsFlaggedWithoutSslObject(TestCertificate& cert)
 {
     std::cout << "Test 56 (TLS flagged but no SSL object: helpers bail out, plain path used): ";
-    LoopbackTcpServer server;
-    TestConnection conn;
-    bool result = CHECK(server.valid());
-    conn.connect("127.0.0.1", server.port(), false);
-    result &= CHECK(server.accept(ACCEPT_TIMEOUT_MS));
-    result &= CHECK(conn.waitForConnects(1));
 
-    int sslErr = 0;
-    result &= CHECK(TcpConnectionHandlerTest::callSslWrite(conn, sslErr) == -1);
-    result &= CHECK(TcpConnectionHandlerTest::callSslRead(conn, sslErr) == -1);
-    result &= CHECK(TcpConnectionHandlerTest::callSslPending(conn) == 0);
+    // With no SSL object at all (a plain connection), the TLS helpers bail out.
+    bool result = true;
+    {
+        LoopbackTcpServer server;
+        TestConnection conn;
+        result &= CHECK(server.valid());
+        conn.connect("127.0.0.1", server.port(), false);
+        result &= CHECK(server.accept(ACCEPT_TIMEOUT_MS));
+        result &= CHECK(conn.waitForConnects(1));
 
-    TcpConnectionHandlerTest::fakeUsingTls(conn); // claims TLS, never negotiated it
+        int sslErr = 0;
+        result &= CHECK(TcpConnectionHandlerTest::callSslWrite(conn, sslErr) == -1);
+        result &= CHECK(TcpConnectionHandlerTest::callSslRead(conn, sslErr) == -1);
+        result &= CHECK(TcpConnectionHandlerTest::callSslPending(conn) == 0);
+    }
+
+    // A TLS connection that loses its SSL object is flagged as TLS with
+    // none. TLS 1.2, so that the server sends nothing after the handshake
+    // (TLS 1.3 session tickets would arrive first and end the stream).
+    TlsFixture f(cert, true);
+    result &= CHECK(f.ok);
+    if (!f.ok) return report(result);
+    SSL* ssl = TcpConnectionHandlerTest::takeSsl(f.conn);
+    result &= CHECK(ssl != nullptr);
+
+    // Sends take the plain path, so the server sees the bytes unencrypted.
     const std::string msg = "plain path";
-    conn.send(msg.c_str(), msg.size());
+    f.conn.send(msg.c_str(), msg.size());
     std::string got(msg.size(), '\0');
-    result &= CHECK(server.recvExact(&got[0], got.size(), IO_TIMEOUT_MS) && got == msg);
+    result &= CHECK(f.server.recvExact(&got[0], got.size(), IO_TIMEOUT_MS) && got == msg);
 
     // Flagged as TLS with nothing pending: the read loop never decrypts, so
     // every arrival (and every timeout) looks like the end of the stream.
-    result &= CHECK(server.sendAll(std::string("ack")));
-    result &= CHECK(conn.waitForDisconnects(1));
-    result &= CHECK(conn.connectCount() == 1);
-    result &= CHECK(conn.disconnectCount() == 1);
-    result &= CHECK(conn.received().empty());
+    result &= CHECK(f.server.sendAll(std::string("ack")));
+    result &= CHECK(f.conn.waitForDisconnects(1));
+    result &= CHECK(f.conn.connectCount() == 1);
+    result &= CHECK(f.conn.disconnectCount() == 1);
+    result &= CHECK(f.conn.received().empty());
+
+    // Closed, so the receive thread that could have used it has finished.
+    SSL_free(ssl);
     return report(result);
 }
 bool testTlsSendLosesSslObjectMidWait(TestCertificate& cert)
@@ -2965,7 +2985,7 @@ int main(int, char**)
     result &= testTlsCertDirEnv(cert);
     result &= testTlsWithoutCertEnvVars(cert);
     result &= testTlsHelloRetryRequestStallsWrite(cert);
-    result &= testTlsFlaggedWithoutSslObject();
+    result &= testTlsFlaggedWithoutSslObject(cert);
     result &= testTlsSendLosesSslObjectMidWait(cert);
     result &= testTlsSendWaitingOnInvalidSocket(cert);
     result &= testTlsReadWantsWriteOnInvalidSocket(cert);
