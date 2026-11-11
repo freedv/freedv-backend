@@ -41,6 +41,7 @@
 
 #include <array>
 #include <cassert>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -947,6 +948,37 @@ static bool test22_sym_size_equal_to_payload()
     return ok;
 }
 
+// ---------------------------------------------------------------------------
+// Test 23: a negative strlength (a caller-computed length gone wrong, or a
+// hostile one) must not become a huge loop bound in the callsign converter: it
+// copied input until it found a NUL, well past the end of the transmit buffer
+// (ASan stack-buffer-overflow, found by fuzzing generate_tx_string). It must
+// behave like an empty callsign.
+// ---------------------------------------------------------------------------
+static bool test23_negative_strlength()
+{
+    printf("=== Test 23: negative strlength ===\n");
+
+    const int lengths[] = { -1, -8, INT_MIN };
+    bool ok = true;
+    for (int len : lengths)
+    {
+        rade_text_t tx = rade_text_create();
+        float syms[TOTAL_FLOATS];
+        memset(syms, 0, sizeof(syms));
+        rade_text_generate_tx_string(tx, "K6AQ", len, syms, TOTAL_FLOATS);
+        rade_text_destroy(tx);
+
+        RxState state = receiveFrame(syms);
+        bool passed = state.callCount == 1 && state.received.empty();
+        printf("  strlength %d -> '%s' (%d callbacks): %s\n", len, state.received.c_str(),
+               state.callCount, passed ? "PASS" : "FAIL");
+        ok &= passed;
+    }
+
+    printf("Negative strlength treated as empty: %s\n\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
 
 int main()
 {
@@ -974,6 +1006,7 @@ int main()
     success &= test20_string_shorter_than_strlength();
     success &= test21_valid_frame_without_rx_callback();
     success &= test22_sym_size_equal_to_payload();
+    success &= test23_negative_strlength();
 
     printf("=== Overall: %s ===\n", success ? "PASS" : "FAIL");
     return success ? 0 : 1;

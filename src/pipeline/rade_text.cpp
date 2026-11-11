@@ -434,8 +434,14 @@ void rade_text_generate_tx_string(rade_text_t ptr, const char *str, int strlengt
     char tmp[RADE_TEXT_MAX_RAW_LENGTH + 1];
     memset(tmp, 0, RADE_TEXT_MAX_RAW_LENGTH + 1);
 
-    convert_callsign_to_ota_string_(str, &tmp[RADE_TEXT_CRC_LENGTH],
-                                    strlength < RADE_TEXT_MAX_LENGTH ? strlength : RADE_TEXT_MAX_LENGTH);
+    // strlength is caller-supplied: clamp it into [0, RADE_TEXT_MAX_LENGTH]. A
+    // negative value otherwise becomes a huge (size_t) loop bound in
+    // convert_callsign_to_ota_string_, which then copies input until it finds a
+    // NUL and writes past the end of `tmp` (ASan stack-buffer-overflow).
+    int textLength = strlength < 0
+        ? 0
+        : (strlength < RADE_TEXT_MAX_LENGTH ? strlength : RADE_TEXT_MAX_LENGTH);
+    convert_callsign_to_ota_string_(str, &tmp[RADE_TEXT_CRC_LENGTH], textLength);
 
     int txt_length = strlen(&tmp[RADE_TEXT_CRC_LENGTH]);
     if (txt_length >= RADE_TEXT_MAX_LENGTH)

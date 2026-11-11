@@ -70,11 +70,15 @@ short* LevelAdjustStep::execute(short* inputSamples, int numInputSamples, int* n
     short* inPtr = inputSamples;
     short* outPtr = outputSamples_.get();
     float* tmpPtr = tmpFloatInput_.get();
-    *numOutputSamples = numInputSamples;
+    // outputSamples_ holds one second of audio: only that many samples can be
+    // written out, so a longer block is truncated rather than overflowing the
+    // buffer (and a negative count isn't reported back as one).
+    int numSamples = std::max(0, std::min(numInputSamples, sampleRate_));
+    *numOutputSamples = numSamples;
 
-    while (numInputSamples > 0)
+    while (numSamples > 0)
     {
-        int samplesToRead = std::min(numInputSamples, sampleRate_ / 100); // process 10ms blocks
+        int samplesToRead = std::min(numSamples, sampleRate_ / 100); // process 10ms blocks
         ConvertToFloatSampleType_<float, short>(inPtr, tmpPtr, samplesToRead);
         for (int index = 0; index < samplesToRead; index++)
         {
@@ -84,7 +88,7 @@ short* LevelAdjustStep::execute(short* inputSamples, int numInputSamples, int* n
 
         inPtr += samplesToRead;
         outPtr += samplesToRead;
-        numInputSamples -= samplesToRead;
+        numSamples -= samplesToRead;
     }
     
     return outputSamples_.get();

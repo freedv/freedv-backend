@@ -99,6 +99,7 @@ DefineUnitTest(UlogConfigTest)
 DefineUnitTest(ThreadedObjectTest)
 DefineUnitTest(SemaphoreTest)
 DefineUnitTest(EventHandlerTest)
+DefineUnitTest(SocketIoClientTest)
 
 # Linux-only fault-injection shims (-Wl,--wrap) for the OS/library failure
 # arms TcpConnectionHandlerTest and SemaphoreTest exercise. The __wrap_X

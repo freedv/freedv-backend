@@ -79,7 +79,10 @@ short* RNNoiseStep::execute(short* inputSamples, int numInputSamples, int* numOu
     short* outputSamples = outputSamples_.get();
     short* tmpOutput = outputSamples;
 
-    while (numInputSamples > 0)
+    // outputSamples_ holds one second of audio; stop when it's full so an
+    // over-long single call can't write past the end (the rest of the input
+    // is dropped, as in ResampleStep).
+    while (numInputSamples > 0 && *numOutputSamples + RNNOISE_FRAME_SIZE <= RNNOISE_SAMPLE_RATE)
     {
         // Always room on every pass: the FIFO is sized RNNOISE_FRAME_SIZE + 1 and
         // the drain below leaves numUsed() < RNNOISE_FRAME_SIZE, so numFree() >= 2
@@ -89,7 +92,8 @@ short* RNNoiseStep::execute(short* inputSamples, int numInputSamples, int* numOu
         inputSamples += samplesToWrite;
         numInputSamples -= samplesToWrite;
 
-        while (inputSampleFifo_.numUsed() >= RNNOISE_FRAME_SIZE)
+        while (inputSampleFifo_.numUsed() >= RNNOISE_FRAME_SIZE &&
+               *numOutputSamples + RNNOISE_FRAME_SIZE <= RNNOISE_SAMPLE_RATE)
         {
             *numOutputSamples += (!firstFrame_ ? 1 : 0) * RNNOISE_FRAME_SIZE;
             inputSampleFifo_.read(tmpOutput, RNNOISE_FRAME_SIZE);

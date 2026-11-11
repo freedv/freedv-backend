@@ -1,0 +1,8 @@
+# The closed-socket tests (Test 46, Test 47 and the stalled-send variant) close
+# the socket from the test thread while the handler's own thread is still inside
+# write()/read() on that descriptor -- that is exactly the situation they exist
+# to exercise ("the socket number was closed behind the handler's back").
+# Product code never does this: disconnectImpl_() joins the receive thread
+# before closesocket(), and sending and disconnecting both run on the single
+# task thread. TSan's file-descriptor race detector therefore only sees the
+race:testCloseSocket

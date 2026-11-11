@@ -79,6 +79,28 @@ bool fullSecond()
     return producesSilence(step, 8000, 48000);
 }
 
+// The rate conversion is done in 64-bit: numInputSamples * outputSampleRate_
+// overflows a 32-bit int for blocks of a few tens of milliseconds at these
+// rates (UBSan signed-integer-overflow, found by fuzzing execute()). The result
+// is still capped at the one second the output buffer holds.
+bool hugeBlockDoesNotOverflowOrOverrun()
+{
+    MuteStep step(8000, 48000);
+
+    // 8000 samples x 48000 = 384,000,000: fits. 1,000,000 x 48000 does not.
+    bool result = producesSilence(step, 1000000, 48000);
+
+    MuteStep up(8000, 192000);
+    result &= producesSilence(up, 3 * 8000, 192000);
+    return result;
+}
+
+bool negativeInputCountIsRejected()
+{
+    MuteStep step(8000, 48000);
+    return producesSilence(step, -1000, 0);
+}
+
 } // namespace
 
 int main()
@@ -88,5 +110,7 @@ int main()
     TEST_CASE(downsample);
     TEST_CASE(noInput);
     TEST_CASE(fullSecond);
+    TEST_CASE(hugeBlockDoesNotOverflowOrOverrun);
+    TEST_CASE(negativeInputCountIsRejected);
     return 0;
 }

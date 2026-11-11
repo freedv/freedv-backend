@@ -20,6 +20,7 @@
 //
 //=========================================================================
 
+#include <climits>
 #include <iostream>
 #include <memory>
 #include <sstream>
@@ -201,6 +202,14 @@ void SocketIoClient::handleWebsocketRequest_(WebSocketClient*, websocketpp::conn
 
 void SocketIoClient::handleEngineIoMessage_(char* ptr, int length)
 {
+    // The frame comes straight off the wire: it is not NUL terminated at
+    // `length`, so nothing here may read past it (strlen() did, and ran off the
+    // end of the caller's buffer -- ASan heap-buffer-overflow).
+    if (ptr == nullptr || length <= 0)
+    {
+        return;
+    }
+
     switch(ptr[0])
     {
         case '0':
@@ -209,15 +218,25 @@ void SocketIoClient::handleEngineIoMessage_(char* ptr, int length)
 
             // "open" -- ready to receive socket.io messages
             // Grab ping timings and start ping timer
-            yyjson_doc* sessionInfo = yyjson_read(ptr + 1, strlen(ptr + 1), 0);
+            yyjson_doc* sessionInfo = yyjson_read(ptr + 1, (size_t)(length - 1), 0);
+            if (sessionInfo == nullptr)
+            {
+                // Not JSON we can use: treat it the way the transport treats
+                // anything invalid.
+                log_warn("invalid session info from engine.io -- reconnecting");
+                disconnect();
+                break;
+            }
 
             yyjson_val* rootVal = yyjson_doc_get_root(sessionInfo);
             auto pingInterval = yyjson_obj_get(rootVal, "pingInterval");
             auto pingTimeout = yyjson_obj_get(rootVal, "pingTimeout");
 
+            // Missing/zero/negative timings would make the watchdog fire
+            // immediately, so keep the built-in interval in that case.
+            auto pingMs = yyjson_get_int(pingInterval) + yyjson_get_int(pingTimeout);
             pingTimer_.setTimeout(
-                yyjson_get_int(pingInterval) +
-                yyjson_get_int(pingTimeout));
+                pingMs > 0 && pingMs <= INT_MAX ? (int)pingMs : DEFAULT_PING_TIMER_INTERVAL_MS);
             pingTimer_.start();
 
             yyjson_doc_free(sessionInfo);
@@ -236,7 +255,12 @@ void SocketIoClient::handleEngineIoMessage_(char* ptr, int length)
             //log_info("engine.io ping");
 
             // "ping" -- send pong
-            connection_->send("3");
+            // Guarded like onDisconnect_'s: a frame can reach this parser
+            // before connection_ exists (UBSan: member call on a null pointer).
+            if (connection_)
+            {
+                connection_->send("3");
+            }
             pingTimer_.restart();
             break;
         }
@@ -249,7 +273,9 @@ void SocketIoClient::handleEngineIoMessage_(char* ptr, int length)
         default:
             // ignore all others as they're related to transport upgrades, but if we got
             // something invalid, we should treat it as a disconnection.
-            if (!isdigit(ptr[0]))
+            // Cast first: isdigit() is undefined for a negative char, and wire
+            // data is full of them (0x80 and above).
+            if (!isdigit((unsigned char)ptr[0]))
             {
                 log_warn("invalid data received from engine.io -- reconnecting");
 
@@ -268,8 +294,15 @@ void SocketIoClient::fireEvent(std::string const& eventName, yyjson_val* params)
     }
 }
 
-void SocketIoClient::handleSocketIoMessage_(char* ptr, int)
+void SocketIoClient::handleSocketIoMessage_(char* ptr, int length)
 {
+    // As in handleEngineIoMessage_: the payload is only valid up to `length`,
+    // so parse with that rather than strlen().
+    if (ptr == nullptr || length <= 0)
+    {
+        return;
+    }
+
     switch(ptr[0])
     {
         case '0':
@@ -288,7 +321,8 @@ void SocketIoClient::handleSocketIoMessage_(char* ptr, int)
         {
             // event received from server (owned by the task, so that it's
             // freed even if the task never runs)
-            std::shared_ptr<yyjson_doc> eventDoc(yyjson_read(ptr + 1, strlen(ptr + 1), 0), yyjson_doc_free);
+            std::shared_ptr<yyjson_doc> eventDoc(
+                yyjson_read(ptr + 1, (size_t)(length - 1), 0), yyjson_doc_free);
             if (eventDoc != nullptr)
             {
                 enqueue_([this, eventDoc]() {

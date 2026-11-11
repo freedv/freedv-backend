@@ -151,7 +151,14 @@ void IPipelineStep::ConvertSingleSampleToIntSampleType_(SrcType* sourceSamples, 
         constexpr auto MAX_DST_TYPE_VAL = std::numeric_limits<DstType>::max();
         constexpr auto multiplier = (SampleMultiplier != MAX_DST_TYPE_VAL) ? SampleMultiplier : (SampleMultiplier + 1);
         SrcType temp = sourceSamples[0] * multiplier;
-        if (temp <= MIN_DST_TYPE_VAL)
+        if (temp != temp)
+        {
+            // NaN compares false against both limits below, and casting it to
+            // an integer is undefined behaviour (UBSan float-cast-overflow).
+            // A NaN sample can only come from a NaN gain, so emit silence.
+            destSamples[0] = 0;
+        }
+        else if (temp <= MIN_DST_TYPE_VAL)
         {
             destSamples[0] = MIN_DST_TYPE_VAL;
         }
@@ -189,7 +196,13 @@ void IPipelineStep::ConvertToIntSampleType_(SrcType* sourceSamples, DstType* des
         for (std::size_t index = 0; index < numSamples; index++)
         {
             SrcType temp = sourceSamples[index] * multiplier;
-            if (temp <= MIN_DST_TYPE_VAL)
+            if (temp != temp)
+            {
+                // See ConvertSingleSampleToIntSampleType_: NaN must not reach
+                // the integer cast, which is undefined behaviour.
+                destSamples[index] = 0;
+            }
+            else if (temp <= MIN_DST_TYPE_VAL)
             {
                 destSamples[index] = MIN_DST_TYPE_VAL;
             }

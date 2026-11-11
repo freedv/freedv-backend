@@ -321,6 +321,14 @@ int GenericFIFO<T>::write(T* data, int len) noexcept
 {
     assert(data != NULL);
 
+    // A negative length passes canWrite_()'s "is there room" test and then
+    // becomes a huge std::copy_n count (the (uint32_t) cast in writeImpl_),
+    // which reads well past the caller's buffer. Reject it instead.
+    if (len < 0)
+    {
+        return -1;
+    }
+
     if (!beginAccess_(writerActive_))
     {
         return -1;
@@ -371,6 +379,13 @@ template<typename T>
 int GenericFIFO<T>::read(T* result, int len) noexcept
 {
     assert(result != NULL);
+
+    // See write(): a negative length is a caller error, not a request to read
+    // (canRead_() happens to reject it, but don't rely on that).
+    if (len < 0)
+    {
+        return -1;
+    }
 
     if (!beginAccess_(readerActive_))
     {

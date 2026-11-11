@@ -138,7 +138,11 @@ short* AgcStep::execute(short* inputSamples, int numInputSamples, int* numOutput
     short* tmpOutput = outputSamples;
     short* tmpInput = tmpInput_.get();
 
-    while (numInputSamples > 0)
+    // outputSamples_ holds one second of audio, so stop once it's full: a
+    // caller that hands over more than a second in one call must not be able
+    // to write past the end (the remaining input is dropped, as in
+    // ResampleStep).
+    while (numInputSamples > 0 && *numOutputSamples + numSamplesPerRun_ <= sampleRate_)
     {
         // Always room on every pass: the FIFO is sized numSamplesPerRun_ + 1 and
         // the drain below leaves numUsed() < numSamplesPerRun_, so numFree() >= 2
@@ -148,7 +152,8 @@ short* AgcStep::execute(short* inputSamples, int numInputSamples, int* numOutput
         inputSamples += samplesToWrite;
         numInputSamples -= samplesToWrite;
 
-        while (inputSampleFifo_.numUsed() >= numSamplesPerRun_)
+        while (inputSampleFifo_.numUsed() >= numSamplesPerRun_ &&
+               *numOutputSamples + numSamplesPerRun_ <= sampleRate_)
         {
             *numOutputSamples += numSamplesPerRun_;
             inputSampleFifo_.read(tmpInput, numSamplesPerRun_);

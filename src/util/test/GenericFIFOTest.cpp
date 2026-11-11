@@ -404,6 +404,32 @@ bool testMoveTransfersBufferOwnership()
     return result;
 }
 
+bool testNegativeLengthIsRejected()
+{
+    std::cout << "Test 9 (Negative transfer length rejected): ";
+
+    // A negative length passed canWrite_()'s "is there room?" test and then
+    // became a huge std::copy_n count in writeImpl_, which read well past the
+    // caller's buffer (ASan heap-buffer-overflow, found by fuzzing).
+    GenericFIFO<int> fifo(16);
+    int in[2] = { 1, 2 };
+    int out[2] = { 0, 0 };
+
+    bool result = (fifo.write(in, -1) == -1);
+    result &= (fifo.numUsed() == 0);
+    result &= (fifo.read(out, -1) == -1);
+    result &= (fifo.numUsed() == 0);
+
+    // Rejected transfers leave the FIFO usable.
+    result &= (fifo.write(in, 2) == 0);
+    result &= (fifo.numUsed() == 2);
+    result &= (fifo.read(out, 2) == 0);
+    result &= (out[0] == 1 && out[1] == 2);
+
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    return result;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -418,6 +444,7 @@ int main(int argc, char** argv)
     result &= testConcurrentResetsAndNumUsed();
     result &= testExternalBufferNotOwned();
     result &= testMoveTransfersBufferOwnership();
+    result &= testNegativeLengthIsRejected();
 
     return result ? 0 : -1;
 }

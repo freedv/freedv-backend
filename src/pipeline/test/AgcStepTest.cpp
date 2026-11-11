@@ -411,6 +411,42 @@ bool agcQuietAboveGateStartsGainRamp()
     return true;
 }
 
+// execute() pre-allocates one second of output; handing it more than that in a
+// single call used to write past the end of that buffer (ASan
+// heap-buffer-overflow, found by fuzzing execute() with random block sizes). It
+// must stop at the buffer's capacity and drop the rest of the block.
+bool agcSingleCallStaysWithinOutputBuffer()
+{
+    const int sampleRate = 16000;
+    AgcStep step(sampleRate);
+
+    std::vector<short> input(sampleRate * 3);
+    for (std::size_t n = 0; n < input.size(); n++)
+    {
+        input[n] = static_cast<short>(
+            10000.0 * std::cos(2.0 * M_PI * TEST_TONE_FREQ_HZ * n / sampleRate));
+    }
+
+    int numOutputSamples = 0;
+    short* result = step.execute(input.data(), static_cast<int>(input.size()), &numOutputSamples);
+
+    if (numOutputSamples <= 0 || numOutputSamples > sampleRate)
+    {
+        std::cerr << "[" << numOutputSamples << " samples returned from a "
+                  << sampleRate << " sample buffer]...";
+        return false;
+    }
+
+    // Reading back what it reports is the actual ASan check.
+    if (result[numOutputSamples - 1] == 0)
+    {
+        std::cerr << "[last returned sample is silent]...";
+        return false;
+    }
+
+    return true;
+}
+
 int main()
 {
     TEST_CASE(agcConvergesLoudSignalToTargetLoudness);
@@ -422,5 +458,6 @@ int main()
     TEST_CASE(agcNativeRates16kAnd32k);
     TEST_CASE(agcSilenceMeasurementsAreRejected);
     TEST_CASE(agcQuietAboveGateStartsGainRamp);
+    TEST_CASE(agcSingleCallStaysWithinOutputBuffer);
     return 0;
 }

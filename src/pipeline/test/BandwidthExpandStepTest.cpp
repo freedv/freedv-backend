@@ -218,6 +218,38 @@ bool nullInputProducesNoOutput()
     return true;
 }
 
+// The step's output buffer holds one second of 48 kHz audio. Handing execute()
+// more than a second of 16 kHz input in one call used to expand past the end of
+// it (ASan heap-buffer-overflow, found by fuzzing with random block sizes); it
+// must stop at the buffer's capacity and drop the remainder.
+bool singleCallStaysWithinOutputBuffer()
+{
+    BandwidthExpandStep step;
+    auto input = makeVowel(3 * IN_RATE); // 3 seconds in
+
+    int numOut = 0;
+    short* result = step.execute(input.data(), (int)input.size(), &numOut);
+    if (numOut <= 0 || numOut > OUT_RATE)
+    {
+        std::cerr << "[" << numOut << " samples returned from a " << OUT_RATE << " sample buffer]...";
+        return false;
+    }
+    // Whole expanded frames: 320 input samples -> 960 out.
+    if (numOut % (FRAME * (OUT_RATE / IN_RATE)) != 0)
+    {
+        std::cerr << "[" << numOut << " samples is not a whole number of frames]...";
+        return false;
+    }
+
+    // Reading back exactly what it reports is what trips ASan if the expansion
+    // ran off the end of the buffer.
+    for (int n = 0; n < numOut; n++)
+    {
+        (void)result[n];
+    }
+    return true;
+}
+
 int main()
 {
     TEST_CASE(outputComesInWholeFrames);
@@ -225,5 +257,6 @@ int main()
     TEST_CASE(addsContentAboveInputBand);
     TEST_CASE(largeBlockMatchesSmallBlocks);
     TEST_CASE(nullInputProducesNoOutput);
+    TEST_CASE(singleCallStaysWithinOutputBuffer);
     return 0;
 }

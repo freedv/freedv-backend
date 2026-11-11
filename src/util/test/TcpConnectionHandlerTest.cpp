@@ -293,12 +293,6 @@ static void callCheckConnections(TcpConnectionHandler& conn, std::vector<int>& s
         BIO_set_callback_ex(SSL_get_rbio(ssl), failBioWrites_);
         return true;
     }
-// Nulls out the SSL object while the connection still believes it has TLS.
-static void nullSsl(TcpConnectionHandler& conn)
-{
-    conn.ssl_.store(nullptr, std::memory_order_relaxed);
-}
-
 // Takes the SSL object away from a live TLS connection, leaving it flagged
 // as TLS with no SSL object. (usingTLS_ itself can't be changed on a live
 // connection: the receive thread reads it unsynchronized.) The caller frees
@@ -993,23 +987,35 @@ protected:
         {
             return;
         }
+        // Build the chain with real getaddrinfo() calls: the handler releases
+        // it with freeaddrinfo(), and that only frees what getaddrinfo
+        // allocated -- on glibc the sockaddr lives inside the node's block, so
+        // a hand-built node either leaks its separately allocated address
+        // (LSan) or, if new'd, is freed with the wrong deallocator (ASan
+        // alloc-dealloc-mismatch). Prepending keeps the last entry as the head,
+        // which is the one the tamper below modifies.
         struct addrinfo* head = nullptr;
         for (const auto& entry : ipv4_)
         {
-            struct addrinfo* node = new struct addrinfo;
-            memset(node, 0, sizeof(*node));
-            struct sockaddr_in* addr = new struct sockaddr_in;
-            memset(addr, 0, sizeof(*addr));
-            addr->sin_family = AF_INET;
-            addr->sin_port = htons(entry.second);
-            inet_pton(AF_INET, entry.first.c_str(), &addr->sin_addr);
-            node->ai_addr = (struct sockaddr*)addr;
-            node->ai_addrlen = sizeof(*addr);
-            node->ai_family = AF_INET;
-            node->ai_socktype = SOCK_STREAM;
-            node->ai_protocol = IPPROTO_TCP;
-            node->ai_next = head;
-            head = node;
+            struct addrinfo hints;
+            memset(&hints, 0, sizeof(hints));
+            hints.ai_family = AF_INET;
+            hints.ai_socktype = SOCK_STREAM;
+            hints.ai_protocol = IPPROTO_TCP;
+            hints.ai_flags = AI_NUMERICHOST;
+
+            struct addrinfo* resolved = nullptr;
+            std::string port = std::to_string(entry.second);
+            if (getaddrinfo(entry.first.c_str(), port.c_str(), &hints, &resolved) != 0)
+            {
+                continue;
+            }
+            while (resolved->ai_next != nullptr)
+            {
+                resolved = resolved->ai_next;
+            }
+            resolved->ai_next = head;
+            head = resolved;
         }
         if (head != nullptr)
         {
@@ -2396,13 +2402,19 @@ bool testTlsSendLosesSslObjectMidWait(TestCertificate& cert)
     auto sendFuture = f.conn.send(msg.c_str(), msg.size());
     result &= CHECK(sendFuture.wait_for(300ms) == std::future_status::timeout); // stalled SSL_write
 
-    TcpConnectionHandlerTest::nullSsl(f.conn); // the write loop must notice and give up
+    // Take the SSL object away: the stalled write loop must notice and give
+    // up. The test keeps the object and frees it once nothing can use it.
+    SSL* ssl = TcpConnectionHandlerTest::takeSsl(f.conn);
+    result &= CHECK(ssl != nullptr);
     auto disconnectFuture = f.conn.disconnect();
     result &= CHECK(sendFuture.wait_for(EVENT_TIMEOUT) == std::future_status::ready);
     result &= CHECK(disconnectFuture.wait_for(EVENT_TIMEOUT) == std::future_status::ready);
     result &= CHECK(f.conn.waitForDisconnects(1));
     result &= CHECK(f.conn.connectCount() == 1);
     result &= CHECK(f.conn.disconnectCount() == 1);
+    // Nothing references it now: the send task returned and the disconnect
+    // joined the receive thread.
+    SSL_free(ssl);
     return report(result);
 }
 
