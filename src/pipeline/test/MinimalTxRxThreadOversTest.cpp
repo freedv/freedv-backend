@@ -287,9 +287,12 @@ bool threadGuardsStopOnHelperAndFullOutputFifo()
 
     // Emptying the FIFO restores room, but the helper must now hold the
     // loop before it processes anything, even with a full mic frame waiting.
+    // The helper says stop first: draining first would let a pass that's
+    // already past the helper check take the mic audio.
+    txHelper->stopNow.store(true, std::memory_order_release);
+    std::this_thread::sleep_for(100ms); // any pass in flight sees it
     std::vector<short> drained;
     drainInto(cbData.outfifo1, drained);
-    txHelper->stopNow.store(true, std::memory_order_release);
     cbData.infifo1->write(junk.data(), 2 * SPEECH_CHUNK);
     std::this_thread::sleep_for(500ms);
     bool txIdle = cbData.infifo1->numUsed() == 2 * SPEECH_CHUNK;

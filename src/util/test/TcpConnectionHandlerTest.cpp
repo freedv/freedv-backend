@@ -262,6 +262,19 @@ static void joinRecvThread(TcpConnectionHandler& conn)
     }
 }
 
+#if defined(ENABLE_TLS_SUPPORT)
+// Frees the TLS state a test left behind by invalidating the socket
+// (disconnectImpl_ frees it only along with a valid socket). Only once the
+// receive thread is joined and nothing else can be using it.
+static void freeTlsState(TcpConnectionHandler& conn)
+{
+    SSL* ssl = conn.ssl_.exchange(nullptr, std::memory_order_relaxed);
+    SSL_CTX* ctx = conn.sslCtx_.exchange(nullptr, std::memory_order_relaxed);
+    SSL_free(ssl);
+    SSL_CTX_free(ctx);
+}
+#endif // defined(ENABLE_TLS_SUPPORT)
+
 #if !defined(_WIN32)
 static void callCheckConnections(TcpConnectionHandler& conn, std::vector<int>& socks)
 {
@@ -987,15 +1000,11 @@ protected:
         {
             return;
         }
-        // Build the chain with real getaddrinfo() calls: the handler releases
-        // it with freeaddrinfo(), and that only frees what getaddrinfo
-        // allocated -- on glibc the sockaddr lives inside the node's block, so
-        // a hand-built node either leaks its separately allocated address
-        // (LSan) or, if new'd, is freed with the wrong deallocator (ASan
-        // alloc-dealloc-mismatch). Prepending keeps the last entry as the head,
-        // which is the one the tamper below modifies.
+        // Built by getaddrinfo() (as numeric hosts), because the handler
+        // frees the list with freeaddrinfo(). The last entry is the head.
         struct addrinfo* head = nullptr;
-        for (const auto& entry : ipv4_)
+        struct addrinfo** tail = &head;
+        for (auto entry = ipv4_.rbegin(); entry != ipv4_.rend(); ++entry)
         {
             struct addrinfo hints;
             memset(&hints, 0, sizeof(hints));
@@ -1003,19 +1012,14 @@ protected:
             hints.ai_socktype = SOCK_STREAM;
             hints.ai_protocol = IPPROTO_TCP;
             hints.ai_flags = AI_NUMERICHOST;
-
-            struct addrinfo* resolved = nullptr;
-            std::string port = std::to_string(entry.second);
-            if (getaddrinfo(entry.first.c_str(), port.c_str(), &hints, &resolved) != 0)
+            std::string port = std::to_string(entry->second);
+            if (getaddrinfo(entry->first.c_str(), port.c_str(), &hints, tail) == 0)
             {
-                continue;
+                while (*tail != nullptr)
+                {
+                    tail = &(*tail)->ai_next;
+                }
             }
-            while (resolved->ai_next != nullptr)
-            {
-                resolved = resolved->ai_next;
-            }
-            resolved->ai_next = head;
-            head = resolved;
         }
         if (head != nullptr)
         {
@@ -1040,6 +1044,29 @@ private:
     DnsTamper tamperHead_;
     std::vector<std::pair<std::string, int> > ipv4_;
 };
+#if defined(__SANITIZE_THREAD__)
+#define TCP_TEST_UNDER_TSAN 1
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define TCP_TEST_UNDER_TSAN 1
+#endif
+#endif
+
+// A few tests close the handler's socket out from under the thread that's
+// using it, as nothing in the handler ever does, to reach the error paths
+// for a descriptor that has gone away. ThreadSanitizer rightly reports that
+// close() as a race with the handler's own use of the descriptor, so these
+// tests only run without it.
+bool skipUnderTsan()
+{
+#if defined(TCP_TEST_UNDER_TSAN)
+    std::cout << "SKIP (closes a socket another thread is using)\n";
+    return true;
+#else
+    return false;
+#endif
+}
+
 // Most of these tests need an IPv6 loopback address; skip them without one.
 bool skipWithoutIpv6(LoopbackTcpServer& server6)
 {
@@ -1415,6 +1442,7 @@ bool testPendingConnectSucceedsWhileDnsPending()
 bool testSendAfterSocketClosedReportsSelectError()
 {
     std::cout << "Test 46 (send's wait loop sees select() fail on a closed socket number): ";
+    if (skipUnderTsan()) return true;
     LoopbackTcpServer server;
     TestConnection conn;
     bool result = CHECK(server.valid());
@@ -1436,6 +1464,7 @@ bool testSendAfterSocketClosedReportsSelectError()
 bool testReceiveAfterSocketClosedReportsSelectError()
 {
     std::cout << "Test 47 (receive loop sees select() fail on a closed socket number): ";
+    if (skipUnderTsan()) return true;
     LoopbackTcpServer server;
     TestConnection conn;
     conn.slowReceive.store(true); // drain at 1 ms per 128 KB, so the socket buffer fills
@@ -1663,6 +1692,7 @@ bool testLateIpv6CollectedWhileIpv4AttemptInFlight()
 bool testStalledSendSelectErrorOnClosedSocket()
 {
     std::cout << "Test 62 (stalled send's wait loop sees select() fail on a closed socket number): ";
+    if (skipUnderTsan()) return true;
     LoopbackTcpServer server;
     TestConnection conn;
     bool result = CHECK(server.valid());
@@ -2447,6 +2477,7 @@ bool testTlsSendWaitingOnInvalidSocket(TestCertificate& cert)
     result &= CHECK(disconnectFuture.wait_for(EVENT_TIMEOUT) == std::future_status::ready);
     TcpConnectionHandlerTest::joinRecvThread(f.conn); // disconnectImpl_ skipped its join
     testCloseSocket(clientFd);
+    TcpConnectionHandlerTest::freeTlsState(f.conn); // and its TLS state
     result &= CHECK(f.conn.connectCount() == 1);
     result &= CHECK(f.conn.disconnectCount() == 0); // invalid socket: nothing to disconnect
     return report(result);
@@ -2487,6 +2518,7 @@ bool testTlsReadWantsWriteOnInvalidSocket(TestCertificate& cert)
     result &= CHECK(disconnectFuture.wait_for(EVENT_TIMEOUT) == std::future_status::ready);
     TcpConnectionHandlerTest::joinRecvThread(f.conn);
     testCloseSocket(clientFd);
+    TcpConnectionHandlerTest::freeTlsState(f.conn); // and its TLS state
     // The buffered data was never dispatched: the pass ended on the dead
     // socket before its hand-over point.
     result &= CHECK(f.conn.connectCount() == 1);
