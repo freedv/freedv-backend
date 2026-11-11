@@ -183,8 +183,12 @@ static bool runPipeline(
 
     paCallBackData cbData;
 
+    // TX input holds 2 s: more than the 1 s of modem output the TX thread
+    // can produce each time it is drained (see the TX phase below).
+    const int TX_SPEECH_FIFO = speechRate * 2;
+
     // TX thread: infifo1 (speech in), outfifo1 (modem out)
-    cbData.infifo1  = new GenericFIFO<short>(SPEECH_FIFO);
+    cbData.infifo1  = new GenericFIFO<short>(TX_SPEECH_FIFO);
     cbData.outfifo1 = new GenericFIFO<short>(MODEM_FIFO);
 
     // RX thread: infifo2 (modem in), outfifo2 (speech out)
@@ -282,7 +286,17 @@ static bool runPipeline(
             {
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
-            drainTxOut();
+
+            // The TX thread encodes whenever its output FIFO has room, and a
+            // frame of silence when its input runs short (as a live mic
+            // would). Only make room once at least 1 s of speech is queued,
+            // so it can't overtake this loop (e.g. when it is slowed down by
+            // a sanitizer or a busy machine) and pad the test audio with
+            // silence, which the loss measurement then counts against it.
+            if (cbData.infifo1->numUsed() >= speechRate)
+            {
+                drainTxOut();
+            }
         }
     }
 
