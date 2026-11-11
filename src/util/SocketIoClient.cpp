@@ -65,10 +65,19 @@ SocketIoClient::~SocketIoClient()
 
 void SocketIoClient::setAuthDictionary(yyjson_mut_doc* authJson)
 {
+    // Render on the caller's thread and publish on the task thread, like every
+    // other mutation here. The websocketpp open handler reads authObj_ while
+    // it runs on the task thread (see connect()), so writing it on the
+    // application thread raced with a connect or reconnect already in flight.
     auto tmp = yyjson_mut_write(authJson, 0, nullptr);
-    authObj_ = tmp;
-    free(tmp);
+    std::string auth = (tmp != nullptr) ? std::string(tmp) : std::string("{}");
+    if (tmp != nullptr)
+    {
+        free(tmp);
+    }
     yyjson_mut_doc_free(authJson);
+
+    enqueue_([this, auth]() { authObj_ = auth; });
 }
 
 void SocketIoClient::on(std::string const& eventName, SioMessageReceivedFn fn)
@@ -294,9 +303,14 @@ void SocketIoClient::handleEngineIoMessage_(char* ptr, int length)
 
 void SocketIoClient::fireEvent(std::string const& eventName, yyjson_val* params)
 {
-    if (eventFnMap_[eventName])
+    // find(), not operator[]: the latter inserts a null entry for every name
+    // that isn't registered, so a server (or anything spoofing one on this
+    // unencrypted ws:// connection) naming a fresh event in each frame grows
+    // the map without bound.
+    auto handler = eventFnMap_.find(eventName);
+    if (handler != eventFnMap_.end() && handler->second)
     {
-        (eventFnMap_[eventName])(params); // eventArgs is nullptr if not provided
+        (handler->second)(params); // eventArgs is nullptr if not provided
     }
 }
 

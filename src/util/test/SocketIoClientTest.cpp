@@ -15,6 +15,7 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <mutex>
 #include <vector>
 
 #include "../SocketIoClient.h"
@@ -38,6 +39,26 @@ public:
     static bool pingTimerRunning(SocketIoClient& client)
     {
         return client.pingTimer_.isRunning();
+    }
+
+    // authObj_ is only touched on the client's task thread, so the snapshot is
+    // queued behind the publication it is checking; the test itself only ever
+    // reads the mutex-protected copy.
+    static void snapshotAuth(SocketIoClient& client, std::mutex& mx, std::string& slot)
+    {
+        client.enqueue_([&client, &mx, &slot]() {
+            std::lock_guard<std::mutex> lk(mx);
+            slot = client.authObj_;
+        });
+    }
+
+    // Same for eventFnMap_: registered and looked up only on the task thread.
+    static void snapshotEventCount(SocketIoClient& client, std::mutex& mx, int& slot)
+    {
+        client.enqueue_([&client, &mx, &slot]() {
+            std::lock_guard<std::mutex> lk(mx);
+            slot = (int) client.eventFnMap_.size();
+        });
     }
 };
 
@@ -224,6 +245,117 @@ bool test7HugePingTimingsDontOverflow()
     return result;
 }
 
+bool test8AuthDictionaryPublication()
+{
+    std::cout << "Test 8 (auth dictionary: unusable doc, task-thread publication): ";
+
+    // The snapshot storage is declared ahead of the clients so it is still
+    // alive while their destructors drain the task queue.
+    std::mutex mx;
+    std::string seenRootless, seen;
+
+    // A document with no root: yyjson_mut_write() returns NULL for it, and
+    // assigning that straight to std::string threw std::logic_error out of the
+    // library, which terminates the process.
+    SocketIoClient rootless;
+    rootless.setAuthDictionary(yyjson_mut_doc_new(nullptr));
+
+    // The write itself is published through the client's task queue, because
+    // the websocketpp open handler reads the member on that thread.
+    SocketIoClient client;
+    auto doc = yyjson_mut_doc_new(nullptr);
+    yyjson_mut_val* root = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_str(doc, root, "callsign", "K6AQ");
+    yyjson_mut_doc_set_root(doc, root);
+    client.setAuthDictionary(doc); // takes ownership of doc
+
+    Driver::snapshotAuth(rootless, mx, seenRootless);
+    Driver::snapshotAuth(client, mx, seen);
+
+    // The lock is not held across the sleep: doing that starves the task
+    // thread that wants to take the snapshot.
+    bool ready = false;
+    for (int waited = 0; waited < 2000 && !ready; waited += 10)
+    {
+        {
+            std::lock_guard<std::mutex> lk(mx);
+            ready = !seenRootless.empty() && !seen.empty();
+        }
+        if (!ready)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+
+    bool result;
+    {
+        std::lock_guard<std::mutex> lk(mx);
+        result = (seenRootless == "{}") && (seen == "{\"callsign\":\"K6AQ\"}");
+        if (!result)
+        {
+            std::cout << "[" << seenRootless << " / " << seen << "]";
+        }
+    }
+
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    return result;
+}
+
+bool test9UnknownEventNamesDoNotGrowTheMap()
+{
+    std::cout << "Test 9 (unknown event names don't register themselves): ";
+
+    // Declared ahead of the client so the storage outlives the queue drain.
+    std::mutex mx;
+    int counted = -1;
+    std::atomic<int> fired{0};
+
+    SocketIoClient client;
+    client.on("known", [&](yyjson_val*) { fired.fetch_add(1, std::memory_order_release); });
+
+    // fireEvent() looked names up with operator[], which inserts a null entry
+    // for each one that isn't registered: 200 frames naming fresh events grew
+    // the map by 200, from data the far end chose.
+    for (int i = 0; i < 200; i++)
+    {
+        auto frame = frameOf("42[\"unknown" + std::to_string(i) + "\",[]]");
+        Driver::feedEngine(client, frame.data(), (int)frame.size());
+    }
+
+    // The registered handler still has to fire.
+    auto known = frameOf("42[\"known\",[]]");
+    Driver::feedEngine(client, known.data(), (int)known.size());
+
+    // Queued behind every dispatch above, so the count is the final one.
+    Driver::snapshotEventCount(client, mx, counted);
+
+    bool ready = false;
+    for (int waited = 0; waited < 2000 && !ready; waited += 10)
+    {
+        {
+            std::lock_guard<std::mutex> lk(mx);
+            ready = (counted >= 0);
+        }
+        if (!ready)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+
+    bool result;
+    {
+        std::lock_guard<std::mutex> lk(mx);
+        result = (counted == 1) && (fired.load(std::memory_order_acquire) == 1);
+        if (!result)
+        {
+            std::cout << "[" << counted << " entries, " << fired.load(std::memory_order_acquire) << " fired]";
+        }
+    }
+
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    return result;
+}
+
 int main()
 {
     bool result = true;
@@ -235,6 +367,8 @@ int main()
     result &= test5TruncatedJsonIsIgnored();
     result &= test6RandomFrames();
     result &= test7HugePingTimingsDontOverflow();
+    result &= test8AuthDictionaryPublication();
+    result &= test9UnknownEventNamesDoNotGrowTheMap();
 
     return result ? 0 : -1;
 }
