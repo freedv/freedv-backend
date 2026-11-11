@@ -1455,9 +1455,12 @@ bool testSendAfterSocketClosedReportsSelectError()
     testCloseSocket(TcpConnectionHandlerTest::clientSocket(conn)); // number stays "valid", fd is gone
 
     result &= CHECK(sendFuture.wait_for(EVENT_TIMEOUT) == std::future_status::ready);
-    result &= CHECK(conn.disconnectCount() == 0); // nobody asked to disconnect
+    // The receive thread is waiting on the same dead number, and may end the
+    // connection itself (Test 47) before or after the send gives up: either
+    // way the connection ends exactly once.
     conn.disconnect().wait();
     result &= CHECK(conn.waitForDisconnects(1));
+    result &= CHECK(conn.disconnectCount() == 1);
     return report(result);
 }
 
