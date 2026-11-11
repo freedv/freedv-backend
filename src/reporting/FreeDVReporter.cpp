@@ -44,8 +44,7 @@ using namespace std::chrono_literals;
 using namespace std::placeholders;
 
 FreeDVReporter::FreeDVReporter(std::string hostname, std::string callsign, std::string gridSquare, std::string software, bool rxOnly, bool writeOnly, bool useSecureConnection)
-    : isConnecting_(false)
-    , hostname_(std::move(hostname))
+    : hostname_(std::move(hostname))
     , callsign_(std::move(callsign))
     , gridSquare_(std::move(gridSquare))
     , software_(std::move(software))
@@ -317,17 +316,8 @@ void FreeDVReporter::connect_()
         }
     });
     
-    // Reconnect listener should re-report frequency so that "unknown"
-    // doesn't appear.
-    sioClient_->setOnConnectFn([&]()
-    {
-        std::unique_lock<std::mutex> lk(objMutex_);
-        isConnecting_ = false;
-    });
-    
     sioClient_->setOnDisconnectFn([&]() {
         std::unique_lock<std::mutex> lk(objMutex_);
-        isConnecting_ = false;
         isFullyConnected_.store(false, std::memory_order_relaxed);
         
         if (onReporterDisconnectFn_)
@@ -336,7 +326,6 @@ void FreeDVReporter::connect_()
         }
     });
     
-    isConnecting_ = true;
     isFullyConnected_.store(false, std::memory_order_relaxed);
     
     std::stringstream ss;
@@ -362,9 +351,12 @@ void FreeDVReporter::connect_()
     sioClient_->connect(host.c_str(), port, true, false);
 #endif // defined(ENABLE_TLS_SUPPORT)
     
-    if (onReporterConnectFn_)
     {
-        onReporterConnectFn_();
+        std::unique_lock<std::mutex> lk(objMutex_);
+        if (onReporterConnectFn_)
+        {
+            onReporterConnectFn_();
+        }
     }
     
     sioClient_->on("new_connection", std::bind(&FreeDVReporter::onFreeDVReporterNewConnection_, this, _1));

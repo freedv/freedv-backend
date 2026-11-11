@@ -18,6 +18,11 @@
 #include <mutex>
 #include <vector>
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
 #include "../SocketIoClient.h"
 #include "yyjson.h"
 
@@ -60,11 +65,103 @@ public:
             slot = (int) client.eventFnMap_.size();
         });
     }
+
+    // connection_ is only meaningful once prepareToReceive_() has run.
+    static bool hasConnection(SocketIoClient& client)
+    {
+        return client.connection_ != nullptr;
+    }
 };
 
 namespace
 {
 using Driver = SocketIoClientTest;
+
+
+// A server that writes the instant it accepts. On a loopback connection its
+// first bytes are in flight long before the worker thread gets to the onConnect_()
+// that connectImpl_() queues, which is the ordering the receive path relies on.
+class EarlyWriteServer
+{
+public:
+    explicit EarlyWriteServer(int connections)
+        : fd_(::socket(AF_INET, SOCK_STREAM, 0))
+        , port_(0)
+        , remaining_(connections)
+    {
+        int one = 1;
+        setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = 0;
+        bind(fd_, (sockaddr*)&addr, sizeof(addr));
+        socklen_t len = sizeof(addr);
+        getsockname(fd_, (sockaddr*)&addr, &len);
+        port_ = ntohs(addr.sin_port);
+        listen(fd_, 8);
+
+        thread_ = std::thread([this]() {
+            while (remaining_-- > 0)
+            {
+                int client = accept(fd_, nullptr, nullptr);
+                if (client < 0)
+                {
+                    return;
+                }
+                static const char OPEN[] = "0{\"pingInterval\":25000,\"pingTimeout\":20000}";
+                send(client, OPEN, sizeof(OPEN) - 1, 0);
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                close(client);
+            }
+        });
+    }
+
+    ~EarlyWriteServer()
+    {
+        shutdown(fd_, SHUT_RDWR);
+        close(fd_);
+        thread_.join();
+    }
+
+    int port() const { return port_; }
+
+private:
+    int fd_;
+    int port_;
+    int remaining_;
+    std::thread thread_;
+};
+
+// Records what the receive path looked like when the first frame arrived: the
+// worker thread must have created the websocketpp connection object already,
+// because receiveThread_ is started before the queued onConnect_() runs.
+class SocketIoOrderProbe : public SocketIoClient
+{
+public:
+    std::atomic<bool> preparedBeforeFirstFrame{false};
+    std::atomic<int> frames{0};
+
+protected:
+    void prepareToReceive_() override
+    {
+        SocketIoClient::prepareToReceive_();
+        prepared_.store(SocketIoClientTest::hasConnection(*this), std::memory_order_release);
+    }
+
+    void onReceive_(char* buf, int length) override
+    {
+        if (frames.fetch_add(1, std::memory_order_relaxed) == 0)
+        {
+            preparedBeforeFirstFrame.store(prepared_.load(std::memory_order_acquire),
+                                           std::memory_order_release);
+        }
+        SocketIoClient::onReceive_(buf, length);
+    }
+
+private:
+    std::atomic<bool> prepared_{false};
+};
 
 // A heap buffer holding exactly `bytes`: reads past the end are out of bounds.
 std::vector<char> frameOf(const std::string& bytes)
@@ -356,6 +453,36 @@ bool test9UnknownEventNamesDoNotGrowTheMap()
     return result;
 }
 
+bool test10ConnectionExistsBeforeTheReceiveThread()
+{
+    std::cout << "Test 10 (websocketpp connection exists before the receive thread): ";
+
+    EarlyWriteServer server(1);
+    SocketIoOrderProbe probe;
+    probe.connect("127.0.0.1", server.port(), false, false);
+
+    // The receive thread reads the frame; the websocketpp handshake then fails
+    // against this server, which is fine -- what matters is what onReceive_()
+    // found. Before prepareToReceive_() existed, connection_ was only assigned
+    // by the queued onConnect_(), which can run after this thread has already
+    // dereferenced it.
+    for (int waited = 0; waited < 3000 && probe.frames.load(std::memory_order_acquire) == 0; waited += 10)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    bool result = (probe.frames.load(std::memory_order_acquire) > 0) &&
+                  probe.preparedBeforeFirstFrame.load(std::memory_order_acquire);
+    if (!result)
+    {
+        std::cout << "[" << probe.frames.load(std::memory_order_acquire) << " frames, prepared="
+                  << probe.preparedBeforeFirstFrame.load(std::memory_order_acquire) << "]";
+    }
+
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    return result;
+}
+
 int main()
 {
     bool result = true;
@@ -369,6 +496,7 @@ int main()
     result &= test7HugePingTimingsDontOverflow();
     result &= test8AuthDictionaryPublication();
     result &= test9UnknownEventNamesDoNotGrowTheMap();
+    result &= test10ConnectionExistsBeforeTheReceiveThread();
 
     return result ? 0 : -1;
 }

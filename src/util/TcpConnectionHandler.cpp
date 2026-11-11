@@ -747,6 +747,11 @@ next_fd:
             // instance, leave SocketIoClient's websocket waiting on a read
             // that never completes, and so never freed.
             auto generation = ++connectionGeneration_;
+
+            // Whatever onReceive_() needs has to exist before receiveThread_
+            // does: the queued onConnect_() below can land after the far end's
+            // first frame is already being parsed.
+            prepareToReceive_();
             enqueue_([this, generation]() {
                 if (generation == connectionGeneration_)
                 {
