@@ -172,6 +172,31 @@ public:
     bool waitForReceived(size_t length, std::chrono::milliseconds timeout = EVENT_TIMEOUT) { return waitFor([&]() { return received_.size() >= length; }, timeout); }
     bool waitForRecvEnd() { return waitFor([&]() { return recvEndCount_ > 0; }); }
 
+    // Waits for `length` bytes for as long as they keep arriving: fails
+    // only if nothing new arrives for `stallTimeout` (the handler has
+    // stopped delivering), or after `limit` in all. For transfers whose
+    // speed depends on how loaded the machine is, which a fixed timeout
+    // can't tell apart from a stall.
+    bool waitForReceivedWhileArriving(size_t length, std::chrono::milliseconds stallTimeout, std::chrono::milliseconds limit)
+    {
+        auto deadline = std::chrono::steady_clock::now() + limit;
+        std::unique_lock<std::mutex> lk(mutex_);
+        while (received_.size() < length)
+        {
+            size_t before = received_.size();
+            bool progressed = cv_.wait_for(lk, stallTimeout, [&]() {
+                return received_.size() >= length || received_.size() > before;
+            });
+            if (!progressed || std::chrono::steady_clock::now() > deadline)
+            {
+                std::cout << "[" << received_.size() << " of " << length << " bytes received; "
+                          << (progressed ? "time limit reached" : "stalled") << "] ";
+                return false;
+            }
+        }
+        return true;
+    }
+
 protected:
     virtual void onConnect_() override
     {
@@ -532,7 +557,11 @@ bool checkBurstToSlowReceiver(TestConnection& conn, std::function<bool(const std
     conn.slowReceive = true;
     const std::string big = makePattern(1024 * 1024);
     bool result = CHECK(serverSend(big));
-    result &= CHECK(conn.waitForReceived(big.size(), 30s));
+    // About 1,000 deliveries of up to 1 KB at 1 ms each: about a second
+    // normally, but each 1 ms sleep can take tens of ms on a loaded (macOS)
+    // CI machine, more under the sanitizers. What matters is that it keeps
+    // arriving.
+    result &= CHECK(conn.waitForReceivedWhileArriving(big.size(), EVENT_TIMEOUT, 5min));
     result &= CHECK(conn.received() == big);
     result &= CHECK(conn.disconnectCount() == 0);
     return result;
@@ -591,6 +620,15 @@ struct DnsAnswer
 {
     std::chrono::milliseconds delay{0};
     std::vector<std::pair<std::string, int>> addresses; // address, port
+
+    // Count `delay` from when the other family's lookup answers instead of
+    // from when this one starts. For tests about how one answer is timed
+    // against the other: the handler starts the two lookup threads one
+    // after the other, and how long each takes to start isn't under the
+    // test's control (it can be tens of ms on a loaded macOS CI runner,
+    // more under ThreadSanitizer), so timing both from their own start
+    // doesn't reliably give the gap between the answers that's wanted.
+    bool afterOtherFamily = false;
 };
 
 // Answers the handler's DNS lookups from a script instead of the network, so
@@ -617,11 +655,40 @@ private:
     DnsAnswer ipv6_;
     DnsAnswer ipv4_;
 
+    // Which families' lookups have answered, for afterOtherFamily.
+    std::mutex answeredMutex_;
+    std::condition_variable answeredCV_;
+    bool ipv6Answered_ = false;
+    bool ipv4Answered_ = false;
+
     virtual void resolveAddresses_(int addressFamily, const char*, const char*, struct addrinfo** result) override
     {
-        const DnsAnswer& answer = addressFamily == AF_INET6 ? ipv6_ : ipv4_;
+        bool isIpv6 = addressFamily == AF_INET6;
+        const DnsAnswer& answer = isIpv6 ? ipv6_ : ipv4_;
+
+        // Build the answer first, so that the delay below runs right up to
+        // the moment it's returned rather than having getaddrinfo()'s time
+        // (more under the sanitizers) added after it.
+        buildAnswer_(addressFamily, answer, result);
+
+        if (answer.afterOtherFamily)
+        {
+            // Bounded, so a script mistake fails the test rather than
+            // hanging it.
+            std::unique_lock<std::mutex> lk(answeredMutex_);
+            answeredCV_.wait_for(lk, 10s, [&]() { return isIpv6 ? ipv4Answered_ : ipv6Answered_; });
+        }
         std::this_thread::sleep_for(answer.delay);
 
+        {
+            std::unique_lock<std::mutex> lk(answeredMutex_);
+            (isIpv6 ? ipv6Answered_ : ipv4Answered_) = true;
+        }
+        answeredCV_.notify_all();
+    }
+
+    static void buildAnswer_(int addressFamily, const DnsAnswer& answer, struct addrinfo** result)
+    {
         // Chain one getaddrinfo() result per address, so the handler can
         // release the list with freeaddrinfo() as usual.
         *result = nullptr;
@@ -667,7 +734,9 @@ bool testDualStackPrefersIpv6()
     LoopbackTcpServer server6(AF_INET6);
     if (skipWithoutIpv6(server6)) return true;
     LoopbackTcpServer server4;
-    ScriptedDnsConnection conn({0ms, {{"::1", server6.port()}}}, {0ms, {{"127.0.0.1", server4.port()}}});
+    // IPv6 answers as IPv4 does (timed from IPv4's answer: see
+    // DnsAnswer::afterOtherFamily).
+    ScriptedDnsConnection conn({0ms, {{"::1", server6.port()}}, true}, {0ms, {{"127.0.0.1", server4.port()}}});
 
     bool result = CHECK(server4.valid());
     conn.connect(SCRIPTED_HOST, 0, false);
@@ -686,7 +755,8 @@ bool testDualStackWaitsBrieflyForIpv6()
     LoopbackTcpServer server6(AF_INET6);
     if (skipWithoutIpv6(server6)) return true;
     LoopbackTcpServer server4;
-    ScriptedDnsConnection conn({5ms, {{"::1", server6.port()}}}, {0ms, {{"127.0.0.1", server4.port()}}});
+    // IPv6 answers 5 ms after IPv4 does (see DnsAnswer::afterOtherFamily).
+    ScriptedDnsConnection conn({5ms, {{"::1", server6.port()}}, true}, {0ms, {{"127.0.0.1", server4.port()}}});
 
     bool result = CHECK(server4.valid());
     conn.connect(SCRIPTED_HOST, 0, false);

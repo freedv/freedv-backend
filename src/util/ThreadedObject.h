@@ -52,14 +52,17 @@ protected:
 private:
     ThreadedObject* parent_;
     std::string name_;
-    // Control flags/counter only. The task payload travels through eventQueueMutex_
-    // (below) or GCD's dispatch_async, and the final barrier is objectThread_.join()
-    // / waitForAllTasksComplete_(), so relaxed ordering is sufficient here.
+    // Control flag only. The task payload travels through eventQueueMutex_
+    // (below) or GCD's dispatch_async, so relaxed ordering is sufficient here.
     std::atomic<bool> suppressEnqueue_;
 
 #if defined(__APPLE__)
     dispatch_queue_t queue_;
-    std::atomic<int> numQueued_; // dispatch groups don't fully seem to wait
+    // Tasks queued and not yet finished (dispatch groups don't fully seem to
+    // wait). It's what waitForAllTasksComplete_() waits on, so it's the only
+    // thing ordering a task's work before the caller's next step: each task
+    // decrements it with release, and the wait reads it with acquire.
+    std::atomic<int> numQueued_;
 #else
     std::atomic<bool> isDestroying_;
     std::atomic<bool> taskCurrentlyExecuting_;

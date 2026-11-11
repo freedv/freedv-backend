@@ -38,6 +38,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cstdint>
 #include <thread>
 #include <functional>
 #include <random>
@@ -75,6 +76,22 @@
 #endif // PSK_REPORTER_TEST
 
 #include "../util/logging/ulog.h"
+
+// The fields in a PSK Reporter datagram aren't aligned to their size (they
+// follow variable-length strings), so they're written byte-wise rather
+// than through an unsigned short / int pointer, which is undefined
+// behaviour at an unaligned address.
+static void putBigEndian16_(char* dst, uint16_t value)
+{
+    uint16_t networkOrder = htons(value);
+    memcpy(dst, &networkOrder, sizeof(networkOrder));
+}
+
+static void putBigEndian32_(char* dst, uint32_t value)
+{
+    uint32_t networkOrder = htonl(value);
+    memcpy(dst, &networkOrder, sizeof(networkOrder));
+}
 
 // RX record:
 /* For receiverCallsign, receiverLocator, decodingSoftware use */
@@ -142,7 +159,7 @@ void SenderRecord::encode(char* buf)
     *fieldPtr++ = infoSource;
     
     // Encode flow start time
-    *((unsigned int*)fieldPtr) = htonl(flowTimeSeconds);
+    putBigEndian32_(fieldPtr, flowTimeSeconds);
 }
 
 PskReporter::PskReporter(std::string callsign, std::string gridSquare, std::string software)
@@ -264,7 +281,7 @@ void PskReporter::encodeReceiverRecord_(char* buf)
 
     // Encode record size.
     char* fieldLoc = &buf[2];
-    *((unsigned short*)fieldLoc) = htons(getRxDataSize_());
+    putBigEndian16_(fieldLoc, getRxDataSize_());
 
     // Encode RX callsign.
     fieldLoc += sizeof(unsigned short);
@@ -292,7 +309,7 @@ void PskReporter::encodeSenderRecords_(char* buf)
 
     // Encode record size.
     char* fieldLoc = &buf[2];
-    *((unsigned short*)fieldLoc) = htons(getTxDataSize_());
+    putBigEndian16_(fieldLoc, getTxDataSize_());
 
     // Encode individual records.
     fieldLoc += sizeof(unsigned short);
@@ -323,19 +340,19 @@ bool PskReporter::reportCommon_()
 
     // Encode datagram size.
     char* fieldLoc = &packet[2];
-    *((unsigned short*)fieldLoc) = htons(dgSize);
+    putBigEndian16_(fieldLoc, dgSize);
 
     // Encode send time.
     fieldLoc += sizeof(unsigned short);
-    *((unsigned int*)fieldLoc) = htonl(time(0));
+    putBigEndian32_(fieldLoc, time(0));
 
     // Encode sequence number.
     fieldLoc += sizeof(unsigned int);
-    *((unsigned int*)fieldLoc) = htonl(currentSequenceNumber_++);
+    putBigEndian32_(fieldLoc, currentSequenceNumber_++);
 
     // Encode random identifier.
     fieldLoc += sizeof(unsigned int);
-    *((unsigned int*)fieldLoc) = htonl(randomIdentifier_);
+    putBigEndian32_(fieldLoc, randomIdentifier_);
 
     // Copy RX and TX format headers.
     fieldLoc += sizeof(unsigned int);
