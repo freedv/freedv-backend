@@ -70,7 +70,11 @@ void ThreadedObject::enqueue_(std::function<void()> fn, int) // NOLINT
     numQueued_.fetch_add(1, std::memory_order_relaxed);
     dispatch_async(queue_, ^() {
         fn();
-        numQueued_.fetch_sub(1, std::memory_order_relaxed);
+        // Release, paired with the acquire in waitForAllTasksComplete_(): a
+        // caller that sees the count reach 0 must also see everything the
+        // task did, and nothing it does next (such as destroying this
+        // object) may race with the task or with this decrement.
+        numQueued_.fetch_sub(1, std::memory_order_release);
     });
 }
 
@@ -81,7 +85,7 @@ void ThreadedObject::waitForAllTasksComplete_()
     // We wait forever here instead of 250ms as with the non-macOS implementation
     // since we don't have a way to just clear out the queued events in the dispatch
     // queue after the timeout.
-    while (numQueued_.load(std::memory_order_relaxed) > 0)
+    while (numQueued_.load(std::memory_order_acquire) > 0)
     {
         std::this_thread::sleep_for(10ms);
     }

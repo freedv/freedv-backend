@@ -58,7 +58,15 @@ static const float TxScaleFactor_ = 2.0;
 
 int MinimalTxRxThread::getTxNNomModemSamples() const
 {
-    return std::max(rade_n_tx_out(rade_), txStep_->eooLengthInSamples());
+    // txStep_ exists only on a TX thread, and only once that thread's worker
+    // has built the pipeline, so the UI thread can ask before it's there (or
+    // of an RX thread). The step's figure depends only on rade_, so work it
+    // out the same way then: the bare EOO length would be 200 ms short (the
+    // silence after the EOO), and a FIFO sized from it too small.
+    auto txStep = txStep_.load(std::memory_order_acquire);
+    return std::max(rade_n_tx_out(rade_),
+                    txStep != nullptr ? txStep->eooLengthInSamples()
+                                      : RADETransmitStep::EooLengthInSamples(rade_));
 }
 
 int MinimalTxRxThread::getRxNumSpeechSamples() const
@@ -82,13 +90,16 @@ void MinimalTxRxThread::initializePipeline_()
     
     if (m_tx)
     {
-        txStep_ = new RADETransmitStep(rade_, encState_);
-        txStep_->setNarrowbandInput(inputSampleRate_ <= 8000);
-        auto agcStep = new AgcStep(txStep_->getInputSampleRate());
+        auto txStep = new RADETransmitStep(rade_, encState_);
+        txStep->setNarrowbandInput(inputSampleRate_ <= 8000);
+        auto agcStep = new AgcStep(txStep->getInputSampleRate());
         auto rnnoiseStep = new RNNoiseStep();
         pipeline_->appendPipelineStep(rnnoiseStep);
         pipeline_->appendPipelineStep(agcStep);
-        pipeline_->appendPipelineStep(txStep_);
+        pipeline_->appendPipelineStep(txStep);
+        // Published once, before the pipeline that uses it can run: the UI
+        // thread reads it through getTxNNomModemSamples().
+        txStep_.store(txStep, std::memory_order_release);
         
         auto levelAdjustStep = new LevelAdjustStep(outputSampleRate_, +[]() FREEDV_NONBLOCKING { return TxScaleFactor_; });
         pipeline_->appendPipelineStep(levelAdjustStep);
@@ -309,12 +320,14 @@ void MinimalTxRxThread::txProcessing_(IRealtimeHelper* helper) noexcept
                 if (!hasEooBeenSent_)
                 {
                     // Special case for handling RADE EOT
-                    txStep_->restartVocoder();
+                    txStep_.load(std::memory_order_acquire)->restartVocoder();
                     hasEooBeenSent_ = true;
                 }
 
                 auto outputSamples = pipeline_->execute(inputPtr, 0, &nout);
-                if (nout > 0 && outputSamples != nullptr)
+                // AudioPipeline steps return their pre-allocated (ctor-asserted)
+                // member buffers, never nullptr.
+                if (nout > 0)
                 {
                     if (cbData_->outfifo1->write(outputSamples, nout) != 0)
                     {
@@ -335,10 +348,8 @@ void MinimalTxRxThread::txProcessing_(IRealtimeHelper* helper) noexcept
             
             auto outputSamples = pipeline_->execute(inputPtr, nsam_in_48, &nout);
             
-            if (outputSamples != nullptr)
-            {
-                cbData_->outfifo1->write(outputSamples, nout);
-            }
+            // Pipeline output buffers are never nullptr (see above).
+            cbData_->outfifo1->write(outputSamples, nout);
             
 #if defined(ENABLE_PROCESSING_STATS)
             endTimer_();
@@ -396,7 +407,7 @@ void MinimalTxRxThread::rxProcessing_(IRealtimeHelper* helper) noexcept
         // send latest squelch level to FreeDV API, as it handles squelch internally
         auto outputSamples = pipeline_->execute(inputSamples_.get(), nsam, &nout);
         
-        if (nout > 0 && outputSamples != nullptr)
+        if (nout > 0)
         {
             outFifo->write(outputSamples, nout);
         }

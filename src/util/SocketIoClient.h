@@ -55,6 +55,9 @@ protected:
     virtual void onReceive_(char* buf, int length) override;
         
 private:
+    // Grants the unit tests access to the engine.io/socket.io frame parsers,
+    // which are otherwise only reachable through a live websocket.
+    friend class SocketIoClientTest;
     using WebSocketClient = websocketpp::client<websocketpp::config::custom_config>;
     using message_ptr = WebSocketClient::message_ptr;
     

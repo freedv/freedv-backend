@@ -643,6 +643,79 @@ bool loudnessUsesLooserSilenceFloorWithNoiseReductionOff()
     return true;
 }
 
+// ---- Buffer bounds ----
+
+// execute() with no input is a no-op, and silence in is silence out.
+bool silenceInSilenceOut()
+{
+    constexpr int sampleRate = 48000;
+    AgcStep step(sampleRate);
+
+    std::vector<short> oneSample(1, 0);
+    int zeroInputOutput = -1;
+    step.execute(oneSample.data(), 0, &zeroInputOutput);
+    if (zeroInputOutput != 0)
+    {
+        std::cerr << "[execute() with 0 input samples returned " << zeroInputOutput << " output samples]...";
+        return false;
+    }
+
+    auto output = runThroughStep(step, std::vector<short>(sampleRate, 0), sampleRate / 10);
+    if ((int)output.size() != sampleRate)
+    {
+        std::cerr << "[got " << output.size() << " samples back from " << sampleRate << "]...";
+        return false;
+    }
+    for (size_t i = 0; i < output.size(); i++)
+    {
+        if (output[i] != 0)
+        {
+            std::cerr << "[silence in, nonzero sample " << output[i] << " out at " << i << "]...";
+            return false;
+        }
+    }
+    return true;
+}
+
+// execute() pre-allocates one second of output; handing it more than that in
+// a single call wrote past the end of that buffer (ASan heap-buffer-overflow).
+// It must stop at the buffer's capacity and drop the rest of the block.
+bool singleCallStaysWithinOutputBuffer()
+{
+    constexpr int sampleRate = 16000;
+    AgcStep step(sampleRate);
+
+    auto input = generateSineWave(amplitudeForPeakDbfs(-10.0), 1000.0, 3.0, sampleRate);
+
+    int numOutputSamples = 0;
+    short* result = step.execute(input.data(), (int)input.size(), &numOutputSamples);
+    if (numOutputSamples <= 0 || numOutputSamples > sampleRate)
+    {
+        std::cerr << "[" << numOutputSamples << " samples returned from a "
+                  << sampleRate << " sample buffer]...";
+        return false;
+    }
+
+    // Reading back what it reports is the actual ASan check.
+    int nonzero = 0;
+    for (int i = 0; i < numOutputSamples; i++) nonzero += result[i] != 0;
+    if (nonzero == 0)
+    {
+        std::cerr << "[returned samples are all silent]...";
+        return false;
+    }
+
+    // A negative count must not be reported back as output.
+    int negativeOutput = -1;
+    step.execute(input.data(), -5, &negativeOutput);
+    if (negativeOutput != 0)
+    {
+        std::cerr << "[execute() with -5 input samples returned " << negativeOutput << " output samples]...";
+        return false;
+    }
+    return true;
+}
+
 int main()
 {
     TEST_CASE(levelerConvergesOnTarget);
@@ -662,5 +735,7 @@ int main()
     TEST_CASE(limiterCatchesSuddenOnsets);
     TEST_CASE(limiterStaysActiveWithLevelerDisabled);
     TEST_CASE(loudnessUsesLooserSilenceFloorWithNoiseReductionOff);
+    TEST_CASE(silenceInSilenceOut);
+    TEST_CASE(singleCallStaysWithinOutputBuffer);
     return 0;
 }

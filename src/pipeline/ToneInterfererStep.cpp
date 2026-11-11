@@ -74,9 +74,12 @@ int ToneInterfererStep::getOutputSampleRate() const FREEDV_NONBLOCKING
 
 short* ToneInterfererStep::execute(short* inputSamples, int numInputSamples, int* numOutputSamples) FREEDV_NONBLOCKING
 {
-    *numOutputSamples = numInputSamples;
-    
-    memcpy(outputSamples_.get(), inputSamples, numInputSamples * sizeof(short));
+    // outputSamples_ holds one second of audio: a longer block is truncated
+    // rather than memcpy'd past the end (and a negative count isn't returned).
+    int numSamples = std::max(0, std::min(numInputSamples, sampleRate_));
+    *numOutputSamples = numSamples;
+
+    memcpy(outputSamples_.get(), inputSamples, numSamples * sizeof(short));
     
     auto toneFrequency = toneFrequencyFn_();
     auto toneAmplitude = toneAmplitudeFn_();
@@ -84,10 +87,14 @@ short* ToneInterfererStep::execute(short* inputSamples, int numInputSamples, int
 
     float phase = tonePhase->load(std::memory_order_relaxed);
     float w = 2.0 * M_PI * toneFrequency / sampleRate_;
-    for(int i = 0; i < numInputSamples; i++) {
+    for(int i = 0; i < numSamples; i++) {
         float s = (float)toneAmplitude * cosf(phase);
+        // A NaN amplitude/phase (or an out-of-range one) must not be cast to
+        // int -- that's undefined behaviour (UBSan float-cast-overflow). A NaN
+        // contributes no tone; an over-range one clips like the sum below.
+        int tone = (s != s) ? 0 : (int)std::clamp(s, -32768.0f, 32767.0f);
         // Clip rather than let the short wrap around to the opposite sign.
-        int sum = outputSamples_.get()[i] + (int)s;
+        int sum = outputSamples_.get()[i] + tone;
         outputSamples_.get()[i] = (short)std::clamp(sum, -32768, 32767);
         phase += w;
     }

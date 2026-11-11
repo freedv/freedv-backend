@@ -34,6 +34,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdint>
 #include <cstring>
 #include "MuteStep.h"
 
@@ -67,8 +68,18 @@ MuteStep::MuteStep(int inputSampleRate, int outputSampleRate)
 // Returns: Array of int16 values corresponding to result audio.
 short* MuteStep::execute(short*, int numInputSamples, int* numOutputSamples) FREEDV_NONBLOCKING
 {
-    *numOutputSamples = (numInputSamples * outputSampleRate_) / inputSampleRate_;
-    
+    // Scale in 64-bit: numInputSamples * outputSampleRate_ overflows a 32-bit
+    // int for blocks of more than a few tens of milliseconds at the usual rates
+    // (UBSan signed-integer-overflow), and an unset input rate must not be a
+    // division by zero. outputSamples_ holds one second of audio, so that's the
+    // most this step can hand back in one call.
+    int64_t scaled = 0;
+    if (inputSampleRate_ > 0 && numInputSamples > 0)
+    {
+        scaled = ((int64_t)numInputSamples * outputSampleRate_) / inputSampleRate_;
+    }
+    *numOutputSamples = (int)std::min<int64_t>(scaled, outputSampleRate_);
+
     if (*numOutputSamples > 0)
     {
         return outputSamples_.get();

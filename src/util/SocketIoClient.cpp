@@ -20,6 +20,7 @@
 //
 //=========================================================================
 
+#include <climits>
 #include <iostream>
 #include <memory>
 #include <sstream>
@@ -64,10 +65,19 @@ SocketIoClient::~SocketIoClient()
 
 void SocketIoClient::setAuthDictionary(yyjson_mut_doc* authJson)
 {
+    // Render on the caller's thread and publish on the task thread, like every
+    // other mutation here. The websocketpp open handler reads authObj_ while
+    // it runs on the task thread (see connect()), so writing it on the
+    // application thread raced with a connect or reconnect already in flight.
     auto tmp = yyjson_mut_write(authJson, 0, nullptr);
-    authObj_ = tmp;
-    free(tmp);
+    std::string auth = (tmp != nullptr) ? std::string(tmp) : std::string("{}");
+    if (tmp != nullptr)
+    {
+        free(tmp);
+    }
     yyjson_mut_doc_free(authJson);
+
+    enqueue_([this, auth]() { authObj_ = auth; });
 }
 
 void SocketIoClient::on(std::string const& eventName, SioMessageReceivedFn fn)
@@ -167,6 +177,11 @@ void SocketIoClient::onConnect_()
     std::stringstream ss;
     ss << "ws://" << host_ << ":" << port_ << "/socket.io/?EIO=4&transport=websocket";
     connection_ = client_.get_connection(ss.str(), ec);
+    if (!connection_)
+    {
+        log_warn("could not create the websocket connection to %s port %d: %s", host_.c_str(), port_, ec.message().c_str());
+        return;
+    }
     client_.connect(connection_);
 }
 
@@ -187,7 +202,13 @@ void SocketIoClient::onDisconnect_()
 
 void SocketIoClient::onReceive_(char* buf, int length)
 {
-    connection_->read_some(buf, length);
+    // Runs on the worker thread, queued behind the onConnect_() that created
+    // connection_ (connectImpl_() queues that before it starts the receive
+    // thread), so it's only null here if get_connection() failed.
+    if (connection_)
+    {
+        connection_->read_some(buf, length);
+    }
 }
 
 void SocketIoClient::handleWebsocketRequest_(WebSocketClient*, websocketpp::connection_hdl const&, message_ptr const& msg)
@@ -201,6 +222,14 @@ void SocketIoClient::handleWebsocketRequest_(WebSocketClient*, websocketpp::conn
 
 void SocketIoClient::handleEngineIoMessage_(char* ptr, int length)
 {
+    // The frame comes straight off the wire: it is not NUL terminated at
+    // `length`, so nothing here may read past it (strlen() did, and ran off the
+    // end of the caller's buffer -- ASan heap-buffer-overflow).
+    if (ptr == nullptr || length <= 0)
+    {
+        return;
+    }
+
     switch(ptr[0])
     {
         case '0':
@@ -209,15 +238,31 @@ void SocketIoClient::handleEngineIoMessage_(char* ptr, int length)
 
             // "open" -- ready to receive socket.io messages
             // Grab ping timings and start ping timer
-            yyjson_doc* sessionInfo = yyjson_read(ptr + 1, strlen(ptr + 1), 0);
+            yyjson_doc* sessionInfo = yyjson_read(ptr + 1, (size_t)(length - 1), 0);
+            if (sessionInfo == nullptr)
+            {
+                // Not JSON we can use: treat it the way the transport treats
+                // anything invalid.
+                log_warn("invalid session info from engine.io -- reconnecting");
+                disconnect();
+                break;
+            }
 
             yyjson_val* rootVal = yyjson_doc_get_root(sessionInfo);
             auto pingInterval = yyjson_obj_get(rootVal, "pingInterval");
             auto pingTimeout = yyjson_obj_get(rootVal, "pingTimeout");
 
+            // Missing/zero/negative timings would make the watchdog fire
+            // immediately, so keep the built-in interval in that case. Each
+            // value is clamped before the sum (done in 64 bits), so two huge
+            // ones from the server can't overflow it.
+            auto clampMs = [](yyjson_val* val) -> int64_t {
+                int64_t ms = yyjson_is_int(val) ? yyjson_get_sint(val) : 0;
+                return ms < 0 ? 0 : (ms > INT_MAX ? INT_MAX : ms);
+            };
+            int64_t pingMs = clampMs(pingInterval) + clampMs(pingTimeout);
             pingTimer_.setTimeout(
-                yyjson_get_int(pingInterval) +
-                yyjson_get_int(pingTimeout));
+                pingMs > 0 && pingMs <= INT_MAX ? (int)pingMs : DEFAULT_PING_TIMER_INTERVAL_MS);
             pingTimer_.start();
 
             yyjson_doc_free(sessionInfo);
@@ -236,7 +281,12 @@ void SocketIoClient::handleEngineIoMessage_(char* ptr, int length)
             //log_info("engine.io ping");
 
             // "ping" -- send pong
-            connection_->send("3");
+            // Guarded like onDisconnect_'s: a frame can reach this parser
+            // before connection_ exists (UBSan: member call on a null pointer).
+            if (connection_)
+            {
+                connection_->send("3");
+            }
             pingTimer_.restart();
             break;
         }
@@ -249,7 +299,9 @@ void SocketIoClient::handleEngineIoMessage_(char* ptr, int length)
         default:
             // ignore all others as they're related to transport upgrades, but if we got
             // something invalid, we should treat it as a disconnection.
-            if (!isdigit(ptr[0]))
+            // Cast first: isdigit() is undefined for a negative char, and wire
+            // data is full of them (0x80 and above).
+            if (!isdigit((unsigned char)ptr[0]))
             {
                 log_warn("invalid data received from engine.io -- reconnecting");
 
@@ -262,14 +314,26 @@ void SocketIoClient::handleEngineIoMessage_(char* ptr, int length)
 
 void SocketIoClient::fireEvent(std::string const& eventName, yyjson_val* params)
 {
-    if (eventFnMap_[eventName])
+    // find(), not operator[]: the latter inserts a null entry for every name
+    // that isn't registered, so a server (or anything spoofing one on this
+    // unencrypted ws:// connection) naming a fresh event in each frame grows
+    // the map without bound.
+    auto handler = eventFnMap_.find(eventName);
+    if (handler != eventFnMap_.end() && handler->second)
     {
-        (eventFnMap_[eventName])(params); // eventArgs is nullptr if not provided
+        (handler->second)(params); // eventArgs is nullptr if not provided
     }
 }
 
-void SocketIoClient::handleSocketIoMessage_(char* ptr, int)
+void SocketIoClient::handleSocketIoMessage_(char* ptr, int length)
 {
+    // As in handleEngineIoMessage_: the payload is only valid up to `length`,
+    // so parse with that rather than strlen().
+    if (ptr == nullptr || length <= 0)
+    {
+        return;
+    }
+
     switch(ptr[0])
     {
         case '0':
@@ -288,7 +352,8 @@ void SocketIoClient::handleSocketIoMessage_(char* ptr, int)
         {
             // event received from server (owned by the task, so that it's
             // freed even if the task never runs)
-            std::shared_ptr<yyjson_doc> eventDoc(yyjson_read(ptr + 1, strlen(ptr + 1), 0), yyjson_doc_free);
+            std::shared_ptr<yyjson_doc> eventDoc(
+                yyjson_read(ptr + 1, (size_t)(length - 1), 0), yyjson_doc_free);
             if (eventDoc != nullptr)
             {
                 enqueue_([this, eventDoc]() {

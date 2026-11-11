@@ -115,6 +115,12 @@ public:
     void stop()
     {
         m_run.store(false, std::memory_order_release);
+        // A worker parked between readySem_ and its processing loop -- one
+        // that was started but never told to begin, because setup failed
+        // after waitForReady() -- would otherwise never see m_run go false,
+        // and the join below would wait forever. Woken, it clears the FIFOs
+        // and the loop test ends it.
+        startSem_.signal();
         if (thread_.joinable())
         {
             thread_.join();
@@ -150,7 +156,10 @@ private:
     bool deferReset_;
     rade_text_t radeText_;
     std::thread thread_;
-    RADETransmitStep* txStep_;
+    // Set by the worker thread when it builds the TX pipeline and read by the
+    // application thread through getTxNNomModemSamples(), so it's atomic:
+    // null until then, and always null on an RX thread.
+    std::atomic<RADETransmitStep*> txStep_;
     std::atomic<signed char> snr_;
     std::atomic<int> sync_;
 

@@ -74,6 +74,72 @@ jobs:
         cd build
         ctest -V
 
+  # Runs the tests under the sanitizers freedv-gui's CI uses, so races,
+  # memory errors and undefined behaviour in the backend show up here
+  # rather than as failures in freedv-gui. macOS is included because parts
+  # of the backend (e.g. ThreadedObject, Semaphore) have their own macOS
+  # implementations.
+  sanitizers:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+        sanitizer: [address-undefined, thread]
+
+    name: sanitizers (${{ matrix.os }}, ${{ matrix.sanitizer }})
+    runs-on: ${{ matrix.os }}
+    env:
+      SANITIZER_FLAGS: ${{ matrix.sanitizer == 'thread' && '-fsanitize=thread' || '-fsanitize=address,undefined -fno-sanitize-recover=undefined' }}
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Install required packages (macOS)
+      if: ${{ matrix.os == 'macos-15' }}
+      run: |
+        brew install automake libtool
+
+    - name: Install required packages (Linux)
+      if: ${{ matrix.os != 'macos-15' }}
+      run: |
+        sudo apt-get update
+        sudo apt-get install clang python3 python3-dev python3-venv
+        # ThreadSanitizer can't map its shadow memory with the larger mmap
+        # randomization recent Ubuntu kernels use.
+        sudo sysctl vm.mmap_rnd_bits=28
+
+    - name: Configure Python
+      run: |
+        python3 -m venv rade-venv
+        . ./rade-venv/bin/activate
+        pip install torch matplotlib
+
+    - name: Configure build
+      run: |
+        mkdir build
+        cd build
+        cmake -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+          -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+          -DCMAKE_C_FLAGS="$SANITIZER_FLAGS -fno-omit-frame-pointer" \
+          -DCMAKE_CXX_FLAGS="$SANITIZER_FLAGS -fno-omit-frame-pointer" \
+          -DCMAKE_OBJCXX_FLAGS="$SANITIZER_FLAGS -fno-omit-frame-pointer" \
+          -DCMAKE_EXE_LINKER_FLAGS="$SANITIZER_FLAGS" \
+          -DCMAKE_SHARED_LINKER_FLAGS="$SANITIZER_FLAGS" \
+          -DRADAE_PYTHON_EXECUTABLE=${{ github.workspace }}/rade-venv/bin/python3 -DBUILD_BACKEND_UNITTESTS=1 ..
+
+    - name: Build backend and tests
+      run: |
+        cd build
+        cmake --build . -j4
+
+    - name: Run tests
+      env:
+        ASAN_OPTIONS: halt_on_error=1:detect_stack_use_after_return=1
+        UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
+      run: |
+        cd build
+        ctest --output-on-failure --timeout 1800
+
   # Builds with clang source-based coverage, runs the tests and posts a
   # coverage summary on the run's summary page (HTML report as an artifact).
   coverage:
@@ -186,6 +252,106 @@ jobs:
           if (-not $proc.WaitForExit(600000)) {
             $proc.Kill()
             $failed += "$($test.Name) (timed out)"
+          } elseif ($proc.ExitCode -ne 0) {
+            $failed += "$($test.Name) (exit code $($proc.ExitCode))"
+          }
+        }
+        if ($failed.Count -gt 0) {
+          Write-Host "`nFailed tests:"
+          $failed | ForEach-Object { Write-Host "  $_" }
+          exit 1
+        }
+        Write-Host "`nAll tests passed."
+
+  # The same Windows tests built with ASan+UBSan, for the Windows-only code
+  # (Winsock, the Win32 Semaphore, COM) the Linux and macOS sanitizer jobs
+  # never compile, and for Windows' 32-bit long. ThreadSanitizer and
+  # LeakSanitizer aren't available for Windows. x86_64 only: llvm-mingw has
+  # no ASan for aarch64.
+  # LibreSSL, which only the Windows build compiles from source, is built
+  # without UBSan (see cmake/BuildLibreSSL.cmake).
+  build-windows-sanitizers:
+    runs-on: ubuntu-24.04
+    env:
+      SANITIZER_FLAGS: -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Install MinGW LLVM
+      run: |
+        wget https://github.com/mstorsjo/llvm-mingw/releases/download/20260908/${LLVM_MINGW}.tar.xz
+        tar xf ${LLVM_MINGW}.tar.xz
+
+    - name: Configure build
+      run: |
+        mkdir build
+        cd build
+        export PATH=${{ github.workspace }}/${LLVM_MINGW}/bin:$PATH
+        cmake -DCMAKE_TOOLCHAIN_FILE=${{ github.workspace }}/cross-compile/freedv-mingw-llvm-x86_64.cmake \
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+          -DCMAKE_C_FLAGS="$SANITIZER_FLAGS" -DCMAKE_CXX_FLAGS="$SANITIZER_FLAGS" \
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined" \
+          -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address,undefined" \
+          -DBUILD_BACKEND_UNITTESTS=1 ..
+
+    - name: Build backend and tests
+      run: |
+        cd build
+        export PATH=${{ github.workspace }}/${LLVM_MINGW}/bin:$PATH
+        cmake --build . -j4
+
+    - name: Collect tests and the DLLs they need
+      run: |
+        mkdir windows-tests
+        find build/src -name '*.exe' -exec cp {} windows-tests/ \;
+        find build -name '*.dll' -not -path '*/CMakeFiles/*' -exec cp {} windows-tests/ \;
+        # ASan's runtime is a DLL on Windows; UBSan's is linked in.
+        for dll in libc++.dll libunwind.dll libwinpthread-1.dll libclang_rt.asan_dynamic-x86_64.dll; do
+          cp ${LLVM_MINGW}/x86_64-w64-mingw32/bin/$dll windows-tests/
+        done
+        # Real speech for RNNoiseStepTest (see src/pipeline/test/SpeechSample.h).
+        cp build/rade_src/wav/all.wav windows-tests/
+        ls -l windows-tests
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: windows-tests-sanitizers
+        path: windows-tests
+
+  test-windows-sanitizers:
+    needs: build-windows-sanitizers
+    runs-on: windows-latest
+    env:
+      UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+    steps:
+    - uses: actions/download-artifact@v4
+      with:
+        name: windows-tests-sanitizers
+        path: windows-tests
+
+    - name: Run tests
+      shell: pwsh
+      run: |
+        # A sanitizer report fails a test even if it then exits 0 (UBSan
+        # can, for checks that don't stop the program), so the output is
+        # captured and searched as well as shown.
+        $sanitizerPattern = 'ERROR: AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:'
+        $failed = @()
+        foreach ($test in Get-ChildItem windows-tests -Filter *.exe | Sort-Object Name) {
+          Write-Host "=== $($test.Name)"
+          $out = Join-Path $env:RUNNER_TEMP "$($test.BaseName).out.txt"
+          $err = Join-Path $env:RUNNER_TEMP "$($test.BaseName).err.txt"
+          $proc = Start-Process -FilePath $test.FullName -WorkingDirectory windows-tests -NoNewWindow -PassThru `
+            -RedirectStandardOutput $out -RedirectStandardError $err
+          $null = $proc.Handle # needed for ExitCode to be available afterwards
+          $timedOut = -not $proc.WaitForExit(1200000)
+          if ($timedOut) { $proc.Kill() }
+          Get-Content $out, $err | Write-Host
+          $report = Select-String -Path $out, $err -Pattern $sanitizerPattern -Quiet
+          if ($timedOut) {
+            $failed += "$($test.Name) (timed out)"
+          } elseif ($report) {
+            $failed += "$($test.Name) (sanitizer report, exit code $($proc.ExitCode))"
           } elseif ($proc.ExitCode -ne 0) {
             $failed += "$($test.Name) (exit code $($proc.ExitCode))"
           }

@@ -47,3 +47,28 @@ endif()
 
 #target_include_directories(LibreSSL BEFORE PRIVATE ${LibreSSL_BINARY_DIR})
 include_directories(${libressl_SOURCE_DIR}/include)
+
+# In sanitizer builds, keep UndefinedBehaviorSanitizer out of LibreSSL. It
+# deliberately relies on behaviour that's undefined by the letter of the
+# standard but fine on the platforms it supports (e.g. unaligned word loads
+# in crypto/modes/cbc128.c, free functions called through a generic
+# void (*)(void*) in crypto/stack/stack.c), which UBSan reports on every TLS
+# connection. AddressSanitizer stays on, as a memory error in LibreSSL would
+# still be a real one. Only the Windows build compiles LibreSSL from source
+# by default, so this is mostly for the Windows sanitizer CI job.
+if(CMAKE_C_FLAGS MATCHES "-fsanitize=" AND CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+    function(freedv_libressl_no_ubsan dir)
+        get_property(_targets DIRECTORY ${dir} PROPERTY BUILDSYSTEM_TARGETS)
+        foreach(_target IN LISTS _targets)
+            get_target_property(_type ${_target} TYPE)
+            if(_type MATCHES "^(STATIC_LIBRARY|SHARED_LIBRARY|MODULE_LIBRARY|OBJECT_LIBRARY|EXECUTABLE)$")
+                target_compile_options(${_target} PRIVATE -fno-sanitize=undefined)
+            endif()
+        endforeach()
+        get_property(_subdirs DIRECTORY ${dir} PROPERTY SUBDIRECTORIES)
+        foreach(_subdir IN LISTS _subdirs)
+            freedv_libressl_no_ubsan(${_subdir})
+        endforeach()
+    endfunction()
+    freedv_libressl_no_ubsan(${libressl_SOURCE_DIR})
+endif()

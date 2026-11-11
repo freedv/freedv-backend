@@ -251,9 +251,12 @@ short* AgcStep::execute(short* inputSamples, int numInputSamples, int* numOutput
 
     short* inPtr = inputSamples;
     short* outPtr = outputSamples_.get();
-    *numOutputSamples = numInputSamples;
 
-    int remaining = numInputSamples;
+    // outputSamples_ holds one second of audio, so a call carrying more than
+    // that must not write past the end: the rest of the block is dropped,
+    // as in ResampleStep. A negative count is treated as no input.
+    int remaining = std::clamp(numInputSamples, 0, sampleRate_);
+    *numOutputSamples = remaining;
     while (remaining > 0)
     {
         int chunkSize = std::min(remaining, sampleRate_ / TEN_MS_DIVIDER);

@@ -46,6 +46,8 @@
 class TapStep : public IPipelineStep
 {
 public:
+    // Takes ownership of tapStep: it's deleted when the TapStep is, so it
+    // must be heap allocated.
     TapStep(int inputSampleRate, IPipelineStep* tapStep);
     virtual ~TapStep();
     

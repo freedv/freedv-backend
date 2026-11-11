@@ -1,3 +1,5 @@
+#include <limits>
+#include <vector>
 #include "LevelAdjustStep.h"
 #include "PipelineTestCommon.h"
 
@@ -66,10 +68,95 @@ bool levelAdjustClipsInsteadOfWrapping()
     return true;
 }
 
+// outputSamples_ holds one second of audio. A longer block used to be written
+// straight through it (ASan heap-buffer-overflow, found by fuzzing execute()
+// with random block lengths); the step must truncate at one second.
+bool levelAdjustTruncatesBlocksLongerThanASecond()
+{
+    LevelAdjustCommonVal = 1.0;
+    LevelAdjustStep levelAdjustStep(8000, +[]() FREEDV_NONBLOCKING { return LevelAdjustCommonVal; });
+
+    std::vector<short> input(3 * 8000, 1000);
+    int outputSamples = 0;
+    auto result = levelAdjustStep.execute(input.data(), (int)input.size(), &outputSamples);
+    if (outputSamples != 8000)
+    {
+        std::cerr << "[outputSamples[" << outputSamples << "] != 8000]...";
+        return false;
+    }
+    // Reading back the whole reported block is what trips ASan when the step
+    // has run past the end of its buffer.
+    for (int i = 0; i < outputSamples; i++)
+    {
+        if (result[i] != 1000)
+        {
+            std::cerr << "[" << result[i] << " != 1000 at sample " << i << "]...";
+            return false;
+        }
+    }
+    return true;
+}
+
+// A negative sample count must not be turned into a huge unsigned one, and a
+// null buffer must not be dereferenced.
+bool levelAdjustRejectsNegativeSampleCount()
+{
+    LevelAdjustCommonVal = 1.0;
+    LevelAdjustStep levelAdjustStep(8000, +[]() FREEDV_NONBLOCKING { return LevelAdjustCommonVal; });
+
+    short input[] = {1000, 2000};
+    int outputSamples = 12345;
+    levelAdjustStep.execute(input, -1, &outputSamples);
+    if (outputSamples != 0)
+    {
+        std::cerr << "[outputSamples[" << outputSamples << "] != 0 for a negative input count]...";
+        return false;
+    }
+    return true;
+}
+
+// A NaN gain (a caller computing it from loudness can produce one) used to reach
+// a float->short cast, which is undefined behaviour that UBSan flags; it must
+// become silence instead. An infinite gain must clip, not cast.
+bool levelAdjustNonFiniteGainIsSafe()
+{
+    struct Case { float gain; short positive; short negative; };
+    const Case cases[] = {
+        {std::numeric_limits<float>::quiet_NaN(), 0, 0},
+        {std::numeric_limits<float>::infinity(), 32767, -32768},
+        {-std::numeric_limits<float>::infinity(), -32768, 32767},
+    };
+
+    for (auto& c : cases)
+    {
+        LevelAdjustStep levelAdjustStep(8000, +[]() FREEDV_NONBLOCKING { return LevelAdjustCommonVal; });
+        LevelAdjustCommonVal = c.gain;
+
+        short input[] = {10000, -10000};
+        int outputSamples = 0;
+        auto result = levelAdjustStep.execute(input, 2, &outputSamples);
+        if (outputSamples != 2)
+        {
+            std::cerr << "[outputSamples[" << outputSamples << "] != 2]...";
+            return false;
+        }
+        if (result[0] != c.positive || result[1] != c.negative)
+        {
+            std::cerr << "[" << input[0] << " x " << c.gain << " -> " << result[0]
+                      << ", expected " << c.positive << "]...";
+            return false;
+        }
+    }
+    return true;
+}
+
 int main()
 {
     TEST_CASE(levelAdjustUp);
     TEST_CASE(levelAdjustDown);
     TEST_CASE(levelAdjustClipsInsteadOfWrapping);
+    TEST_CASE(levelAdjustTruncatesBlocksLongerThanASecond);
+    TEST_CASE(levelAdjustRejectsNegativeSampleCount);
+    TEST_CASE(levelAdjustNonFiniteGainIsSafe);
     return 0;
 }
