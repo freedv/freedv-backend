@@ -752,14 +752,14 @@ next_fd:
         reconnectTimer_.start();
     }
     
-    // Free address info objects
-    ipv6ResolveThread.detach();
-    ipv4ResolveThread.detach();
-    while (!ipv4Complete_.load(std::memory_order_relaxed) || !ipv6Complete_.load(std::memory_order_relaxed))
-    {
-        std::this_thread::sleep_for(1ms);
-    }
-    
+    // Wait for both lookups to finish before freeing their results. Joining
+    // (rather than detaching and polling ipv*Complete_, which are relaxed)
+    // also orders everything the lookup threads did with this object, such
+    // as the virtual resolveAddresses_() call, before anything after this
+    // connect attempt, including the object's destruction.
+    ipv6ResolveThread.join();
+    ipv4ResolveThread.join();
+
     if (ipv4ResultFuture.valid())
     {
         heads[1] = ipv4ResultFuture.get();

@@ -31,6 +31,10 @@
 #include <atomic>
 #include <new>
 
+#if defined(_MSC_VER)
+#include <intrin.h> // _mm_pause() / __yield() in GenericFIFO::pauseCpu_()
+#endif // defined(_MSC_VER)
+
 #ifdef __cpp_lib_hardware_interference_size
     using std::hardware_constructive_interference_size;
     using std::hardware_destructive_interference_size;
@@ -56,6 +60,11 @@ public:
     int numFree() const noexcept;
     int capacity() const noexcept;
 
+    // Empties the FIFO. Can be called from any thread, including while the
+    // producer and consumer are using it: a write() or read() already in
+    // progress finishes first (reset() waits for it, which takes at most one
+    // copy), and one that starts while the reset is in progress fails
+    // (returns -1) rather than waiting. write() and read() never block.
     void reset() noexcept;
 
 private:
@@ -107,17 +116,29 @@ private:
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Winterference-size"
 #endif // !defined(__clang__)
+    // Each side's active flag shares a cache line with the cursor that side
+    // already writes, so setting it costs no extra cache-line traffic.
     alignas(hardware_destructive_interference_size) std::atomic<Pos> pin_;
     Pos poutCache_;
+    std::atomic<bool> writerActive_; // set for the duration of write()
     alignas(hardware_destructive_interference_size) std::atomic<Pos> pout_;
     Pos pinCache_;
+    std::atomic<bool> readerActive_; // set for the duration of read()
 
     int nelem;
     bool ownBuffer_;
 
-    // Serializes concurrent reset() calls so two threads calling reset()
-    // simultaneously can't interleave their independent stores.
+    // Set by reset() for as long as it's resetting; also serializes
+    // concurrent reset() calls so they can't interleave their stores.
     // Kept on its own cache line to avoid false-sharing with pin_/pout_.
+    //
+    // A read()/write() and a reset() must never overlap: a copy in progress
+    // when the ring is rewound would race with the copies after it into
+    // the same slots. Each side announces itself before checking for the
+    // other (read()/write() set their active flag and then check
+    // resetting_; reset() sets resetting_ and then checks both flags), all
+    // seq_cst, so at least one of them always sees the other: either the
+    // read()/write() backs out, or reset() waits for it to finish.
     alignas(hardware_destructive_interference_size) std::atomic<bool> resetting_;
 #if !defined(__clang__)
 #pragma GCC diagnostic pop
@@ -125,6 +146,37 @@ private:
 
     bool canWrite_(int len, Pos& outStart) noexcept;
     bool canRead_(int len, Pos& outStart) noexcept;
+    int writeImpl_(T* data, int len) noexcept;
+    int readImpl_(T* result, int len) noexcept;
+
+    // Marks a read() or write() as in progress. Returns false (with the flag
+    // cleared again) if a reset() is in progress, in which case the caller
+    // must back out without touching the ring.
+    bool beginAccess_(std::atomic<bool>& active) noexcept
+    {
+        active.store(true, std::memory_order_seq_cst);
+        if (resetting_.load(std::memory_order_seq_cst))
+        {
+            active.store(false, std::memory_order_release);
+            return false;
+        }
+        return true;
+    }
+
+    // Spin-wait hint for reset(). Not std::this_thread::yield(), which is a
+    // system call, since reset() can be called from real-time threads.
+    static void pauseCpu_() noexcept
+    {
+#if defined(__x86_64__) || defined(__i386__)
+        __builtin_ia32_pause();
+#elif defined(_M_X64) || defined(_M_IX86)
+        _mm_pause();
+#elif defined(__aarch64__) || defined(__arm__)
+        __asm__ __volatile__("yield");
+#elif defined(_M_ARM64) || defined(_M_ARM)
+        __yield();
+#endif
+    }
 };
 
 template<typename T>
@@ -132,8 +184,10 @@ GenericFIFO<T>::GenericFIFO(int len, T* inBuf)
     : buf(inBuf)
     , pin_(makePos_(0, 0))
     , poutCache_(makePos_(0, 0))
+    , writerActive_(false)
     , pout_(makePos_(0, 0))
     , pinCache_(makePos_(0, 0))
+    , readerActive_(false)
     , nelem(len)
     , ownBuffer_(inBuf == nullptr ? true : false)
     , resetting_(false)
@@ -159,8 +213,10 @@ GenericFIFO<T>::GenericFIFO(GenericFIFO<T>&& rhs) noexcept
     : buf(rhs.buf)
     , pin_(rhs.pin_.load())
     , poutCache_(rhs.poutCache_)
+    , writerActive_(false)
     , pout_(rhs.pout_.load())
     , pinCache_(rhs.pinCache_)
+    , readerActive_(false)
     , nelem(rhs.nelem)
     , ownBuffer_(rhs.ownBuffer_)
     , resetting_(false)
@@ -176,20 +232,31 @@ GenericFIFO<T>::GenericFIFO(GenericFIFO<T>&& rhs) noexcept
 template<typename T>
 void GenericFIFO<T>::reset() noexcept
 {
-    // Serialise concurrent reset() calls.
+    // Serialise concurrent reset() calls. Setting resetting_ also stops any
+    // new read()/write() from starting (see beginAccess_()); seq_cst pairs
+    // with theirs.
     bool expected = false;
     while (!resetting_.compare_exchange_weak(
                expected, true,
-               std::memory_order_acquire,
+               std::memory_order_seq_cst,
                std::memory_order_relaxed))
     {
         expected = false;
+        pauseCpu_();
     }
 
-    // Bump the generation as part of rewinding both indices to 0. Any
-    // writer/reader whose in-flight write()/read() started before this
-    // point will have its commit CAS fail (see write()/read()), since its
-    // captured Pos can never match a Pos from a newer generation.
+    // Wait for a read()/write() already in progress to finish, so that
+    // rewinding the ring can't race with its copy. Each holds its flag for
+    // one bounded copy and never waits on anything, so this is short.
+    while (writerActive_.load(std::memory_order_seq_cst) ||
+           readerActive_.load(std::memory_order_seq_cst))
+    {
+        pauseCpu_();
+    }
+
+    // Bump the generation as part of rewinding both indices to 0, so that
+    // the producer's and consumer's cached copies of the other's cursor
+    // (pinCache_/poutCache_) are seen to be stale (see computeUsed_()).
     Pos oldPin = pin_.load(std::memory_order_acquire);
     Pos freshPos = makePos_(generationOf_(oldPin) + 1, 0);
 
@@ -202,8 +269,6 @@ void GenericFIFO<T>::reset() noexcept
 template<typename T>
 bool GenericFIFO<T>::canWrite_(int len, Pos& outStart) noexcept
 {
-    if (resetting_.load(std::memory_order_acquire)) return false;
-
     // Own cursor: only the producer writes pin_, so this load synchronises with nothing
     // and needs no ordering of its own. The acquire that matters on this side is the
     // pout_ load below.
@@ -229,8 +294,6 @@ bool GenericFIFO<T>::canWrite_(int len, Pos& outStart) noexcept
 template<typename T>
 bool GenericFIFO<T>::canRead_(int len, Pos& outStart) noexcept
 {
-    if (resetting_.load(std::memory_order_acquire)) return false;
-
     // Own cursor: only the consumer writes pout_, so this load synchronises with nothing.
     // The acquire that matters on this side is the pin_ load below, which is what makes
     // the producer's buffer writes visible.
@@ -258,6 +321,18 @@ int GenericFIFO<T>::write(T* data, int len) noexcept
 {
     assert(data != NULL);
 
+    if (!beginAccess_(writerActive_))
+    {
+        return -1;
+    }
+    int result = writeImpl_(data, len);
+    writerActive_.store(false, std::memory_order_release);
+    return result;
+}
+
+template<typename T>
+int GenericFIFO<T>::writeImpl_(T* data, int len) noexcept
+{
     Pos startPos;
     if (!canWrite_(len, startPos))
     {
@@ -278,13 +353,10 @@ int GenericFIFO<T>::write(T* data, int len) noexcept
     }
 
     // Commit only if `pin_` still holds exactly the (generation, index) we
-    // started from. In normal SPSC operation we're the sole writer, so the
-    // only thing that can move `pin_` out from under us is a concurrent
-    // reset(), which always changes the generation -- so this can never be
-    // fooled by a coincidental index match the way a bare-pointer CAS could.
-    // If it fails, abandon this write rather than clobbering the freshly
-    // reset FIFO, consistent with reset()'s "a lost write beats a corrupted
-    // FIFO" policy.
+    // started from. We're the sole writer and reset() waits for write() to
+    // finish (see beginAccess_()), so nothing should have moved `pin_`; the
+    // generation-checked CAS just keeps a broken caller (e.g. two producers)
+    // from corrupting the FIFO, abandoning the write instead.
     Pos expected = startPos;
     Pos newPos = makePos_(gen, idx);
     if (!pin_.compare_exchange_strong(expected, newPos, std::memory_order_release, std::memory_order_relaxed))
@@ -300,6 +372,18 @@ int GenericFIFO<T>::read(T* result, int len) noexcept
 {
     assert(result != NULL);
 
+    if (!beginAccess_(readerActive_))
+    {
+        return -1;
+    }
+    int ret = readImpl_(result, len);
+    readerActive_.store(false, std::memory_order_release);
+    return ret;
+}
+
+template<typename T>
+int GenericFIFO<T>::readImpl_(T* result, int len) noexcept
+{
     Pos startPos;
     if (!canRead_(len, startPos))
     {

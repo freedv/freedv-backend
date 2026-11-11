@@ -187,6 +187,22 @@ bool testWaitForTimesOut()
     return report(result);
 }
 
+// Timeouts over about 2.1 s overflowed an int nanosecond count on macOS and
+// returned at once.
+bool testLongWaitForTimesOut()
+{
+    std::cout << "Test 12 (a waitFor() longer than 2.1 s lasts as long as asked): ";
+
+    Semaphore sem;
+    auto start = Clock::now();
+    sem.waitFor(3000);
+    auto elapsed = Clock::now() - start;
+    bool result = CHECK(elapsed >= 2900ms);
+    result &= CHECK(elapsed < 6s);
+
+    return report(result);
+}
+
 bool testWaitForWokenEarly()
 {
     std::cout << "Test 3 (waitFor() returns as soon as another thread signals): ";
@@ -479,6 +495,7 @@ int main(int, char**)
     result &= testWaitBlocksUntilSignaled();
     result &= testPingPong();
     result &= testConcurrentSignalers();
+    result &= testLongWaitForTimesOut();
 #if !defined(_WIN32) && !defined(__APPLE__)
     result &= testWaitForRetriesAfterSignal();
     result &= testWaitRetriesAfterSignal();

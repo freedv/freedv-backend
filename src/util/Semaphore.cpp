@@ -114,10 +114,11 @@ void Semaphore::waitFor(int timeMilliseconds)
         log_error(ss.str().c_str());
     }
 #elif defined(__APPLE__)
-    const int MS_TO_NS = 1000000;
+    // In 64 bits: as an int, anything over about 2.1 s overflows.
+    const int64_t MS_TO_NS = 1000000;
     if (sem_ != nullptr)
     {
-        dispatch_semaphore_wait(sem_, dispatch_time(DISPATCH_TIME_NOW, timeMilliseconds * MS_TO_NS));
+        dispatch_semaphore_wait(sem_, dispatch_time(DISPATCH_TIME_NOW, (int64_t)timeMilliseconds * MS_TO_NS));
     }
 #else
     struct timespec ts;
