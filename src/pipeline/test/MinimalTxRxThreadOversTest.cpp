@@ -387,7 +387,8 @@ bool gettersAnswerBeforeTheTransmitStepExists()
 
     // The TX worker has now built its pipeline, so the getter can use the
     // transmit step's own figure, which includes the silence sent after the
-    // EOO; the RX thread still has no transmit step.
+    // EOO; the RX thread still has no transmit step. All four answers must
+    // agree: a FIFO sized before the step existed has to be big enough after.
     int txAfter = txThread->getTxNNomModemSamples();
     int rxAfter = rxThread->getTxNNomModemSamples();
 
@@ -404,8 +405,8 @@ bool gettersAnswerBeforeTheTransmitStepExists()
     rade_close(rade);
     lpcnet_encoder_destroy(encState);
 
-    bool result = txBefore >= bareEooSamples && txAfter >= txBefore &&
-                  rxBefore >= bareEooSamples && rxAfter == rxBefore;
+    bool result = txBefore > bareEooSamples && txAfter == txBefore &&
+                  rxBefore == txBefore && rxAfter == rxBefore;
     if (!result)
     {
         std::cerr << "[tx " << txBefore << " -> " << txAfter << ", rx " << rxBefore
