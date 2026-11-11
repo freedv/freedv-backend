@@ -142,20 +142,8 @@ void SocketIoClient::setOnDisconnectFn(OnConnectionStateChangeFn fn)
     });
 }
 
-void SocketIoClient::prepareToReceive_()
+void SocketIoClient::onConnect_()
 {
-    // The receive thread feeds frames straight into the websocketpp connection
-    // (onReceive_ -> read_some), so that connection has to exist before the
-    // thread does -- onConnect_() is only queued at that point and can land
-    // after the far end's first frame is already in hand. Creating it cannot
-    // block, so it happens here; the handshake, which does block until the
-    // connection ends, stays in onConnect_().
-    //
-    // The handlers have to be registered before get_connection() as well:
-    // websocketpp's create_connection() copies the endpoint's current handlers
-    // into the connection (websocketpp/impl/endpoint_impl.hpp:59), so a
-    // connection created first would never see them.
-    
     // websocketpp: initialize logging
     client_.clear_access_channels(websocketpp::log::alevel::all);
     client_.set_access_channels(websocketpp::log::alevel::connect);
@@ -184,6 +172,7 @@ void SocketIoClient::prepareToReceive_()
         return websocketpp::lib::error_code();
     });
     
+    // "Start" connection
     websocketpp::lib::error_code ec;
     std::stringstream ss;
     ss << "ws://" << host_ << ":" << port_ << "/socket.io/?EIO=4&transport=websocket";
@@ -191,18 +180,8 @@ void SocketIoClient::prepareToReceive_()
     if (!connection_)
     {
         log_warn("could not create the websocket connection to %s port %d: %s", host_.c_str(), port_, ec.message().c_str());
-    }
-}
-
-void SocketIoClient::onConnect_()
-{
-    // "Start" connection
-    if (!connection_)
-    {
-        // prepareToReceive_() failed; there is nothing to shake hands with.
         return;
     }
-
     client_.connect(connection_);
 }
 
@@ -223,8 +202,9 @@ void SocketIoClient::onDisconnect_()
 
 void SocketIoClient::onReceive_(char* buf, int length)
 {
-    // prepareToReceive_() creates this before receiveThread_ exists, so it is
-    // only null when that creation failed.
+    // Runs on the worker thread, queued behind the onConnect_() that created
+    // connection_ (connectImpl_() queues that before it starts the receive
+    // thread), so it's only null here if get_connection() failed.
     if (connection_)
     {
         connection_->read_some(buf, length);

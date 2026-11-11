@@ -66,7 +66,7 @@ public:
         });
     }
 
-    // connection_ is only meaningful once prepareToReceive_() has run.
+    // Whether the websocketpp connection object has been created yet.
     static bool hasConnection(SocketIoClient& client)
     {
         return client.connection_ != nullptr;
@@ -79,8 +79,8 @@ using Driver = SocketIoClientTest;
 
 
 // A server that writes the instant it accepts. On a loopback connection its
-// first bytes are in flight long before the worker thread gets to the onConnect_()
-// that connectImpl_() queues, which is the ordering the receive path relies on.
+// first bytes are in flight before the worker thread gets to the onConnect_()
+// that connectImpl_() queues.
 class EarlyWriteServer
 {
 public:
@@ -133,34 +133,27 @@ private:
     std::thread thread_;
 };
 
-// Records what the receive path looked like when the first frame arrived: the
-// worker thread must have created the websocketpp connection object already,
-// because receiveThread_ is started before the queued onConnect_() runs.
+// Records whether the websocketpp connection object existed when the first
+// frame reached onReceive_(). The receive thread only buffers what it reads and
+// queues the dispatch on the worker thread, behind the onConnect_() that
+// connectImpl_() queued before starting it, so the connection must already be
+// there however early the far end writes.
 class SocketIoOrderProbe : public SocketIoClient
 {
 public:
-    std::atomic<bool> preparedBeforeFirstFrame{false};
+    std::atomic<bool> connectionAtFirstFrame{false};
     std::atomic<int> frames{0};
 
 protected:
-    void prepareToReceive_() override
-    {
-        SocketIoClient::prepareToReceive_();
-        prepared_.store(SocketIoClientTest::hasConnection(*this), std::memory_order_release);
-    }
-
     void onReceive_(char* buf, int length) override
     {
         if (frames.fetch_add(1, std::memory_order_relaxed) == 0)
         {
-            preparedBeforeFirstFrame.store(prepared_.load(std::memory_order_acquire),
-                                           std::memory_order_release);
+            connectionAtFirstFrame.store(SocketIoClientTest::hasConnection(*this),
+                                         std::memory_order_release);
         }
         SocketIoClient::onReceive_(buf, length);
     }
-
-private:
-    std::atomic<bool> prepared_{false};
 };
 
 // A heap buffer holding exactly `bytes`: reads past the end are out of bounds.
@@ -453,30 +446,33 @@ bool test9UnknownEventNamesDoNotGrowTheMap()
     return result;
 }
 
-bool test10ConnectionExistsBeforeTheReceiveThread()
+bool test10ConnectionExistsAtTheFirstFrame()
 {
-    std::cout << "Test 10 (websocketpp connection exists before the receive thread): ";
+    std::cout << "Test 10 (websocketpp connection exists when the first frame arrives): ";
 
-    EarlyWriteServer server(1);
-    SocketIoOrderProbe probe;
-    probe.connect("127.0.0.1", server.port(), false, false);
-
-    // The receive thread reads the frame; the websocketpp handshake then fails
-    // against this server, which is fine -- what matters is what onReceive_()
-    // found. Before prepareToReceive_() existed, connection_ was only assigned
-    // by the queued onConnect_(), which can run after this thread has already
-    // dereferenced it.
-    for (int waited = 0; waited < 3000 && probe.frames.load(std::memory_order_acquire) == 0; waited += 10)
+    // Several rounds: each server writes the instant it accepts, so its bytes
+    // are in hand before the worker thread gets to onConnect_().
+    bool result = true;
+    for (int round = 0; round < 20 && result; round++)
     {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
+        EarlyWriteServer server(1);
+        SocketIoOrderProbe probe;
+        probe.connect("127.0.0.1", server.port(), false, false);
 
-    bool result = (probe.frames.load(std::memory_order_acquire) > 0) &&
-                  probe.preparedBeforeFirstFrame.load(std::memory_order_acquire);
-    if (!result)
-    {
-        std::cout << "[" << probe.frames.load(std::memory_order_acquire) << " frames, prepared="
-                  << probe.preparedBeforeFirstFrame.load(std::memory_order_acquire) << "]";
+        // The websocketpp handshake then fails against this server, which is
+        // fine: what matters is what onReceive_() found.
+        for (int waited = 0; waited < 3000 && probe.frames.load(std::memory_order_acquire) == 0; waited += 10)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+
+        result = (probe.frames.load(std::memory_order_acquire) > 0) &&
+                 probe.connectionAtFirstFrame.load(std::memory_order_acquire);
+        if (!result)
+        {
+            std::cout << "[round " << round << ": " << probe.frames.load(std::memory_order_acquire)
+                      << " frames, connection=" << probe.connectionAtFirstFrame.load(std::memory_order_acquire) << "]";
+        }
     }
 
     std::cout << (result ? "PASS" : "FAIL") << "\n";
@@ -496,7 +492,7 @@ int main()
     result &= test7HugePingTimingsDontOverflow();
     result &= test8AuthDictionaryPublication();
     result &= test9UnknownEventNamesDoNotGrowTheMap();
-    result &= test10ConnectionExistsBeforeTheReceiveThread();
+    result &= test10ConnectionExistsAtTheFirstFrame();
 
     return result ? 0 : -1;
 }

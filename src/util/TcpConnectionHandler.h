@@ -65,12 +65,6 @@ protected:
     virtual void onConnect_() = 0;
     virtual void onDisconnect_() = 0;
     virtual void onReceive_(char* buf, int length) = 0;
-
-    // Called on the worker thread just before receiveThread_ is created, so a
-    // subclass can publish anything onReceive_() will need. onConnect_() is only
-    // queued at that point, so a server that writes immediately reaches
-    // onReceive_() before onConnect_() has run.
-    virtual void prepareToReceive_() {}
     
 private:
     friend class TcpConnectionHandlerTest; // grants unit tests access to TLS state

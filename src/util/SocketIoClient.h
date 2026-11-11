@@ -53,10 +53,7 @@ protected:
     virtual void onConnect_() override;
     virtual void onDisconnect_() override;
     virtual void onReceive_(char* buf, int length) override;
-
-    // Creates the websocketpp connection object before the receive thread can
-    // hand it bytes; the handshake itself happens in onConnect_().
-    virtual void prepareToReceive_() override;
+        
 private:
     // Grants the unit tests access to the engine.io/socket.io frame parsers,
     // which are otherwise only reachable through a live websocket.
