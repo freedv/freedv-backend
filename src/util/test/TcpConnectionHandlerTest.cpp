@@ -255,12 +255,23 @@ static void invalidateSocket(TcpConnectionHandler& conn)
 // Joins the receive thread after a test invalidated the socket behind the
 // handler's back, for tests that don't then call disconnect() (which joins
 // it, and frees the TLS state, whether or not the socket is still valid).
+// The join runs on the handler's own thread, like every other use of
+// receiveThread_: a disconnectImpl_() queued there (e.g. by a write that
+// fails on the invalidated socket) joins it too, and two threads joining one
+// std::thread at once is undefined (on Windows the second join fails on the
+// handle the first one closed, and the uncaught exception aborts the test).
 static void joinRecvThread(TcpConnectionHandler& conn)
 {
-    if (conn.receiveThread_.joinable())
-    {
-        conn.receiveThread_.join();
-    }
+    auto done = std::make_shared<std::promise<void>>();
+    auto fut = done->get_future();
+    conn.enqueue_([&conn, done]() {
+        if (conn.receiveThread_.joinable())
+        {
+            conn.receiveThread_.join();
+        }
+        done->set_value();
+    });
+    fut.wait();
 }
 
 #if !defined(_WIN32)
@@ -1486,7 +1497,10 @@ bool testSelectWakeDiscardedWhenSocketInvalidated()
     int clientFd = TcpConnectionHandlerTest::clientSocket(conn);
     result &= CHECK(clientFd >= 0);
 
-    conn.send("go", 2); // wakes the receive pass
+    // Waits for the write: one still queued when the socket is invalidated
+    // below would fail and queue a disconnect, which this test says doesn't
+    // happen.
+    conn.send("go", 2).wait(); // wakes the receive pass
     result &= CHECK(conn.waitForReceived(0)); // trivially true; just a barrier
     // invalidateSocket() flips the stored number: the select() wake is
     // discarded and the pass ends without dispatching anything.
