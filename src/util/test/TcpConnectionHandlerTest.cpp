@@ -253,7 +253,8 @@ static void invalidateSocket(TcpConnectionHandler& conn)
 }
 
 // Joins the receive thread after a test invalidated the socket behind the
-// handler's back (disconnectImpl_ would skip its own join in that case).
+// handler's back, for tests that don't then call disconnect() (which joins
+// it, and frees the TLS state, whether or not the socket is still valid).
 static void joinRecvThread(TcpConnectionHandler& conn)
 {
     if (conn.receiveThread_.joinable())
@@ -261,19 +262,6 @@ static void joinRecvThread(TcpConnectionHandler& conn)
         conn.receiveThread_.join();
     }
 }
-
-#if defined(ENABLE_TLS_SUPPORT)
-// Frees the TLS state a test left behind by invalidating the socket
-// (disconnectImpl_ frees it only along with a valid socket). Only once the
-// receive thread is joined and nothing else can be using it.
-static void freeTlsState(TcpConnectionHandler& conn)
-{
-    SSL* ssl = conn.ssl_.exchange(nullptr, std::memory_order_relaxed);
-    SSL_CTX* ctx = conn.sslCtx_.exchange(nullptr, std::memory_order_relaxed);
-    SSL_free(ssl);
-    SSL_CTX_free(ctx);
-}
-#endif // defined(ENABLE_TLS_SUPPORT)
 
 #if !defined(_WIN32)
 static void callCheckConnections(TcpConnectionHandler& conn, std::vector<int>& socks)
@@ -1526,7 +1514,7 @@ bool testDispatchAbandonedWhenSocketInvalidated()
     result &= CHECK(server.sendAll(std::string(64 * 1024, 'x')));
     std::this_thread::sleep_for(5ms); // dispatch is mid-flight (socket still valid)
     TcpConnectionHandlerTest::invalidateSocket(conn); // the hand-over guard must notice
-    TcpConnectionHandlerTest::joinRecvThread(conn); // disconnectImpl_ skipped its join
+    TcpConnectionHandlerTest::joinRecvThread(conn); // nothing else will join it
     testCloseSocket(clientFd);
     result &= CHECK(conn.connectCount() == 1);
     result &= CHECK(conn.disconnectCount() == 0);
@@ -2478,9 +2466,7 @@ bool testTlsSendWaitingOnInvalidSocket(TestCertificate& cert)
     auto disconnectFuture = f.conn.disconnect();
     result &= CHECK(sendFuture.wait_for(EVENT_TIMEOUT) == std::future_status::ready);
     result &= CHECK(disconnectFuture.wait_for(EVENT_TIMEOUT) == std::future_status::ready);
-    TcpConnectionHandlerTest::joinRecvThread(f.conn); // disconnectImpl_ skipped its join
-    testCloseSocket(clientFd);
-    TcpConnectionHandlerTest::freeTlsState(f.conn); // and its TLS state
+    testCloseSocket(clientFd); // the disconnect left the orphaned fd to us
     result &= CHECK(f.conn.connectCount() == 1);
     result &= CHECK(f.conn.disconnectCount() == 0); // invalid socket: nothing to disconnect
     return report(result);
@@ -2519,9 +2505,7 @@ bool testTlsReadWantsWriteOnInvalidSocket(TestCertificate& cert)
     TcpConnectionHandlerTest::invalidateSocket(f.conn); // the WANT_WRITE guard must notice
     auto disconnectFuture = f.conn.disconnect();
     result &= CHECK(disconnectFuture.wait_for(EVENT_TIMEOUT) == std::future_status::ready);
-    TcpConnectionHandlerTest::joinRecvThread(f.conn);
-    testCloseSocket(clientFd);
-    TcpConnectionHandlerTest::freeTlsState(f.conn); // and its TLS state
+    testCloseSocket(clientFd); // the disconnect left the orphaned fd to us
     // The buffered data was never dispatched: the pass ended on the dead
     // socket before its hand-over point.
     result &= CHECK(f.conn.connectCount() == 1);

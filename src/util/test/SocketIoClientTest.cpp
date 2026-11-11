@@ -202,6 +202,28 @@ bool test6RandomFrames()
 }
 } // namespace
 
+bool test7HugePingTimingsDontOverflow()
+{
+    std::cout << "Test 7 (huge ping timings from the server): ";
+
+    // Each fits an int; their sum doesn't. Added as ints, that's a signed
+    // overflow (UBSan); the timer must still be armed with a sane timeout.
+    bool result = true;
+    for (const char* json : {
+             "0{\"pingInterval\":2000000000,\"pingTimeout\":2000000000}",
+             "0{\"pingInterval\":9223372036854775807,\"pingTimeout\":1}",
+             "0{\"pingInterval\":-2000000000,\"pingTimeout\":-2000000000}",
+         })
+    {
+        SocketIoClient client;
+        auto frame = frameOf(json);
+        Driver::feedEngine(client, frame.data(), (int)frame.size());
+        result &= Driver::pingTimerRunning(client);
+    }
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    return result;
+}
+
 int main()
 {
     bool result = true;
@@ -212,6 +234,7 @@ int main()
     result &= test4EmptyAndTypeOnlyFrames();
     result &= test5TruncatedJsonIsIgnored();
     result &= test6RandomFrames();
+    result &= test7HugePingTimingsDontOverflow();
 
     return result ? 0 : -1;
 }
