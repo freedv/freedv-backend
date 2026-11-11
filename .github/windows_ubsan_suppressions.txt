@@ -1,0 +1,10 @@
+# UndefinedBehaviorSanitizer suppressions for the Windows sanitizer tests
+# (test-windows-sanitizers in workflows/build-and-test.yml). Only for
+# third-party code: the backend's own reports are fixed, not suppressed.
+
+# LibreSSL (built from source on Windows only; Linux and macOS use the
+# system OpenSSL). sk_pop_free() calls each element's free function
+# through a generic void (*)(void*) pointer. Undefined by the letter of
+# the standard (-fsanitize=function), harmless on every ABI we build for,
+# and freedv-gui suppresses it too.
+function:crypto/stack/stack.c

@@ -309,6 +309,9 @@ jobs:
         done
         # Real speech for RNNoiseStepTest (see src/pipeline/test/SpeechSample.h).
         cp build/rade_src/wav/all.wav windows-tests/
+        # Next to the tests, as UBSAN_OPTIONS needs a bare relative filename
+        # (a drive letter's colon would be taken as separating two options).
+        cp .github/windows_ubsan_suppressions.txt windows-tests/ubsan_suppressions.txt
         ls -l windows-tests
 
     - uses: actions/upload-artifact@v4
@@ -320,7 +323,8 @@ jobs:
     needs: build-windows-sanitizers
     runs-on: windows-latest
     env:
-      UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+      # The tests run in windows-tests, where the suppressions file is.
+      UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1:suppressions=ubsan_suppressions.txt
     steps:
     - uses: actions/download-artifact@v4
       with:
