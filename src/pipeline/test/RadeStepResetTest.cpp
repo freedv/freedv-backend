@@ -17,6 +17,7 @@
 #include "RADETransmitStep.h"
 #include "RADEReceiveStep.h"
 #include "PipelineTestCommon.h"
+#include "rade_text.h"
 
 // Unit-test hooks read by the RADE steps; empty disables feature dumps.
 std::string utTxFeatureFile;
@@ -263,6 +264,130 @@ bool rxStateAccessors()
     return result;
 }
 
+bool txLargeFeedStopsAtOutputLimit()
+{
+    RadeSession session;
+    std::unique_ptr<RADETransmitStep> step(session.makeTx());
+
+    // All 3 s fed in one call: the loop must stop on the output-capacity
+    // check (room for one more modem frame), not on the input running out.
+    auto input = makeSpeechLike(RADE_SPEECH_SAMPLE_RATE, 3.0f);
+    int perFrame = rade_n_tx_out(session.dv);
+    int numOut = -1;
+    short* out = step->execute(input.data(), (int)input.size(), &numOut);
+    int wholeFrames = (RADE_MODEM_SAMPLE_RATE - 1) / perFrame;
+    bool result = out != nullptr && numOut > 0 && numOut == wholeFrames * perFrame;
+    if (!result)
+    {
+        std::cerr << "[" << numOut << " output samples, expected " << wholeFrames * perFrame
+                  << " (" << wholeFrames << " x " << perFrame << ")]...";
+    }
+    return result;
+}
+
+bool txRestartQueueOverflowDropsEoo()
+{
+    RadeSession session;
+    std::unique_ptr<RADETransmitStep> step(session.makeTx());
+    int eoo = step->eooLengthInSamples();
+
+    // The output FIFO (RADE_MODEM_SAMPLE_RATE slots, one always kept free)
+    // fits exactly `fits` bursts; the next restartVocoder() can't queue its
+    // EOO and must drop it instead.
+    int fits = (RADE_MODEM_SAMPLE_RATE - 1) / eoo;
+    for (int i = 0; i <= fits; i++) step->restartVocoder();
+
+    int numOut = -1;
+    step->execute(nullptr, 0, &numOut);
+    bool result = eoo > 0 && fits >= 1 && numOut == fits * eoo && numOut < (fits + 1) * eoo;
+    if (!result)
+    {
+        std::cerr << "[" << numOut << " samples queued, expected " << fits * eoo << " of "
+                  << (fits + 1) << " restarts of " << eoo << "]...";
+    }
+    return result;
+}
+
+bool rxAppliesFrequencyOffset()
+{
+    std::vector<short> modem;
+    {
+        RadeSession session;
+        std::unique_ptr<RADETransmitStep> tx(session.makeTx());
+        modem = run(*tx, makeSpeechLike(RADE_SPEECH_SAMPLE_RATE, 2.0f));
+    }
+
+    // A receiver configured with a non-zero frequency offset must shift the
+    // incoming stream instead of passing it through unmodified.
+    RadeSession session;
+    std::unique_ptr<RADEReceiveStep> step(new RADEReceiveStep(
+        session.dv, &session.fargan, nullptr,
+        +[](RADEReceiveStep*) FREEDV_NONBLOCKING {},
+        +[]() FREEDV_NONBLOCKING { return 50.0f; }));
+    auto out = run(*step, modem);
+    bool result = !out.empty();
+    if (!result)
+    {
+        std::cerr << "[no output samples from shifted receiver]...";
+    }
+    return result;
+}
+
+bool rxTextWithoutCallsignTextState()
+{
+    // V2 streams the callsign one data symbol per modem frame (~25 bits/s)
+    // rather than in the end-of-over. Ten seconds carries the one-block
+    // message about twice, with time for the receiver to acquire first.
+    RadeSession session;
+    rade_text_t txText = rade_text_create();
+    rade_text_generate_tx_string(txText, "K6AQ", 4);
+
+    std::vector<short> modem;
+    {
+        std::unique_ptr<RADETransmitStep> tx(new RADETransmitStep(session.dv, session.encState, txText));
+        modem = run(*tx, makeSpeechLike(RADE_SPEECH_SAMPLE_RATE, 10.0f));
+        tx->restartVocoder();
+        int drained = -1;
+        while (drained != 0)
+        {
+            short* out = tx->execute(nullptr, 0, &drained);
+            if (drained > 0) modem.insert(modem.end(), out, out + drained);
+        }
+    }
+    rade_text_destroy(txText);
+    modem.insert(modem.end(), RADE_MODEM_SAMPLE_RATE, 0); // settle the decoder
+
+    // A receiver with callsign text state proves the text really is on the wire.
+    int callsigns = 0;
+    rade_text_t rxText = rade_text_create();
+    rade_text_set_rx_callback(rxText, +[](rade_text_t, const char* txt, int length, void* state) {
+        if (length == 4 && strncmp(txt, "K6AQ", 4) == 0) (*reinterpret_cast<int*>(state))++;
+    }, &callsigns);
+    {
+        RadeSession textSession;
+        std::unique_ptr<RADEReceiveStep> textRx(new RADEReceiveStep(
+            textSession.dv, &textSession.fargan, rxText,
+            +[](RADEReceiveStep*) FREEDV_NONBLOCKING {},
+            +[]() FREEDV_NONBLOCKING { return 0.0f; }));
+        run(*textRx, modem);
+    }
+    rade_text_destroy(rxText);
+
+    // The same stream through a receiver with no text state: the data
+    // symbols must be ignored and the speech decoded as usual.
+    RadeSession rxSession;
+    std::unique_ptr<RADEReceiveStep> plainRx(rxSession.makeRx());
+    auto out = run(*plainRx, modem);
+
+    bool result = callsigns >= 1 && !out.empty();
+    if (!result)
+    {
+        std::cerr << "[" << callsigns << " callsigns on the text receiver, " << out.size()
+                  << " output samples on the plain one]...";
+    }
+    return result;
+}
+
 // Regression: feeding far more modem audio than the RX step's output buffer
 // can hold in a single execute() call must stop at the buffer's capacity.
 // One rade_rx call supplies up to rade_n_features_in_out(dv_) features and,
@@ -304,6 +429,10 @@ int main()
     TEST_CASE(txResetDiscardsQueuedEoo);
     TEST_CASE(rxResetDiscardsBufferedSamples);
     TEST_CASE(rxStateAccessors);
+    TEST_CASE(txLargeFeedStopsAtOutputLimit);
+    TEST_CASE(txRestartQueueOverflowDropsEoo);
+    TEST_CASE(rxAppliesFrequencyOffset);
+    TEST_CASE(rxTextWithoutCallsignTextState);
     TEST_CASE(rxSingleExecuteClampsAtOutputCapacity);
 
     rade_finalize();

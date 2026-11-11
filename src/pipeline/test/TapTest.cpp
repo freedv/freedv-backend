@@ -306,6 +306,113 @@ bool destructionJoinsAndFreesTap()
     return true;
 }
 
+bool destructionWhileDroppingReportsDrops()
+{
+    // Two overfull bursts against a fast tap, separated by a pause long
+    // enough for the tap thread to catch up and emit its report pair: the
+    // first report notes that the tap has started dropping (dropping_ goes
+    // true) and the catch-up report notes that it ended. TapStep is then
+    // destroyed mid-backlog, so ~TapStep logs the lost audio instead of
+    // silently swallowing it.
+    std::atomic<bool> destroyed(false);
+    {
+        TapStep tapStep(SAMPLE_RATE, new RecordingStep(1ms, &destroyed));
+        auto input = makeRamp(27 * BLOCK);
+        int outputSamples = 0;
+        int outputSamples2 = 0;
+        tapStep.execute(input.data(), input.size(), &outputSamples);
+        // 27 blocks drain from the 250 ms buffer in ~24 ms at 1 block/ms;
+        // 300 ms is a wide margin for the tap thread to catch up and emit
+        // its first drop report.
+        std::this_thread::sleep_for(300ms);
+        tapStep.execute(input.data(), input.size(), &outputSamples2);
+        if (outputSamples != 27 * BLOCK)
+        {
+            std::cerr << "[outputSamples " << outputSamples << " != " << 27 * BLOCK << "]...";
+            return false;
+        }
+        if (outputSamples2 != 27 * BLOCK)
+        {
+            std::cerr << "[outputSamples2 " << outputSamples2 << " != " << 27 * BLOCK << "]...";
+            return false;
+        }
+    }
+    if (!destroyed)
+    {
+        std::cerr << "[tapped step not deleted]...";
+        return false;
+    }
+    return true;
+}
+
+bool dropStatePersistsAcrossConsecutiveOverflowReports()
+{
+    // A 50 ms/block slow tap: execute() #1 overflows (the ring fits
+    // nelem-1 = 1999 samples = 24 whole blocks, so 3 of 27 are dropped), and
+    // while the tap is still chewing through the 24-block backlog its first
+    // drop report fires (dropping_ goes true). Only then does execute() #2
+    // overflow, so its drop is reported while TapStep is *already* dropping
+    // -- the second operand-false side of `if (!dropping_)` (the
+    // drop-continuing report). execute() #3 then feeds a clean block: its
+    // report has no drops while dropping_ is still true, so the drop state
+    // ends.
+    auto* recorder = new RecordingStep(50ms);
+    TapStep tapStep(SAMPLE_RATE, recorder);
+    auto input = makeRamp(27 * BLOCK);
+    int out1 = 0, out2 = 0, out3 = 0;
+
+    tapStep.execute(input.data(), input.size(), &out1);   // 24 buffered, 3 dropped
+    // The report only runs after the whole backlog drains (24 blocks x 50ms);
+    // 24 delivered blocks means the first report has fired (or fires within
+    // microseconds) and the tap thread is parked in sem_.wait() -- no drops==0
+    // report can interleave before execute() #2 wakes it again.
+    auto got = recorder->waitForSamples(24 * BLOCK, 30s);
+    if (got.size() != (size_t)24 * BLOCK)
+    {
+        std::cerr << "[expected exactly 24 blocks before second overflow, got "
+                  << got.size() / BLOCK << "]...";
+        return false;
+    }
+    std::this_thread::sleep_for(100ms); // margin past the first drop report
+
+    tapStep.execute(input.data(), input.size(), &out2);   // overflow #2 while dropping_==true
+    // execute() #3's block only fits once the tap has drained at least one
+    // block of the second backlog (free space is 1999 - 24*80 = 79 samples
+    // until then), so gate on 25 delivered blocks before feeding it.
+    got = recorder->waitForSamples(25 * BLOCK, 30s);
+    if (got.size() != (size_t)25 * BLOCK)
+    {
+        std::cerr << "[tap did not start draining the second backlog, got "
+                  << got.size() / BLOCK << "]...";
+        return false;
+    }
+    tapStep.execute(input.data(), BLOCK, &out3);          // clean wake-up -> drop state ends
+    if (out1 != 27 * BLOCK || out2 != 27 * BLOCK || out3 != BLOCK)
+    {
+        std::cerr << "[pass-through broken: " << out1 << "/" << out2 << "/" << out3 << "]...";
+        return false;
+    }
+
+    // 55 blocks fed, 6 dropped (3 per overflowing execute): the tap must end
+    // with exactly 49 whole blocks, proving both overflow reports and the
+    // terminating no-drop report ran in order.
+    got = recorder->waitForSamples(49 * BLOCK, 30s);
+    if (got.size() != (size_t)49 * BLOCK)
+    {
+        std::cerr << "[tap got " << got.size() / BLOCK << " blocks, expected 49]...";
+        return false;
+    }
+    for (int size : recorder->callSizes())
+    {
+        if (size != BLOCK)
+        {
+            std::cerr << "[tap called with " << size << " samples, expected " << BLOCK << "]...";
+            return false;
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 int main()
@@ -316,5 +423,6 @@ int main()
     TEST_CASE(burstThatFitsInBufferIsNotLost);
     TEST_CASE(destructionHandsOverWholeBlocksOnly);
     TEST_CASE(destructionJoinsAndFreesTap);
-    return 0;
+    TEST_CASE(destructionWhileDroppingReportsDrops);
+    TEST_CASE(dropStatePersistsAcrossConsecutiveOverflowReports);
 }

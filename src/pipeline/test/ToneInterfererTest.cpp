@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <cmath>
+#include <limits>
 #include <vector>
 
 #include "ToneInterfererStep.h"
@@ -138,6 +139,79 @@ bool emptyBlock()
     return numOut == 0 && std::fabs(g_phase - 1.0f) < 1e-6f;
 }
 
+// execute() copies the block into a buffer that holds one second of audio; a
+// longer block used to be memcpy'd past the end of it (ASan
+// heap-buffer-overflow, found by fuzzing execute() with random block sizes).
+bool blockLongerThanASecondIsTruncated()
+{
+    g_phase = 0;
+    g_frequency = 1000;
+    g_amplitude = 1000;
+    std::unique_ptr<ToneInterfererStep> step(makeStep(8000));
+
+    std::vector<short> input(3 * 8000, 100);
+    int numOut = -1;
+    short* out = step->execute(input.data(), (int)input.size(), &numOut);
+    if (numOut != 8000)
+    {
+        std::cerr << "[" << numOut << " samples returned from a 8000 sample buffer]...";
+        return false;
+    }
+
+    // Reading back what it reports is the bounds check; the tone must stay
+    // within its amplitude of the copied input throughout.
+    for (int i = 0; i < numOut; i++)
+    {
+        if (std::abs((int)out[i] - 100) > 1000)
+        {
+            std::cerr << "[" << out[i] << " at sample " << i << " is more than the tone amplitude away]...";
+            return false;
+        }
+    }
+    return true;
+}
+
+bool negativeBlockCountIsRejected()
+{
+    g_phase = 0;
+    std::unique_ptr<ToneInterfererStep> step(makeStep(8000));
+
+    std::vector<short> input(4, 1000);
+    int numOut = 12345;
+    step->execute(input.data(), -4, &numOut);
+    if (numOut != 0)
+    {
+        std::cerr << "[" << numOut << " samples reported for a negative block]...";
+        return false;
+    }
+    return true;
+}
+
+// A NaN amplitude used to be cast straight to int (UBSan float-cast-overflow).
+// It must contribute no tone; an infinite one must clip like any loud tone.
+bool nonFiniteAmplitudeIsSafe()
+{
+    g_phase = 0;
+    g_frequency = 2000; // cos = 1, 0, -1, 0
+    std::unique_ptr<ToneInterfererStep> step(makeStep(8000));
+
+    g_amplitude = std::numeric_limits<float>::quiet_NaN();
+    auto nanOut = run(*step, {1000, 1000, 1000, 1000});
+    bool result = nanOut == std::vector<short>({1000, 1000, 1000, 1000});
+    if (!result)
+    {
+        std::cerr << "[NaN amplitude gave " << (nanOut.size() == 4 ? nanOut[0] : -1) << ", expected 1000]...";
+    }
+
+    g_phase = 0;
+    g_amplitude = std::numeric_limits<float>::infinity();
+    auto infOut = run(*step, {0, 0, 0, 0});
+    result &= infOut.size() == 4;
+    result &= infOut[0] == 32767;
+    result &= infOut[2] == -32768;
+    return result;
+}
+
 } // namespace
 
 int main()
@@ -147,5 +221,8 @@ int main()
     TEST_CASE(phaseContinuesAcrossBlocks);
     TEST_CASE(clipsInsteadOfWrapping);
     TEST_CASE(emptyBlock);
+    TEST_CASE(blockLongerThanASecondIsTruncated);
+    TEST_CASE(negativeBlockCountIsRejected);
+    TEST_CASE(nonFiniteAmplitudeIsSafe);
     return 0;
 }

@@ -42,6 +42,7 @@
 
 #include <array>
 #include <cassert>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -1182,6 +1183,89 @@ static bool test23_empty_callsign()
     return ok;
 }
 
+// ---------------------------------------------------------------------------
+// Test 24: strlength larger than the string: generation must stop at the
+//          string's own terminator, so the message decodes back to "AB"
+// ---------------------------------------------------------------------------
+static bool test24_string_shorter_than_strlength()
+{
+    printf("=== Test 24: strlength larger than the string ===\n");
+
+    // Heap copy sized to the string, so reading past its terminator is an
+    // ASan heap-buffer-overflow rather than a silent read of whatever follows.
+    std::vector<char> str = {'A', 'B', '\0'};
+    rade_text_t tx = rade_text_create();
+    rade_text_enable_stats_output(tx, 0);
+    rade_text_generate_tx_string(tx, str.data(), 8);
+    auto syms = pullSymbols(tx, SWEEP_COMPLETE_SYMS);
+    rade_text_destroy(tx);
+
+    RxState state = receiveRepeated(syms, SWEEP_COMPLETE_SYMS);
+    bool ok = state.callCount >= 1 && state.received == "AB";
+    printf("Received '%s' (%d callbacks): %s\n\n", state.received.c_str(), state.callCount,
+           ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
+// Test 25: a valid message arrives on an instance that never had a rx
+//          callback set: it is decoded but nothing is reported
+// ---------------------------------------------------------------------------
+static bool test25_valid_message_without_rx_callback()
+{
+    printf("=== Test 25: valid message received with no callback set ===\n");
+
+    rade_text_t tx = rade_text_create();
+    rade_text_enable_stats_output(tx, 0);
+    rade_text_generate_tx_string(tx, "K6AQ", 4);
+    auto syms = pullSymbols(tx, SWEEP_COMPLETE_SYMS);
+    rade_text_destroy(tx);
+
+    // Same symbols through a normal receiver, to prove they are decodable.
+    RxState state = receiveRepeated(syms, SWEEP_COMPLETE_SYMS);
+    bool decoded = state.callCount >= 1 && state.received == "K6AQ";
+
+    // A receiver without a callback must swallow them silently.
+    rade_text_t rx = rade_text_create();
+    rade_text_enable_stats_output(rx, 0);
+    for (int i = 0; i < SWEEP_COMPLETE_SYMS; i++)
+        rade_text_rx_symbol(rx, syms[i]);
+    rade_text_destroy(rx);
+
+    printf("Callback receiver: '%s' (%d callbacks); callback-less receiver: silent: %s\n\n",
+           state.received.c_str(), state.callCount, decoded ? "PASS" : "FAIL");
+    return decoded;
+}
+
+// ---------------------------------------------------------------------------
+// Test 26: a negative strlength (a caller-computed length gone wrong, or a
+//          hostile one) is treated as an empty callsign
+// ---------------------------------------------------------------------------
+static bool test26_negative_strlength()
+{
+    printf("=== Test 26: negative strlength ===\n");
+
+    const int lengths[] = { -1, -8, INT_MIN };
+    bool ok = true;
+    for (int len : lengths)
+    {
+        rade_text_t tx = rade_text_create();
+        rade_text_enable_stats_output(tx, 0);
+        rade_text_generate_tx_string(tx, "K6AQ", len);
+        auto syms = pullSymbols(tx, SWEEP_COMPLETE_SYMS);
+        rade_text_destroy(tx);
+
+        RxState state = receiveRepeated(syms, SWEEP_COMPLETE_SYMS);
+        bool passed = state.callCount >= 1 && state.received.empty();
+        printf("  strlength %d -> '%s' (%d callbacks): %s\n", len, state.received.c_str(),
+               state.callCount, passed ? "PASS" : "FAIL");
+        ok &= passed;
+    }
+
+    printf("Negative strlength treated as empty: %s\n\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 int main()
 {
     bool success = true;
@@ -1209,6 +1293,9 @@ int main()
     success &= test21_valid_codeword_bad_crc_rejected();
     success &= test22_unencodable_characters_skipped();
     success &= test23_empty_callsign();
+    success &= test24_string_shorter_than_strlength();
+    success &= test25_valid_message_without_rx_callback();
+    success &= test26_negative_strlength();
 
     printf("=== Overall: %s ===\n", success ? "PASS" : "FAIL");
     return success ? 0 : 1;

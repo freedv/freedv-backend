@@ -343,6 +343,13 @@ static int convert_string_to_ota_chars_(const char *input, int inputLength, uint
     for (int index = 0; index < inputLength && outidx < maxOutLength; index++)
     {
         char c = input[index];
+
+        // inputLength is caller-supplied and may run past the string (as
+        // the strlen()-free callers allow): stop at its terminator rather
+        // than read beyond it.
+        if (c == '\0')
+            break;
+
         if (c >= '0' && c <= '9')
         {
             output[outidx++] = (uint8_t)(c - '0' + 1);

@@ -89,25 +89,31 @@ short* BandwidthExpandStep::execute(short* inputSamples, int numInputSamples, in
     short* outputSamples = outputSamples_.get();
     short* tmpOutput = outputSamples;
     short* tmpInput = tmpInput_.get();
+    const int outputPerFrame = BWE_FRAME_SIZE * (OUTPUT_SAMPLE_RATE / INPUT_SAMPLE_RATE);
 
     // Feed the input FIFO in pieces that fit: it holds half a second, and a
     // larger block written in one go would be rejected outright.
-    while (numInputSamples > 0 && inputSamples != nullptr)
+    // outputSamples_ holds one second of expanded audio; stop when it's full so
+    // a caller handing over more than a second of 16 kHz input can't write past
+    // the end (whatever is left over is dropped, as in ResampleStep).
+    while (numInputSamples > 0 && inputSamples != nullptr &&
+           *numOutputSamples + outputPerFrame <= OUTPUT_SAMPLE_RATE)
     {
         int samplesToWrite = std::min(inputSampleFifo_.numFree(), numInputSamples);
         inputSampleFifo_.write(inputSamples, samplesToWrite);
         inputSamples += samplesToWrite;
         numInputSamples -= samplesToWrite;
 
-        while (inputSampleFifo_.numUsed() >= BWE_FRAME_SIZE)
+        while (inputSampleFifo_.numUsed() >= BWE_FRAME_SIZE &&
+               *numOutputSamples + outputPerFrame <= OUTPUT_SAMPLE_RATE)
         {
             inputSampleFifo_.read(tmpInput, BWE_FRAME_SIZE);
 
             // Run BBWENet. Expects BWE_FRAME_SIZE * 3 buffer for output.
             osce_bwe(osce_, osceBWE_, tmpOutput, tmpInput, BWE_FRAME_SIZE, arch_);
 
-            tmpOutput += BWE_FRAME_SIZE * (OUTPUT_SAMPLE_RATE / INPUT_SAMPLE_RATE);
-            *numOutputSamples += BWE_FRAME_SIZE * (OUTPUT_SAMPLE_RATE / INPUT_SAMPLE_RATE);
+            tmpOutput += outputPerFrame;
+            *numOutputSamples += outputPerFrame;
         }
     }
 

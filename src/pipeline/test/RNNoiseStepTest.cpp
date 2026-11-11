@@ -143,10 +143,44 @@ bool suppressesNoiseButKeepsSpeech()
     return true;
 }
 
+// outputSamples_ holds one second of audio. Handing execute() more than a
+// second in one call used to write past the end of it (ASan
+// heap-buffer-overflow, found by fuzzing execute() with random block sizes), so
+// the step must stop at the buffer and never report more than it can hold.
+bool singleCallStaysWithinOutputBuffer()
+{
+    RNNoiseStep step;
+    auto input = makeNoise(RATE * 3, 10000);
+
+    int numOut = 0;
+    short* result = step.execute(input.data(), (int)input.size(), &numOut);
+    if (numOut <= 0 || numOut > RATE)
+    {
+        std::cerr << "[" << numOut << " samples returned from a " << RATE << " sample buffer]...";
+        return false;
+    }
+
+    // Reading back exactly what the step reports is what trips ASan if it
+    // wrote past the allocation. The filter attenuates steady noise, so only
+    // require that it actually processed the block.
+    int maxAbs = 0;
+    for (int n = 0; n < numOut; n++)
+    {
+        maxAbs = std::max(maxAbs, std::abs((int)result[n]));
+    }
+    if (maxAbs == 0)
+    {
+        std::cerr << "[output was entirely silent]...";
+        return false;
+    }
+    return true;
+}
+
 int main()
 {
     TEST_CASE(firstFrameIsLatency);
     TEST_CASE(blockSizeDoesNotMatter);
     TEST_CASE(suppressesNoiseButKeepsSpeech);
+    TEST_CASE(singleCallStaysWithinOutputBuffer);
     return 0;
 }

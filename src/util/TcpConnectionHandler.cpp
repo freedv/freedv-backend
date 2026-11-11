@@ -310,11 +310,9 @@ void TcpConnectionHandler::connectImpl_()
     
     while (!cancelConnect_.load(std::memory_order_relaxed) && (results[0] || results[1]))
     {
-        // At least one list is non-empty; make sure we're on one of those.
-        if (results[whichIndex] == nullptr)
-        {
-            whichIndex = (whichIndex + 1) % 2;
-        }
+        // whichIndex always indexes a non-empty list here: the initial
+        // selection above and the end-of-loop fallback both keep it on a list
+        // that has entries whenever the while condition holds.
         struct addrinfo* current = results[whichIndex];
         int ret = 0;
 #if defined(WIN32)
@@ -406,14 +404,9 @@ void TcpConnectionHandler::connectImpl_()
             log_warn("cannot start connection to %s (err=%d: %s)", buf, err, tmpBuf);
 #else
             auto ptr = strerror_r(err, tmpBuf, ERROR_BUFFER_LEN);
-            if (ptr == nullptr)
-            {
-                strncpy(tmpBuf, "(null)", 7);
-            }
-            else
-            {
-                memmove(tmpBuf, ptr, strlen(ptr) + 1);
-            }
+            // The GNU strerror_r always returns tmpBuf (or a static string),
+            // never nullptr.
+            memmove(tmpBuf, ptr, strlen(ptr) + 1);
             log_warn("cannot start connection to %s (err=%d: %s)", buf, err, tmpBuf);
 #endif // defined(__APPLE__) || ((_POSIX_C_SOURCE >= 200112L) && !_GNU_SOURCE)
             close(fd);
@@ -524,8 +517,21 @@ next_fd:
     {
         bool connSucceeded = true;
 #if defined(ENABLE_TLS_SUPPORT)
-        sslCtx_.store(nullptr, std::memory_order_relaxed);
+        // Free, then clear: storing nullptr used to drop the objects a previous
+        // attempt left behind, so a retried TLS connection leaked its old
+        // context and everything allocated under it.
+        auto staleSsl = ssl_.load(std::memory_order_relaxed);
+        auto staleCtx = sslCtx_.load(std::memory_order_relaxed);
         ssl_.store(nullptr, std::memory_order_relaxed);
+        sslCtx_.store(nullptr, std::memory_order_relaxed);
+        if (staleSsl != nullptr)
+        {
+            SSL_free(staleSsl);
+        }
+        if (staleCtx != nullptr)
+        {
+            SSL_CTX_free(staleCtx);
+        }
 
         // We have a valid socket. If the user wants to connect via TLS, attempt TLS negotiation now.
         // If we can't negotiate TLS for whatever reason, close socket and try again in a bit.
@@ -759,14 +765,14 @@ next_fd:
         reconnectTimer_.start();
     }
     
-    // Free address info objects
-    ipv6ResolveThread.detach();
-    ipv4ResolveThread.detach();
-    while (!ipv4Complete_.load(std::memory_order_relaxed) || !ipv6Complete_.load(std::memory_order_relaxed))
-    {
-        std::this_thread::sleep_for(1ms);
-    }
-    
+    // Wait for both lookups to finish before freeing their results. Joining
+    // (rather than detaching and polling ipv*Complete_, which are relaxed)
+    // also orders everything the lookup threads did with this object, such
+    // as the virtual resolveAddresses_() call, before anything after this
+    // connect attempt, including the object's destruction.
+    ipv6ResolveThread.join();
+    ipv4ResolveThread.join();
+
     if (ipv4ResultFuture.valid())
     {
         heads[1] = ipv4ResultFuture.get();
@@ -793,31 +799,39 @@ void TcpConnectionHandler::disconnectImpl_(bool callHandler)
     {
         // Any onConnect_() still queued for this connection is now stale.
         connectionGeneration_++;
+    }
+
+    // Joined whether or not the socket is still open: the TLS objects below are
+    // freed unconditionally, and the receive thread uses them.
+    if (receiveThread_.joinable())
+    {
+        receiveThread_.join();
+    }
 
 #if defined(ENABLE_TLS_SUPPORT)
-        auto tmpSsl = ssl_.load(std::memory_order_relaxed);
-        ssl_.store(nullptr, std::memory_order_relaxed);
-        auto tmpCtx = sslCtx_.load(std::memory_order_relaxed);
-        sslCtx_.store(nullptr, std::memory_order_relaxed);
+    // The TLS objects belong to the connect attempt, not to a live socket: an
+    // attempt that failed after creating them has already closed its socket, so
+    // freeing them inside the socket check above leaked the CTX and everything
+    // hanging off it (its whole certificate store) on every such attempt.
+    // LeakSanitizer reports ~300k of libcrypto allocations that way.
+    auto tmpSsl = ssl_.load(std::memory_order_relaxed);
+    ssl_.store(nullptr, std::memory_order_relaxed);
+    auto tmpCtx = sslCtx_.load(std::memory_order_relaxed);
+    sslCtx_.store(nullptr, std::memory_order_relaxed);
+
+    if (tmpSsl != nullptr)
+    {
+        SSL_shutdown(tmpSsl);
+        SSL_free(tmpSsl);
+    }
+    if (tmpCtx != nullptr)
+    {
+        SSL_CTX_free(tmpCtx);
+    }
 #endif // defined(ENABLE_TLS_SUPPORT)
 
-        if (receiveThread_.joinable())
-        {
-            receiveThread_.join();
-        }
-
-#if defined(ENABLE_TLS_SUPPORT)
-        if (tmpSsl != nullptr) 
-        {
-            SSL_shutdown(tmpSsl);
-            SSL_free(tmpSsl);
-        }
-        if (tmpCtx != nullptr)
-        {
-            SSL_CTX_free(tmpCtx);
-        }
-#endif // defined(ENABLE_TLS_SUPPORT)
-
+    if (tmp != INVALID_SOCKET)
+    {
 #if defined(WIN32)
         closesocket(tmp);
 #else
@@ -1023,18 +1037,27 @@ void TcpConnectionHandler::receiveImpl_()
         }
 
         int rv = 1;
+        // Take the descriptor once: a disconnect between the loop test above and
+        // FD_SET() used to hand -1 to FD_SET (UBSan: shift exponent -1) and to
+        // select().
+        int sock = socket_.load(std::memory_order_relaxed);
 #if defined(ENABLE_TLS_SUPPORT)
         // Data TLS has already decrypted doesn't make the socket readable, so
         // read it without waiting (left over when the buffer filled up).
         if (!usingTLS_ || sslPending_() == 0)
 #endif // defined(ENABLE_TLS_SUPPORT)
         {
+            if (sock == INVALID_SOCKET)
+            {
+                continue;
+            }
+
             struct timeval tv = {0, 250000}; // 250ms
             fd_set readSet;
             FD_ZERO(&readSet);
-            FD_SET(socket_.load(std::memory_order_relaxed), &readSet);
+            FD_SET(sock, &readSet);
 
-            rv = select(socket_.load(std::memory_order_relaxed) + 1, &readSet, nullptr, nullptr, &tv);
+            rv = select(sock + 1, &readSet, nullptr, nullptr, &tv);
         }
         if (rv > 0 && socket_.load(std::memory_order_relaxed) != INVALID_SOCKET)
         {
@@ -1114,10 +1137,7 @@ void TcpConnectionHandler::receiveImpl_()
                 // Queue RX handler. This thread is the buffer's only writer
                 // and we checked for room above, so this can't fail.
                 numHaveRead += numRead;
-                if (receiveBuffer_.write(buf, numRead) != 0)
-                {
-                    log_error("receive buffer overflow; dropped %d bytes", numRead);
-                }
+                receiveBuffer_.write(buf, numRead);
 
                 if (numRead < READ_SIZE_BYTES)
                 {

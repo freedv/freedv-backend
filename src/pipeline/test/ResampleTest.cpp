@@ -105,6 +105,22 @@ bool resample44100To8000() { return resampleToneCommon(44100, 8000); }
 bool resample8000To44100() { return resampleToneCommon(8000, 44100); }
 bool resample48000To8000Tone() { return resampleToneCommon(48000, 8000); }
 
+bool linearResampleForPlots()
+{
+    // The linear variant (for plots only) must resample just like the
+    // default one, at the expected output count.
+    ResampleStep resampleStep(8000, 48000, true);
+    auto inputSineWave = std::unique_ptr<short[]>(generateOneSecondSineWave(2000, 8000), std::default_delete<short[]>());
+    int numOutputSamples = 0;
+    resampleStep.execute(inputSineWave.get(), 8000, &numOutputSamples);
+    if (numOutputSamples < 48000 * 0.9 || numOutputSamples > 48000 * 1.1)
+    {
+        std::cerr << "[linear resampling produced " << numOutputSamples << " samples, expected 48000]...";
+        return false;
+    }
+    return true;
+}
+
 // Regression: feeding exactly one second of input at an integer upsample
 // ratio must not push more samples into the one-second output buffer than
 // it can hold. The linear converter emits ceil(input*ratio) per 10 ms
@@ -128,6 +144,55 @@ bool linearOneSecondFeedStaysWithinOutputBuffer()
     return result;
 }
 
+// Regression: a call carrying only one or two samples. libsamplerate's
+// linear converter interpolates from data_in[-1] before it has consumed
+// anything from the buffer it was just handed, which read one float before
+// tempInput_ (ASan: heap-buffer-overflow) -- one sample at any ratio, two
+// when upsampling. Short calls must stay in bounds and must not disturb the
+// converter: the rest of the second still has to come out at the expected
+// count.
+bool shortFeedsStayInBounds()
+{
+    const int RATES[][2] = { {48000, 8000}, {8000, 48000}, {16000, 8000} };
+
+    for (auto& rate : RATES)
+    {
+        ResampleStep resampleStep(rate[0], rate[1], true);
+        std::vector<short> input(rate[0]);
+        for (size_t n = 0; n < input.size(); n++)
+        {
+            input[n] = (short)(8000 * std::sin(2 * M_PI * 400.0 * n / rate[0]));
+        }
+
+        int total = 0;
+        size_t pos = 0;
+        for (int count = 1; count <= 3; count++)
+        {
+            int numOutputSamples = 0;
+            resampleStep.execute(&input[pos], count, &numOutputSamples);
+            total += numOutputSamples;
+            pos += count;
+        }
+
+        while (pos < input.size())
+        {
+            int count = std::min(rate[0] / 100, (int)(input.size() - pos));
+            int numOutputSamples = 0;
+            resampleStep.execute(&input[pos], count, &numOutputSamples);
+            total += numOutputSamples;
+            pos += count;
+        }
+
+        if (std::abs(total - rate[1]) > rate[1] / 50)
+        {
+            std::cerr << "[" << rate[0] << "->" << rate[1] << " produced " << total
+                      << " samples, expected " << rate[1] << "]...";
+            return false;
+        }
+    }
+    return true;
+}
+
 int main()
 {
     TEST_CASE(resampleEqual);
@@ -138,6 +203,8 @@ int main()
     TEST_CASE(resample44100To8000);
     TEST_CASE(resample8000To44100);
     TEST_CASE(resample48000To8000Tone);
+    TEST_CASE(linearResampleForPlots);
     TEST_CASE(linearOneSecondFeedStaysWithinOutputBuffer);
+    TEST_CASE(shortFeedsStayInBounds);
     return 0;
 }
