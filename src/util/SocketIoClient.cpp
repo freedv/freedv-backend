@@ -233,8 +233,14 @@ void SocketIoClient::handleEngineIoMessage_(char* ptr, int length)
             auto pingTimeout = yyjson_obj_get(rootVal, "pingTimeout");
 
             // Missing/zero/negative timings would make the watchdog fire
-            // immediately, so keep the built-in interval in that case.
-            auto pingMs = yyjson_get_int(pingInterval) + yyjson_get_int(pingTimeout);
+            // immediately, so keep the built-in interval in that case. Each
+            // value is clamped before the sum (done in 64 bits), so two huge
+            // ones from the server can't overflow it.
+            auto clampMs = [](yyjson_val* val) -> int64_t {
+                int64_t ms = yyjson_is_int(val) ? yyjson_get_sint(val) : 0;
+                return ms < 0 ? 0 : (ms > INT_MAX ? INT_MAX : ms);
+            };
+            int64_t pingMs = clampMs(pingInterval) + clampMs(pingTimeout);
             pingTimer_.setTimeout(
                 pingMs > 0 && pingMs <= INT_MAX ? (int)pingMs : DEFAULT_PING_TIMER_INTERVAL_MS);
             pingTimer_.start();

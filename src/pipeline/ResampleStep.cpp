@@ -159,7 +159,12 @@ short* ResampleStep::execute(short* inputSamples, int numInputSamples, int* numO
         inputPtr += src_data.input_frames_used;
         numInputSamples -= src_data.input_frames_used;
         *numOutputSamples += src_data.output_frames_gen;
-        lastInputSample_ = tempInput_[INPUT_GUARD_SAMPLES + inputSize - 1];
+        // The next pass starts after the last sample consumed, which isn't
+        // the last one handed over when the output filled first.
+        if (src_data.input_frames_used > 0)
+        {
+            lastInputSample_ = tempInput_[INPUT_GUARD_SAMPLES + src_data.input_frames_used - 1];
+        }
         if (src_data.input_frames_used == 0)
         {
             // src_process consumed nothing with room still in the buffer:
