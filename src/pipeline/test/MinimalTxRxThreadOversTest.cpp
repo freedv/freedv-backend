@@ -344,11 +344,82 @@ bool threadGuardsStopOnHelperAndFullOutputFifo()
 }
 
 
+// The UI thread reads the modem frame size through this getter, and it can
+// ask before a thread has started -- or of the RX thread, which never has a
+// transmit step at all. getTxNNomModemSamples() used to dereference the null
+// txStep_ in both cases (it segfaults; the UI thread never gets an answer).
+bool gettersAnswerBeforeTheTransmitStepExists()
+{
+    char modelFile[1] = {0};
+    struct rade* rade = rade_open(modelFile, RADE_USE_C_ENCODER | RADE_USE_C_DECODER);
+    if (rade == nullptr)
+    {
+        std::cerr << "[rade_open failed]...";
+        return false;
+    }
+    LPCNetEncState* encState = lpcnet_encoder_create();
+    FARGANState fargan;
+    {
+        float zeros[320] = {0};
+        float inFeatures[5 * NB_TOTAL_FEATURES] = {0};
+        fargan_init(&fargan);
+        fargan_cont(&fargan, zeros, inFeatures);
+    }
+    rade_text_t radeText = rade_text_create();
+
+    paCallBackData cbData;
+    cbData.infifo1 = new GenericFIFO<short>(SPEECH_RATE);
+    cbData.outfifo1 = new GenericFIFO<short>(MODEM_RATE);
+    cbData.infifo2 = new GenericFIFO<short>(MODEM_RATE);
+    cbData.outfifo2 = new GenericFIFO<short>(SPEECH_RATE);
+
+    auto helper = std::make_shared<MinimalRealtimeHelper>();
+    auto txThread = std::make_unique<MinimalTxRxThread>(true, SPEECH_RATE, MODEM_RATE, helper, rade, encState, &fargan, radeText, &cbData);
+    auto rxThread = std::make_unique<MinimalTxRxThread>(false, MODEM_RATE, SPEECH_RATE, helper, rade, encState, &fargan, radeText, &cbData);
+
+    // Neither worker has run yet, so neither has a transmit step.
+    const int bareEooSamples = rade_n_tx_eoo_out(rade);
+    int txBefore = txThread->getTxNNomModemSamples();
+    int rxBefore = rxThread->getTxNNomModemSamples();
+
+    txThread->start();
+    txThread->waitForReady();
+
+    // The TX worker has now built its pipeline, so the getter can use the
+    // transmit step's own figure, which includes the silence sent after the
+    // EOO; the RX thread still has no transmit step.
+    int txAfter = txThread->getTxNNomModemSamples();
+    int rxAfter = rxThread->getTxNNomModemSamples();
+
+    txThread->stop();
+    txThread.reset();
+    rxThread.reset();
+
+    delete cbData.infifo1;
+    delete cbData.outfifo1;
+    delete cbData.infifo2;
+    delete cbData.outfifo2;
+
+    rade_text_destroy(radeText);
+    rade_close(rade);
+    lpcnet_encoder_destroy(encState);
+
+    bool result = txBefore >= bareEooSamples && txAfter >= txBefore &&
+                  rxBefore >= bareEooSamples && rxAfter == rxBefore;
+    if (!result)
+    {
+        std::cerr << "[tx " << txBefore << " -> " << txAfter << ", rx " << rxBefore
+                  << " -> " << rxAfter << ", bare EOO " << bareEooSamples << "]...";
+    }
+    return result;
+}
+
 int main()
 {
     rade_initialize();
     TEST_CASE(secondTransmissionStartsClean);
     TEST_CASE(threadGuardsStopOnHelperAndFullOutputFifo);
+    TEST_CASE(gettersAnswerBeforeTheTransmitStepExists);
     rade_finalize();
     return 0;
 }

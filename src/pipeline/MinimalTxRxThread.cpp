@@ -58,7 +58,12 @@ static const float TxScaleFactor_ = 2.0;
 
 int MinimalTxRxThread::getTxNNomModemSamples() const
 {
-    return std::max(rade_n_tx_out(rade_), txStep_->eooLengthInSamples());
+    // txStep_ exists only on a TX thread, and only once that thread's worker
+    // has built the pipeline, so the UI thread can ask before it's there (or
+    // of an RX thread). Fall back to the EOO length on its own then.
+    auto txStep = txStep_.load(std::memory_order_acquire);
+    return std::max(rade_n_tx_out(rade_),
+                    txStep != nullptr ? txStep->eooLengthInSamples() : rade_n_tx_eoo_out(rade_));
 }
 
 int MinimalTxRxThread::getRxNumSpeechSamples() const
@@ -82,12 +87,15 @@ void MinimalTxRxThread::initializePipeline_()
     
     if (m_tx)
     {
-        txStep_ = new RADETransmitStep(rade_, encState_);
-        auto agcStep = new AgcStep(txStep_->getInputSampleRate());
+        auto txStep = new RADETransmitStep(rade_, encState_);
+        auto agcStep = new AgcStep(txStep->getInputSampleRate());
         auto rnnoiseStep = new RNNoiseStep();
         pipeline_->appendPipelineStep(rnnoiseStep);
         pipeline_->appendPipelineStep(agcStep);
-        pipeline_->appendPipelineStep(txStep_);
+        pipeline_->appendPipelineStep(txStep);
+        // Published once, before the pipeline that uses it can run: the UI
+        // thread reads it through getTxNNomModemSamples().
+        txStep_.store(txStep, std::memory_order_release);
         
         auto levelAdjustStep = new LevelAdjustStep(outputSampleRate_, +[]() FREEDV_NONBLOCKING { return TxScaleFactor_; });
         pipeline_->appendPipelineStep(levelAdjustStep);
@@ -308,7 +316,7 @@ void MinimalTxRxThread::txProcessing_(IRealtimeHelper* helper) noexcept
                 if (!hasEooBeenSent_)
                 {
                     // Special case for handling RADE EOT
-                    txStep_->restartVocoder();
+                    txStep_.load(std::memory_order_acquire)->restartVocoder();
                     hasEooBeenSent_ = true;
                 }
 
