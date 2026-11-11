@@ -268,10 +268,17 @@ jobs:
   # never compile, and for Windows' 32-bit long. ThreadSanitizer and
   # LeakSanitizer aren't available for Windows. x86_64 only: llvm-mingw has
   # no ASan for aarch64.
+  #
+  # -fsanitize=function is left out: LibreSSL, which only the Windows build
+  # compiles from source, calls element free functions through a generic
+  # void (*)(void*) pointer (crypto/stack/stack.c), harmless on every ABI we
+  # build for but reported on every TLS connection. A UBSan suppression for
+  # it didn't take effect in this combined ASan+UBSan build. The Linux and
+  # macOS jobs still run that check on all of the backend's own code.
   build-windows-sanitizers:
     runs-on: ubuntu-24.04
     env:
-      SANITIZER_FLAGS: -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer
+      SANITIZER_FLAGS: -fsanitize=address,undefined -fno-sanitize=function -fno-sanitize-recover=undefined -fno-omit-frame-pointer
     steps:
     - uses: actions/checkout@v6
 
@@ -288,8 +295,8 @@ jobs:
         cmake -DCMAKE_TOOLCHAIN_FILE=${{ github.workspace }}/cross-compile/freedv-mingw-llvm-x86_64.cmake \
           -DCMAKE_BUILD_TYPE=RelWithDebInfo \
           -DCMAKE_C_FLAGS="$SANITIZER_FLAGS" -DCMAKE_CXX_FLAGS="$SANITIZER_FLAGS" \
-          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined" \
-          -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address,undefined" \
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined -fno-sanitize=function" \
+          -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address,undefined -fno-sanitize=function" \
           -DBUILD_BACKEND_UNITTESTS=1 ..
 
     - name: Build backend and tests
@@ -309,9 +316,6 @@ jobs:
         done
         # Real speech for RNNoiseStepTest (see src/pipeline/test/SpeechSample.h).
         cp build/rade_src/wav/all.wav windows-tests/
-        # Next to the tests, as UBSAN_OPTIONS needs a bare relative filename
-        # (a drive letter's colon would be taken as separating two options).
-        cp .github/windows_ubsan_suppressions.txt windows-tests/ubsan_suppressions.txt
         ls -l windows-tests
 
     - uses: actions/upload-artifact@v4
@@ -323,8 +327,7 @@ jobs:
     needs: build-windows-sanitizers
     runs-on: windows-latest
     env:
-      # The tests run in windows-tests, where the suppressions file is.
-      UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1:suppressions=ubsan_suppressions.txt
+      UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
     steps:
     - uses: actions/download-artifact@v4
       with:
