@@ -349,15 +349,27 @@ int GenericFIFO<T>::writeImpl_(T* data, int len) noexcept
 
     std::uint32_t gen = generationOf_(startPos);
     std::uint32_t idx = indexOf_(startPos);
-    int numToCopy = std::min((std::uint32_t)len, nelem - idx);
-    std::copy_n(data, numToCopy, &buf[idx]);
-    len -= numToCopy;
-    idx += numToCopy;
-    data += numToCopy;
-    if (idx >= (std::uint32_t)nelem)
+    // Either all of it fits before the end of the buffer, or it's copied in
+    // two pieces: to the end, then the rest from the start. Spelled out as
+    // the two cases, every count is plainly within len. (As one sequence, with
+    // the first count an int, GCC 16 can't rule out the second copy running
+    // past the caller's buffer, and says so under -Warray-bounds once this is
+    // inlined into a one-element write.)
+    std::uint32_t total = (std::uint32_t)len;
+    std::uint32_t untilEnd = (std::uint32_t)nelem - idx;
+    if (total < untilEnd)
     {
-        std::copy_n(data, len, buf);
-        idx = len;
+        std::copy_n(data, total, &buf[idx]);
+        idx += total;
+    }
+    else
+    {
+        std::copy_n(data, untilEnd, &buf[idx]);
+        if (total > untilEnd)
+        {
+            std::copy_n(data + untilEnd, total - untilEnd, buf);
+        }
+        idx = total - untilEnd;
     }
 
     // Commit only if `pin_` still holds exactly the (generation, index) we
@@ -407,15 +419,23 @@ int GenericFIFO<T>::readImpl_(T* result, int len) noexcept
 
     std::uint32_t gen = generationOf_(startPos);
     std::uint32_t idx = indexOf_(startPos);
-    int numToCopy = std::min((std::uint32_t)len, nelem - idx);
-    std::copy_n(&buf[idx], numToCopy, result);
-    result += numToCopy;
-    idx += numToCopy;
-    len -= numToCopy;
-    if (idx >= (std::uint32_t)nelem)
+    // As in writeImpl_(): it doesn't reach the end of the buffer, or it's
+    // copied to the end and then the rest from the start.
+    std::uint32_t total = (std::uint32_t)len;
+    std::uint32_t untilEnd = (std::uint32_t)nelem - idx;
+    if (total < untilEnd)
     {
-        std::copy_n(buf, len, result);
-        idx = len;
+        std::copy_n(&buf[idx], total, result);
+        idx += total;
+    }
+    else
+    {
+        std::copy_n(&buf[idx], untilEnd, result);
+        if (total > untilEnd)
+        {
+            std::copy_n(buf, total - untilEnd, result + untilEnd);
+        }
+        idx = total - untilEnd;
     }
 
     // See write() -- commit only if `pout_` still holds exactly the
