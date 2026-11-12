@@ -84,28 +84,28 @@ int main()
     char modelFile[1];
     modelFile[0] = 0;
     rade_initialize();
-    rade = rade_open(modelFile, RADE_USE_C_ENCODER | RADE_USE_C_DECODER);
+    rade = rade_open(modelFile, RADE_USE_C_ENCODER | RADE_USE_C_DECODER | RADE_MODE_V2);
     assert(rade != nullptr);
 
     // Initialize RADE text
     rade_text_t txt = rade_text_create();
     assert(txt != nullptr);
     rade_text_enable_stats_output(txt, 1);
-    int nsyms = rade_n_eoo_bits(rade);
-    float txSyms[1024]; // randomly selected maximum to suppress warning
-    rade_text_generate_tx_string(txt, "K6AQ", 4, txSyms, nsyms);
+    rade_text_generate_tx_string(txt, "K6AQ", 4);
     rade_text_set_rx_callback(txt, OnRadeTextRx, nullptr);
-    rade_tx_set_eoo_bits(rade, txSyms);
 
     // Initialize RADE steps
     RADEReceiveStep* recvStep = new RADEReceiveStep(
         rade, &fargan, txt, +[](RADEReceiveStep*) FREEDV_NONBLOCKING { },
         +[]() FREEDV_NONBLOCKING { return 0.0f; /* no freq shift */ });
     assert(recvStep != nullptr);
-    RADETransmitStep* txStep = new RADETransmitStep(rade, encState);
+    RADETransmitStep* txStep = new RADETransmitStep(rade, encState, txt);
     assert(txStep != nullptr);
 
-    // "Transmit" ~1 second of audio (including EOO) and immediately receive it.
+    // "Transmit" several seconds of audio (including EOO) and immediately
+    // receive it. The callsign streams continuously at ~25 bits/s, so this
+    // needs to run well past one full 112-bit codeword cycle (~4.5s) to give
+    // the receiver a chance to acquire sync and decode at least once.
     int nout = 0;
     int noutRx = 0;
     constexpr int SAMPLES_PER_TX = 1638; // 100ms @ 16 kHz sample rate
@@ -113,7 +113,7 @@ int main()
     assert(inputSamples != nullptr);
     memset(inputSamples, 0, sizeof(short) * SAMPLES_PER_TX);
     auto inputSamplesPtr = std::unique_ptr<short[]>(inputSamples);
-    for (int count = 0; count < 11; count++)
+    for (int count = 0; count < 100; count++)
     {
         auto outputSamples = txStep->execute(inputSamplesPtr.get(), SAMPLES_PER_TX, &nout);
         addNoise(outputSamples, nout);

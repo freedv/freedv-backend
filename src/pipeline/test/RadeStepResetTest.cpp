@@ -36,7 +36,7 @@ struct RadeSession
     RadeSession()
     {
         char modelFile[1] = {0};
-        dv = rade_open(modelFile, RADE_USE_C_ENCODER | RADE_USE_C_DECODER);
+        dv = rade_open(modelFile, RADE_USE_C_ENCODER | RADE_USE_C_DECODER | RADE_MODE_V2);
         assert(dv != nullptr);
         encState = lpcnet_encoder_create();
         assert(encState != nullptr);
@@ -333,20 +333,19 @@ bool rxAppliesFrequencyOffset()
     return result;
 }
 
-bool rxEooWithoutCallsignText()
+bool rxTextWithoutCallsignTextState()
 {
-    // Modem audio with a callsign-carrying end-of-over, from a transmitter
-    // whose rade state was told which EOO bits to send.
+    // V2 streams the callsign one data symbol per modem frame (~25 bits/s)
+    // rather than in the end-of-over. Ten seconds carries the one-block
+    // message about twice, with time for the receiver to acquire first.
     RadeSession session;
-    rade_text_t radeText = rade_text_create();
-    std::vector<float> eooSyms(rade_n_eoo_bits(session.dv));
-    rade_text_generate_tx_string(radeText, "K6AQ", 4, eooSyms.data(), (int)eooSyms.size());
-    rade_tx_set_eoo_bits(session.dv, eooSyms.data());
+    rade_text_t txText = rade_text_create();
+    rade_text_generate_tx_string(txText, "K6AQ", 4);
 
     std::vector<short> modem;
     {
-        std::unique_ptr<RADETransmitStep> tx(session.makeTx());
-        modem = run(*tx, makeSpeechLike(RADE_SPEECH_SAMPLE_RATE, 2.0f));
+        std::unique_ptr<RADETransmitStep> tx(new RADETransmitStep(session.dv, session.encState, txText));
+        modem = run(*tx, makeSpeechLike(RADE_SPEECH_SAMPLE_RATE, 10.0f));
         tx->restartVocoder();
         int drained = -1;
         while (drained != 0)
@@ -355,36 +354,37 @@ bool rxEooWithoutCallsignText()
             if (drained > 0) modem.insert(modem.end(), out, out + drained);
         }
     }
+    rade_text_destroy(txText);
     modem.insert(modem.end(), RADE_MODEM_SAMPLE_RATE, 0); // settle the decoder
 
-    // A receiver with callsign text state proves the EOO really is on the wire.
+    // A receiver with callsign text state proves the text really is on the wire.
     int callsigns = 0;
-    rade_text_set_rx_callback(radeText, +[](rade_text_t, const char* txt, int length, void* state) {
+    rade_text_t rxText = rade_text_create();
+    rade_text_set_rx_callback(rxText, +[](rade_text_t, const char* txt, int length, void* state) {
         if (length == 4 && strncmp(txt, "K6AQ", 4) == 0) (*reinterpret_cast<int*>(state))++;
     }, &callsigns);
     {
         RadeSession textSession;
         std::unique_ptr<RADEReceiveStep> textRx(new RADEReceiveStep(
-            textSession.dv, &textSession.fargan, radeText,
+            textSession.dv, &textSession.fargan, rxText,
             +[](RADEReceiveStep*) FREEDV_NONBLOCKING {},
             +[]() FREEDV_NONBLOCKING { return 0.0f; }));
         run(*textRx, modem);
     }
+    rade_text_destroy(rxText);
 
-    // The same stream through a receiver with no text state on a fresh rade
-    // state: the EOO must pass through unhandled instead of crashing.
+    // The same stream through a receiver with no text state: the data
+    // symbols must be ignored and the speech decoded as usual.
     RadeSession rxSession;
-    rade_tx_set_eoo_bits(rxSession.dv, eooSyms.data());
     std::unique_ptr<RADEReceiveStep> plainRx(rxSession.makeRx());
     auto out = run(*plainRx, modem);
 
-    bool result = callsigns == 1 && !out.empty();
+    bool result = callsigns >= 1 && !out.empty();
     if (!result)
     {
         std::cerr << "[" << callsigns << " callsigns on the text receiver, " << out.size()
                   << " output samples on the plain one]...";
     }
-    rade_text_destroy(radeText);
     return result;
 }
 
@@ -432,7 +432,7 @@ int main()
     TEST_CASE(txLargeFeedStopsAtOutputLimit);
     TEST_CASE(txRestartQueueOverflowDropsEoo);
     TEST_CASE(rxAppliesFrequencyOffset);
-    TEST_CASE(rxEooWithoutCallsignText);
+    TEST_CASE(rxTextWithoutCallsignTextState);
     TEST_CASE(rxSingleExecuteClampsAtOutputCapacity);
 
     rade_finalize();

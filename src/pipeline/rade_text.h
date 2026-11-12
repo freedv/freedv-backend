@@ -52,17 +52,41 @@ extern "C"
     /* Destroy rade_text object. */
     void rade_text_destroy(rade_text_t ptr);
 
-    /* Generates float array for use with RADE EOO functions. */
-    void rade_text_generate_tx_string(rade_text_t ptr, const char *str, int strlength, float *syms, int symSize);
+    /* Encode str into the internal repeating LDPC-coded bitstream that
+       rade_text_tx_next_symbol() streams out, one bit per modem frame. */
+    void rade_text_generate_tx_string(rade_text_t ptr, const char *str, int strlength);
+
+    /* Returns the next BPSK data symbol (+1.0 / -1.0) to pass to
+       rade_tx_set_data_symbol(). Call once per rade_tx() frame; the
+       encoded text loops continuously for as long as this is called. */
+    float rade_text_tx_next_symbol(rade_text_t ptr);
 
     /* Set text RX callback. */
     void rade_text_set_rx_callback(rade_text_t ptr, on_text_rx_t text_rx_fn, void *state);
 
-    /* Decode received symbols from RADE decoder. */
-    void rade_text_rx(rade_text_t ptr, float *syms, int symSize);
+    /* Feed one soft-decision BPSK data symbol obtained from
+       rade_rx_get_data_symbol(). Call once per successful (return > 0)
+       rade_rx(). May invoke the RX callback if a valid decode results. */
+    void rade_text_rx_symbol(rade_text_t ptr, float sym);
 
     /* Whether to enable output of stats (i.e. BER). */
     void rade_text_enable_stats_output(rade_text_t ptr, int enable);
+
+    /* Discard all RX state (partially received symbols, combined copies and
+       partially reassembled messages). Call when the modem loses sync, since
+       the position within the transmitter's cycle is unknown afterward. */
+    void rade_text_rx_reset(rade_text_t ptr);
+
+    /* Whether to coherently combine repeated copies of the transmitted
+       cycle to decode at lower SNR (enabled by default). */
+    void rade_text_enable_rx_combining(rade_text_t ptr, int enable);
+
+    /* Whether a decode that only receive combining produced must be
+       confirmed by a second decode of the same block at the same alignment
+       before it's delivered (disabled by default). Cancels out the extra
+       false decodes combining otherwise adds, at the cost of up to ~1 dB
+       and one more codeword (~4.5s) of latency near threshold. */
+    void rade_text_enable_rx_combine_confirm(rade_text_t ptr, int enable);
 
 #ifdef __cplusplus
 }
