@@ -228,6 +228,13 @@ public:
         return (int)conn.socket_.load(std::memory_order_relaxed);
     }
 
+    // Whether the handler has seen the given family's DNS lookup finish.
+    static bool lookupComplete(TcpConnectionHandler& conn, int addressFamily)
+    {
+        return (addressFamily == AF_INET6 ? conn.ipv6Complete_ : conn.ipv4Complete_)
+            .load(std::memory_order_relaxed);
+    }
+
     // Queues closing the connection the way the receive thread does when
     // the peer hangs up: unlike disconnect(), without cancelling a
     // connection that's still being made.
@@ -861,13 +868,19 @@ struct DnsAnswer
     std::chrono::milliseconds delay{0};
     std::vector<std::pair<std::string, int>> addresses; // address, port
 
-    // Count `delay` from when the other family's lookup answers instead of
-    // from when this one starts. For tests about how one answer is timed
-    // against the other: the handler starts the two lookup threads one
-    // after the other, and how long each takes to start isn't under the
-    // test's control (it can be tens of ms on a loaded macOS CI runner,
-    // more under ThreadSanitizer), so timing both from their own start
-    // doesn't reliably give the gap between the answers that's wanted.
+    // Count `delay` from when the handler sees the other family's lookup
+    // finish instead of from when this one starts. For tests about how one
+    // answer is timed against the other: the handler starts the two lookup
+    // threads one after the other, and how long each takes to start isn't
+    // under the test's control (it can be tens of ms on a loaded macOS CI
+    // runner, more under ThreadSanitizer), so timing both from their own
+    // start doesn't reliably give the gap between the answers that's wanted.
+    //
+    // The lookup keeps running while it waits (it spins rather than
+    // sleeping or blocking), so the answer isn't held up by the scheduler
+    // waking it: the handler gives IPv6 only 50 ms once IPv4 has answered,
+    // and a 5 ms sleep after a condition-variable wake-up has taken longer
+    // than that on a loaded CI runner under AddressSanitizer.
     bool afterOtherFamily = false;
 };
 
@@ -895,12 +908,6 @@ private:
     DnsAnswer ipv6_;
     DnsAnswer ipv4_;
 
-    // Which families' lookups have answered, for afterOtherFamily.
-    std::mutex answeredMutex_;
-    std::condition_variable answeredCV_;
-    bool ipv6Answered_ = false;
-    bool ipv4Answered_ = false;
-
     virtual void resolveAddresses_(int addressFamily, const char*, const char*, struct addrinfo** result) override
     {
         bool isIpv6 = addressFamily == AF_INET6;
@@ -915,16 +922,24 @@ private:
         {
             // Bounded, so a script mistake fails the test rather than
             // hanging it.
-            std::unique_lock<std::mutex> lk(answeredMutex_);
-            answeredCV_.wait_for(lk, 10s, [&]() { return isIpv6 ? ipv4Answered_ : ipv6Answered_; });
-        }
-        std::this_thread::sleep_for(answer.delay);
+            int otherFamily = isIpv6 ? AF_INET : AF_INET6;
+            auto giveUp = std::chrono::steady_clock::now() + 10s;
+            while (!TcpConnectionHandlerTest::lookupComplete(*this, otherFamily) &&
+                   std::chrono::steady_clock::now() < giveUp)
+            {
+                std::this_thread::yield();
+            }
 
-        {
-            std::unique_lock<std::mutex> lk(answeredMutex_);
-            (isIpv6 ? ipv6Answered_ : ipv4Answered_) = true;
+            auto answerAt = std::chrono::steady_clock::now() + answer.delay;
+            while (std::chrono::steady_clock::now() < answerAt)
+            {
+                std::this_thread::yield();
+            }
         }
-        answeredCV_.notify_all();
+        else
+        {
+            std::this_thread::sleep_for(answer.delay);
+        }
     }
 
     static void buildAnswer_(int addressFamily, const DnsAnswer& answer, struct addrinfo** result)
@@ -1084,7 +1099,7 @@ bool testDualStackPrefersIpv6()
     LoopbackTcpServer server6(AF_INET6);
     if (skipWithoutIpv6(server6)) return true;
     LoopbackTcpServer server4;
-    // IPv6 answers as IPv4 does (timed from IPv4's answer: see
+    // IPv6 answers as soon as the handler has IPv4's answer (see
     // DnsAnswer::afterOtherFamily).
     ScriptedDnsConnection conn({0ms, {{"::1", server6.port()}}, true}, {0ms, {{"127.0.0.1", server4.port()}}});
 
@@ -1105,7 +1120,8 @@ bool testDualStackWaitsBrieflyForIpv6()
     LoopbackTcpServer server6(AF_INET6);
     if (skipWithoutIpv6(server6)) return true;
     LoopbackTcpServer server4;
-    // IPv6 answers 5 ms after IPv4 does (see DnsAnswer::afterOtherFamily).
+    // IPv6 answers 5 ms after the handler has IPv4's answer (see
+    // DnsAnswer::afterOtherFamily).
     ScriptedDnsConnection conn({5ms, {{"::1", server6.port()}}, true}, {0ms, {{"127.0.0.1", server4.port()}}});
 
     bool result = CHECK(server4.valid());
