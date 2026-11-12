@@ -107,7 +107,22 @@ public:
                 }
                 static const char OPEN[] = "0{\"pingInterval\":25000,\"pingTimeout\":20000}";
                 send(client, OPEN, (int)(sizeof(OPEN) - 1), 0);
-                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+                // Close gracefully: FIN after the frame, then read what the
+                // client sent (its HTTP upgrade request) until it closes too.
+                // Closing with that request unread makes Windows send an RST
+                // instead, which can discard the frame before the client has
+                // read it (WSAECONNRESET, and no frame at all).
+#if defined(_WIN32)
+                shutdown(client, SD_SEND);
+#else
+                shutdown(client, SHUT_WR);
+#endif // defined(_WIN32)
+                testSetRecvTimeout(client, 2000);
+                char discard[512];
+                while (recv(client, discard, (int)sizeof(discard), 0) > 0)
+                {
+                }
                 testCloseSocket(client);
             }
         });
