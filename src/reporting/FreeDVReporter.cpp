@@ -49,6 +49,7 @@ FreeDVReporter::FreeDVReporter(std::string hostname, std::string callsign, std::
     , gridSquare_(std::move(gridSquare))
     , software_(std::move(software))
     , lastFrequency_(0)
+    , sideband_(Sideband::UNKNOWN)
     , tx_(false)
     , rxOnly_(rxOnly)
     , hidden_(false)
@@ -82,6 +83,7 @@ FreeDVReporter::~FreeDVReporter()
         onUserConnectFn_ = nullptr;
         onUserDisconnectFn_ = nullptr;
         onFrequencyChangeFn_ = nullptr;
+        onSidebandChangeFn_ = nullptr;
         onTransmitUpdateFn_ = nullptr;
         onReceiveUpdateFn_ = nullptr;
     
@@ -151,6 +153,18 @@ void FreeDVReporter::freqChange(uint64_t frequency)
     if (isValidForReporting())
     {
         freqChangeImpl_(frequency);
+    }
+}
+
+void FreeDVReporter::sidebandChange(Sideband sideband)
+{
+    std::unique_lock<std::mutex> lk(objMutex_);
+
+    if (isValidForReporting() && sideband != sideband_)
+    {
+        // Sent along with the frequency, which hasn't changed.
+        sideband_ = sideband;
+        freqChangeImpl_(lastFrequency_);
     }
 }
 
@@ -235,6 +249,12 @@ void FreeDVReporter::setOnFrequencyChangeFn(FrequencyChangeFn fn)
 {
     std::unique_lock<std::mutex> lk(objMutex_);
     onFrequencyChangeFn_ = std::move(fn);
+}
+
+void FreeDVReporter::setOnSidebandChangeFn(SidebandChangeFn fn)
+{
+    std::unique_lock<std::mutex> lk(objMutex_);
+    onSidebandChangeFn_ = std::move(fn);
 }
 
 void FreeDVReporter::setOnTransmitUpdateFn(TxUpdateFn fn)
@@ -583,6 +603,29 @@ void FreeDVReporter::onFreeDVReporterFrequencyChange_(yyjson_val* msgParams)
             );
         }
     }
+
+    // Only from servers that report it: an older one leaves whatever the
+    // station was last said to be on as it was.
+    if (onSidebandChangeFn_)
+    {
+        auto sid = yyjson_obj_get(msgParams, "sid");
+        auto frequency = yyjson_obj_get(msgParams, "freq");
+        auto sidebandJson = yyjson_obj_get(msgParams, "sideband");
+        if (yyjson_is_str(sid) && yyjson_is_uint(frequency) && yyjson_is_str(sidebandJson))
+        {
+            std::string sidebandStr = yyjson_get_str(sidebandJson);
+            Sideband sideband = Sideband::UNKNOWN;
+            if (sidebandStr == "USB")
+            {
+                sideband = Sideband::USB;
+            }
+            else if (sidebandStr == "LSB")
+            {
+                sideband = Sideband::LSB;
+            }
+            onSidebandChangeFn_(yyjson_get_str(sid), sideband);
+        }
+    }
 }
 
 void FreeDVReporter::onFreeDVReporterMessageUpdate_(yyjson_val* msgParams)
@@ -661,6 +704,23 @@ void FreeDVReporter::freqChangeImpl_(uint64_t frequency)
         yyjson_mut_val* freqData = yyjson_mut_obj(freqDoc);
 
         yyjson_mut_obj_add_uint(freqDoc, freqData, "freq", frequency);
+
+        // Always sent, so that going back to not knowing (e.g. rig control
+        // turned off) is passed on too. Servers from before the sideband
+        // was reported ignore it.
+        const char* sideband = "";
+        switch (sideband_)
+        {
+            case Sideband::USB:
+                sideband = "USB";
+                break;
+            case Sideband::LSB:
+                sideband = "LSB";
+                break;
+            default:
+                break;
+        }
+        yyjson_mut_obj_add_str(freqDoc, freqData, "sideband", sideband);
         sioClient_->emit("freq_change", freqData);
 
         yyjson_mut_doc_free(freqDoc);

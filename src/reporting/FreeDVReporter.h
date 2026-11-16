@@ -64,6 +64,11 @@ public:
     
     // sid, last_update, callsign, grid_square, frequency
     using FrequencyChangeFn = std::function<void(std::string, std::string, std::string, std::string, uint64_t)>;
+
+    // sid, sideband (UNKNOWN if the station hasn't said). Called after the
+    // FrequencyChangeFn for the same freq_change, when the server includes
+    // the sideband (servers from before it was reported don't).
+    using SidebandChangeFn = std::function<void(std::string, Sideband)>;
     
     // sid, last_update, callsign, grid_square, txMode, transmitting, lastTx
     using TxUpdateFn = std::function<void(std::string, std::string, std::string, std::string, std::string, bool, std::string)>;
@@ -94,6 +99,7 @@ public:
     void updateMessage(std::string const& message);
     
     virtual void freqChange(uint64_t frequency) override;
+    virtual void sidebandChange(Sideband sideband) override;
     virtual void transmit(std::string mode, bool tx) override;
     
     virtual void inAnalogMode(bool inAnalog) override;
@@ -107,6 +113,7 @@ public:
     void setOnUserConnectFn(ConnectionDataFn fn);
     void setOnUserDisconnectFn(ConnectionDataFn fn);
     void setOnFrequencyChangeFn(FrequencyChangeFn fn);
+    void setOnSidebandChangeFn(SidebandChangeFn fn);
     void setOnTransmitUpdateFn(TxUpdateFn fn);
     void setOnReceiveUpdateFn(RxUpdateFn fn);
     
@@ -140,6 +147,7 @@ private:
     std::string gridSquare_;
     std::string software_;
     uint64_t lastFrequency_;
+    Sideband sideband_;
     std::string mode_;
     bool tx_;
     bool rxOnly_;
@@ -154,6 +162,7 @@ private:
     ConnectionDataFn onUserConnectFn_;
     ConnectionDataFn onUserDisconnectFn_;
     FrequencyChangeFn onFrequencyChangeFn_;
+    SidebandChangeFn onSidebandChangeFn_;
     TxUpdateFn onTransmitUpdateFn_;
     RxUpdateFn onReceiveUpdateFn_;
     

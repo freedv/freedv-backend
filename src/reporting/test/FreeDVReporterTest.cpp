@@ -25,6 +25,7 @@ public:
     static void fireBulkUpdate(FreeDVReporter& reporter, yyjson_val* params) { reporter.onFreeDVReporterBulkUpdate_(params); }
 
     static uint64_t lastFrequency(const FreeDVReporter& reporter) { return reporter.lastFrequency_; }
+    static IReporter::Sideband sideband(const FreeDVReporter& reporter) { return reporter.sideband_; }
     static std::string mode(const FreeDVReporter& reporter) { return reporter.mode_; }
     static bool tx(const FreeDVReporter& reporter) { return reporter.tx_; }
     static std::string message(const FreeDVReporter& reporter) { return reporter.message_; }
@@ -290,6 +291,73 @@ bool testFreqChangeHandler()
         R"({"sid":"s","last_update":"u","callsign":"K6AQ","grid_square":"DM12kw","freq":14236000.5})",
         [&](yyjson_val* root) { FreeDVReporterTest::fireFreqChange(reporter, root); });
     result &= (calls == 1);
+
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    return result;
+}
+
+bool testSidebandHandler()
+{
+    std::cout << "Test 6a (freq_change sideband dispatch): ";
+
+    FreeDVReporter reporter("localhost", "N1DQ", "CN98", "FreeDV Test", false);
+
+    std::vector<std::pair<std::string, IReporter::Sideband>> got;
+    int freqCalls = 0;
+    reporter.setOnFrequencyChangeFn([&](std::string, std::string, std::string, std::string, uint64_t) { freqCalls++; });
+    reporter.setOnSidebandChangeFn([&](std::string sid, IReporter::Sideband sideband) {
+        got.emplace_back(sid, sideband);
+    });
+
+    auto fire = [&](const char* json) {
+        withParsedJson(json, [&](yyjson_val* root) { FreeDVReporterTest::fireFreqChange(reporter, root); });
+    };
+
+    bool result = true;
+    fire(R"({"sid":"s1","last_update":"u","callsign":"K6AQ","grid_square":"DM12kw","freq":14236000,"sideband":"USB"})");
+    fire(R"({"sid":"s2","last_update":"u","callsign":"VK3TPM","grid_square":"QF22","freq":7177000,"sideband":"LSB"})");
+    fire(R"({"sid":"s3","last_update":"u","callsign":"W1AW","grid_square":"FN31","freq":3625000,"sideband":""})");
+    fire(R"({"sid":"s4","last_update":"u","callsign":"W1AW","grid_square":"FN31","freq":3625000,"sideband":"CW"})");
+    result &= (got.size() == 4);
+    result &= (got.size() == 4 && got[0] == std::make_pair(std::string("s1"), IReporter::Sideband::USB));
+    result &= (got.size() == 4 && got[1] == std::make_pair(std::string("s2"), IReporter::Sideband::LSB));
+    result &= (got.size() == 4 && got[2].second == IReporter::Sideband::UNKNOWN);
+    result &= (got.size() == 4 && got[3].second == IReporter::Sideband::UNKNOWN);
+
+    // A server from before the sideband was reported doesn't send it: the
+    // frequency still gets through, but nothing is said about the sideband.
+    fire(R"({"sid":"s1","last_update":"u","callsign":"K6AQ","grid_square":"DM12kw","freq":14240000})");
+    fire(R"({"sid":"s1","last_update":"u","callsign":"K6AQ","grid_square":"DM12kw","freq":14240000,"sideband":1})");
+    fire(R"({"sid":"s1","last_update":"u","callsign":"K6AQ","grid_square":"DM12kw","freq":-1,"sideband":"USB"})");
+    result &= (got.size() == 4);
+    result &= (freqCalls == 6);
+
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    return result;
+}
+
+bool testSidebandSavedAndSentWithFrequency()
+{
+    std::cout << "Test 6b (sideband saved before connecting, unchanged sideband ignored): ";
+
+    FreeDVReporter reporter("localhost", "N1DQ", "CN98", "FreeDV Test", false);
+
+    bool result = (FreeDVReporterTest::sideband(reporter) == IReporter::Sideband::UNKNOWN);
+
+    // Through the IReporter interface, as FreeDV calls it for every reporter.
+    IReporter& asReporter = reporter;
+    reporter.freqChange(7177000);
+    asReporter.sidebandChange(IReporter::Sideband::LSB);
+    result &= (FreeDVReporterTest::sideband(reporter) == IReporter::Sideband::LSB);
+    result &= (FreeDVReporterTest::lastFrequency(reporter) == 7177000ULL);
+
+    asReporter.sidebandChange(IReporter::Sideband::UNKNOWN);
+    result &= (FreeDVReporterTest::sideband(reporter) == IReporter::Sideband::UNKNOWN);
+
+    // Not reported with an invalid callsign, as with the frequency.
+    FreeDVReporter invalid("localhost", "", "CN98", "FreeDV Test", false);
+    invalid.sidebandChange(IReporter::Sideband::USB);
+    result &= (FreeDVReporterTest::sideband(invalid) == IReporter::Sideband::UNKNOWN);
 
     std::cout << (result ? "PASS" : "FAIL") << "\n";
     return result;
@@ -734,6 +802,8 @@ int main(int argc, char** argv)
     result &= testTxReportHandler();
     result &= testRxReportHandler();
     result &= testFreqChangeHandler();
+    result &= testSidebandHandler();
+    result &= testSidebandSavedAndSentWithFrequency();
     result &= testMessageAndQsyHandlers();
     result &= testBulkUpdateToleratesMalformedEntries();
     result &= testStateSavedBeforeConnectionAndReplayedOnSuccess();
