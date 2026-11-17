@@ -511,6 +511,10 @@ void registerCallbacks(FreeDVReporter& reporter, CallbackLog& log)
                                         uint64_t freq) {
         log.add("freq_change " + sid + " " + callsign + " " + std::to_string(freq));
     });
+    reporter.setOnSidebandChangeFn([&](std::string sid, IReporter::Sideband sideband) {
+        log.add("sideband " + sid + " " +
+                (sideband == IReporter::Sideband::USB ? "USB" : sideband == IReporter::Sideband::LSB ? "LSB" : "unknown"));
+    });
     reporter.setOnTransmitUpdateFn([&](std::string sid, std::string, std::string, std::string,
                                        std::string mode, bool tx, std::string lastTx) {
         log.add("tx_report " + sid + " " + mode + " " + (tx ? "tx" : "rx") + " [" + lastTx + "]");
@@ -545,6 +549,7 @@ bool testHandshakeAndInitialReport()
     // State set before connecting must be replayed once the server says
     // the connection is fully established.
     reporter.freqChange(14236000);
+    reporter.sidebandChange(IReporter::Sideband::USB);
     reporter.transmit("RADEV1", false);
     reporter.updateMessage("hello from test");
 
@@ -571,6 +576,7 @@ bool testHandshakeAndInitialReport()
     JsonDoc args;
     result &= CHECK(server.expectEvent("freq_change", args));
     result &= CHECK((yyjson_get_uint(yyjson_obj_get(args.root(), "freq")) == 14236000ULL));
+    result &= CHECK((getStr(args.root(), "sideband") == "USB"));
     result &= CHECK(server.expectEvent("tx_report", args));
     result &= CHECK((getStr(args.root(), "mode") == "RADEV1"));
     result &= CHECK(yyjson_is_false(yyjson_obj_get(args.root(), "transmitting")));
@@ -627,6 +633,30 @@ bool testInboundEvents()
     result &= CHECK(log.waitFor("user_connect s2 VK3TPM QF22 2.0 tx t1"));
     result &= CHECK(log.waitFor("freq_change s2 VK3TPM 14236000"));
 
+    // The sideband, from servers that send it; the frequency's callback
+    // first.
+    result &= CHECK(server.sendEvent("freq_change",
+        R"({"sid":"s2","last_update":"u","callsign":"VK3TPM","grid_square":"QF22","freq":7177000,"sideband":"LSB"})"));
+    result &= CHECK(log.waitFor("sideband s2 LSB"));
+    result &= CHECK(log.waitFor("freq_change s2 VK3TPM 7177000"));
+    result &= CHECK(server.sendEvent("freq_change",
+        R"({"sid":"s2","last_update":"u","callsign":"VK3TPM","grid_square":"QF22","freq":7177000,"sideband":""})"));
+    result &= CHECK(log.waitFor("sideband s2 unknown"));
+    result &= CHECK((log.count("sideband s2") == 2));
+
+    // With a QsyRequestWithSidebandFn, that's called instead, with the
+    // requester's sideband.
+    reporter.setOnQSYRequestWithSidebandFn([&](std::string callsign, uint64_t freq, std::string message,
+                                               IReporter::Sideband sideband) {
+        log.add("qsy_request_with_sideband " + callsign + " " + std::to_string(freq) + " " + message + " " +
+                (sideband == IReporter::Sideband::USB ? "USB" : sideband == IReporter::Sideband::LSB ? "LSB" : "unknown"));
+    });
+    result &= CHECK(server.sendEvent("qsy_request", R"({"callsign":"K6AQ","frequency":7177000,"message":"QSY?","sideband":"LSB"})"));
+    result &= CHECK(log.waitFor("qsy_request_with_sideband K6AQ 7177000 QSY? LSB"));
+    result &= CHECK(server.sendEvent("qsy_request", R"({"callsign":"K6AQ","frequency":7177000,"message":"QSY?"})"));
+    result &= CHECK(log.waitFor("qsy_request_with_sideband K6AQ 7177000 QSY? unknown"));
+    result &= CHECK((log.count("qsy_request ") == 1));
+
     // Junk the client should shrug off: unknown event, unparseable JSON,
     // non-string event name, and socket.io/engine.io packet types it ignores.
     result &= CHECK(server.sendEvent("no_such_event", "{}"));
@@ -665,6 +695,15 @@ bool testOutboundReports()
     reporter.freqChange(7177000);
     result &= CHECK(server.expectEvent("freq_change", args));
     result &= CHECK((yyjson_get_uint(yyjson_obj_get(args.root(), "freq")) == 7177000ULL));
+    result &= CHECK((getStr(args.root(), "sideband") == ""));
+
+    // A new sideband goes with the frequency it's on; the same one again
+    // sends nothing.
+    reporter.sidebandChange(IReporter::Sideband::LSB);
+    result &= CHECK(server.expectEvent("freq_change", args));
+    result &= CHECK((yyjson_get_uint(yyjson_obj_get(args.root(), "freq")) == 7177000ULL));
+    result &= CHECK((getStr(args.root(), "sideband") == "LSB"));
+    reporter.sidebandChange(IReporter::Sideband::LSB);
 
     reporter.transmit("RADEV1", true);
     result &= CHECK(server.expectEvent("tx_report", args));
@@ -685,6 +724,8 @@ bool testOutboundReports()
     result &= CHECK((getStr(args.root(), "dest_sid") == "sid-9"));
     result &= CHECK((getStr(args.root(), "message") == "meet me on 20m"));
     result &= CHECK((yyjson_get_uint(yyjson_obj_get(args.root(), "frequency")) == 14236000ULL));
+    // On the sideband we're on.
+    result &= CHECK((getStr(args.root(), "sideband") == "LSB"));
 
     // Analog mode hides us; going back to digital shows us and re-reports state.
     reporter.inAnalogMode(true);
@@ -696,6 +737,7 @@ bool testOutboundReports()
     result &= CHECK(server.expectEvent("show_self"));
     result &= CHECK(server.expectEvent("freq_change", args));
     result &= CHECK((yyjson_get_uint(yyjson_obj_get(args.root(), "freq")) == 7177000ULL));
+    result &= CHECK((getStr(args.root(), "sideband") == "LSB"));
     result &= CHECK(server.expectEvent("tx_report"));
     result &= CHECK(server.expectEvent("message_update", args));
     result &= CHECK((getStr(args.root(), "message") == "testing 1 2 3"));

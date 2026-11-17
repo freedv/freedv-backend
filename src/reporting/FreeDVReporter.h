@@ -64,6 +64,11 @@ public:
     
     // sid, last_update, callsign, grid_square, frequency
     using FrequencyChangeFn = std::function<void(std::string, std::string, std::string, std::string, uint64_t)>;
+
+    // sid, sideband (UNKNOWN if the station hasn't said). Called after the
+    // FrequencyChangeFn for the same freq_change, when the server includes
+    // the sideband (servers from before it was reported don't).
+    using SidebandChangeFn = std::function<void(std::string, Sideband)>;
     
     // sid, last_update, callsign, grid_square, txMode, transmitting, lastTx
     using TxUpdateFn = std::function<void(std::string, std::string, std::string, std::string, std::string, bool, std::string)>;
@@ -73,6 +78,10 @@ public:
     
     // callsign, frequency, message
     using QsyRequestFn = std::function<void(std::string, uint64_t, std::string)>;
+
+    // callsign, frequency, message, sideband (the requester's; UNKNOWN if
+    // they or the server didn't say)
+    using QsyRequestWithSidebandFn = std::function<void(std::string, uint64_t, std::string, Sideband)>;
     
     // sid, last_update, message
     using MessageUpdateFn = std::function<void(std::string, std::string, std::string)>;
@@ -90,10 +99,14 @@ public:
     virtual ~FreeDVReporter();
 
     void connect();
+
+    // Asks a station to come to the given frequency, on the sideband we've
+    // reported (see sidebandChange()).
     void requestQSY(std::string const& sid, uint64_t frequencyHz, std::string const& message);
     void updateMessage(std::string const& message);
     
     virtual void freqChange(uint64_t frequency) override;
+    virtual void sidebandChange(Sideband sideband) override;
     virtual void transmit(std::string mode, bool tx) override;
     
     virtual void inAnalogMode(bool inAnalog) override;
@@ -107,10 +120,15 @@ public:
     void setOnUserConnectFn(ConnectionDataFn fn);
     void setOnUserDisconnectFn(ConnectionDataFn fn);
     void setOnFrequencyChangeFn(FrequencyChangeFn fn);
+    void setOnSidebandChangeFn(SidebandChangeFn fn);
     void setOnTransmitUpdateFn(TxUpdateFn fn);
     void setOnReceiveUpdateFn(RxUpdateFn fn);
     
     void setOnQSYRequestFn(QsyRequestFn fn);
+
+    // As setOnQSYRequestFn(), with the sideband to go to as well. Called
+    // instead of the QsyRequestFn when set.
+    void setOnQSYRequestWithSidebandFn(QsyRequestWithSidebandFn fn);
     void setMessageUpdateFn(MessageUpdateFn fn);
     void setConnectionSuccessfulFn(ConnectionSuccessfulFn fn);
     void setAboutToShowSelfFn(AboutToShowSelfFn fn);
@@ -140,6 +158,7 @@ private:
     std::string gridSquare_;
     std::string software_;
     uint64_t lastFrequency_;
+    Sideband sideband_;
     std::string mode_;
     bool tx_;
     bool rxOnly_;
@@ -154,10 +173,12 @@ private:
     ConnectionDataFn onUserConnectFn_;
     ConnectionDataFn onUserDisconnectFn_;
     FrequencyChangeFn onFrequencyChangeFn_;
+    SidebandChangeFn onSidebandChangeFn_;
     TxUpdateFn onTransmitUpdateFn_;
     RxUpdateFn onReceiveUpdateFn_;
     
     QsyRequestFn onQsyRequestFn_;
+    QsyRequestWithSidebandFn onQsyRequestWithSidebandFn_;
     MessageUpdateFn onMessageUpdateFn_;
     ConnectionSuccessfulFn onConnectionSuccessfulFn_;
     AboutToShowSelfFn onAboutToShowSelfFn_;
@@ -165,6 +186,10 @@ private:
     RecvEndFn onRecvEndFn_;
         
     void connect_();
+
+    // A sideband as the server sends it ("USB", "LSB" or ""; see
+    // IReporter::SidebandName()).
+    static Sideband sidebandFromJson_(yyjson_val* sideband);
     
     void freqChangeImpl_(uint64_t frequency);
     void transmitImpl_(std::string const& mode, bool tx);

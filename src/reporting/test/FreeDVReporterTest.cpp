@@ -25,6 +25,7 @@ public:
     static void fireBulkUpdate(FreeDVReporter& reporter, yyjson_val* params) { reporter.onFreeDVReporterBulkUpdate_(params); }
 
     static uint64_t lastFrequency(const FreeDVReporter& reporter) { return reporter.lastFrequency_; }
+    static IReporter::Sideband sideband(const FreeDVReporter& reporter) { return reporter.sideband_; }
     static std::string mode(const FreeDVReporter& reporter) { return reporter.mode_; }
     static bool tx(const FreeDVReporter& reporter) { return reporter.tx_; }
     static std::string message(const FreeDVReporter& reporter) { return reporter.message_; }
@@ -290,6 +291,137 @@ bool testFreqChangeHandler()
         R"({"sid":"s","last_update":"u","callsign":"K6AQ","grid_square":"DM12kw","freq":14236000.5})",
         [&](yyjson_val* root) { FreeDVReporterTest::fireFreqChange(reporter, root); });
     result &= (calls == 1);
+
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    return result;
+}
+
+bool testSidebandHandler()
+{
+    std::cout << "Test 6a (freq_change sideband dispatch): ";
+
+    FreeDVReporter reporter("localhost", "N1DQ", "CN98", "FreeDV Test", false);
+
+    std::vector<std::pair<std::string, IReporter::Sideband>> got;
+    int freqCalls = 0;
+    reporter.setOnFrequencyChangeFn([&](std::string, std::string, std::string, std::string, uint64_t) { freqCalls++; });
+    reporter.setOnSidebandChangeFn([&](std::string sid, IReporter::Sideband sideband) {
+        got.emplace_back(sid, sideband);
+    });
+
+    auto fire = [&](const char* json) {
+        withParsedJson(json, [&](yyjson_val* root) { FreeDVReporterTest::fireFreqChange(reporter, root); });
+    };
+
+    bool result = true;
+    fire(R"({"sid":"s1","last_update":"u","callsign":"K6AQ","grid_square":"DM12kw","freq":14236000,"sideband":"USB"})");
+    fire(R"({"sid":"s2","last_update":"u","callsign":"VK3TPM","grid_square":"QF22","freq":7177000,"sideband":"LSB"})");
+    fire(R"({"sid":"s3","last_update":"u","callsign":"W1AW","grid_square":"FN31","freq":3625000,"sideband":""})");
+    fire(R"({"sid":"s4","last_update":"u","callsign":"W1AW","grid_square":"FN31","freq":3625000,"sideband":"CW"})");
+    result &= (got.size() == 4);
+    result &= (got.size() == 4 && got[0] == std::make_pair(std::string("s1"), IReporter::Sideband::USB));
+    result &= (got.size() == 4 && got[1] == std::make_pair(std::string("s2"), IReporter::Sideband::LSB));
+    result &= (got.size() == 4 && got[2].second == IReporter::Sideband::UNKNOWN);
+    result &= (got.size() == 4 && got[3].second == IReporter::Sideband::UNKNOWN);
+
+    // A server from before the sideband was reported doesn't send it: the
+    // frequency still gets through, but nothing is said about the sideband.
+    fire(R"({"sid":"s1","last_update":"u","callsign":"K6AQ","grid_square":"DM12kw","freq":14240000})");
+    fire(R"({"sid":"s1","last_update":"u","callsign":"K6AQ","grid_square":"DM12kw","freq":14240000,"sideband":1})");
+    fire(R"({"sid":"s1","last_update":"u","callsign":"K6AQ","grid_square":"DM12kw","freq":-1,"sideband":"USB"})");
+    result &= (got.size() == 4);
+    result &= (freqCalls == 6);
+
+    // Nor for a message the frequency's handler refuses for any other field:
+    // the sideband's never heard of without the frequency it's on.
+    fire(R"({"sid":"s1","last_update":"u","callsign":"K6AQ","freq":14236000,"sideband":"USB"})");
+    fire(R"({"sid":"s1","last_update":"u","grid_square":"DM12kw","freq":14236000,"sideband":"USB"})");
+    fire(R"({"sid":"s1","callsign":"K6AQ","grid_square":"DM12kw","freq":14236000,"sideband":"USB"})");
+    fire(R"({"last_update":"u","callsign":"K6AQ","grid_square":"DM12kw","freq":14236000,"sideband":"USB"})");
+    fire(R"({"sid":"s1","last_update":"u","callsign":"K6AQ","grid_square":5,"freq":14236000,"sideband":"USB"})");
+    fire(R"({"sid":"s1","last_update":"u","callsign":"K6AQ","grid_square":"DM12kw","sideband":"USB"})");
+    result &= (got.size() == 4);
+    result &= (freqCalls == 6);
+
+    // And with no frequency handler at all, the sideband's still only heard
+    // of for a whole message.
+    reporter.setOnFrequencyChangeFn(FreeDVReporter::FrequencyChangeFn());
+    fire(R"({"sid":"s5","last_update":"u","callsign":"K6AQ","freq":14236000,"sideband":"USB"})");
+    result &= (got.size() == 4);
+    fire(R"({"sid":"s5","last_update":"u","callsign":"K6AQ","grid_square":"DM12kw","freq":14236000,"sideband":"USB"})");
+    result &= (got.size() == 5 && got[4] == std::make_pair(std::string("s5"), IReporter::Sideband::USB));
+
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    return result;
+}
+
+bool testSidebandSavedAndSentWithFrequency()
+{
+    std::cout << "Test 6b (sideband saved before connecting, unchanged sideband ignored): ";
+
+    FreeDVReporter reporter("localhost", "N1DQ", "CN98", "FreeDV Test", false);
+
+    bool result = (FreeDVReporterTest::sideband(reporter) == IReporter::Sideband::UNKNOWN);
+
+    // Through the IReporter interface, as FreeDV calls it for every reporter.
+    IReporter& asReporter = reporter;
+    reporter.freqChange(7177000);
+    asReporter.sidebandChange(IReporter::Sideband::LSB);
+    result &= (FreeDVReporterTest::sideband(reporter) == IReporter::Sideband::LSB);
+    result &= (FreeDVReporterTest::lastFrequency(reporter) == 7177000ULL);
+
+    asReporter.sidebandChange(IReporter::Sideband::UNKNOWN);
+    result &= (FreeDVReporterTest::sideband(reporter) == IReporter::Sideband::UNKNOWN);
+
+    // Not reported with an invalid callsign, as with the frequency.
+    FreeDVReporter invalid("localhost", "", "CN98", "FreeDV Test", false);
+    invalid.sidebandChange(IReporter::Sideband::USB);
+    result &= (FreeDVReporterTest::sideband(invalid) == IReporter::Sideband::UNKNOWN);
+
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    return result;
+}
+
+bool testQsyRequestWithSideband()
+{
+    std::cout << "Test 6c (qsy_request with the requester's sideband): ";
+
+    FreeDVReporter reporter("localhost", "N1DQ", "CN98", "FreeDV Test", false);
+
+    int plainCalls = 0;
+    reporter.setOnQSYRequestFn([&](std::string, uint64_t, std::string) { plainCalls++; });
+
+    std::vector<IReporter::Sideband> got;
+    std::vector<uint64_t> gotFreq;
+    reporter.setOnQSYRequestWithSidebandFn([&](std::string callsign, uint64_t freq, std::string message, IReporter::Sideband sideband) {
+        if (callsign == "K6AQ" && message == "QSY?")
+        {
+            got.push_back(sideband);
+            gotFreq.push_back(freq);
+        }
+    });
+
+    auto fire = [&](const char* json) {
+        withParsedJson(json, [&](yyjson_val* root) { FreeDVReporterTest::fireQsyRequest(reporter, root); });
+    };
+
+    fire(R"({"callsign":"K6AQ","frequency":7100000,"message":"QSY?","sideband":"LSB"})");
+    fire(R"({"callsign":"K6AQ","frequency":14236000,"message":"QSY?","sideband":"USB"})");
+    fire(R"({"callsign":"K6AQ","frequency":14236000,"message":"QSY?","sideband":""})");
+    fire(R"({"callsign":"K6AQ","frequency":14236000,"message":"QSY?","sideband":"AM"})");
+    fire(R"({"callsign":"K6AQ","frequency":14236000,"message":"QSY?","sideband":5})");
+    // From a server that doesn't pass the sideband on.
+    fire(R"({"callsign":"K6AQ","frequency":14236000,"message":"QSY?"})");
+    // Still refused when the rest isn't right.
+    fire(R"({"callsign":"K6AQ","frequency":-1,"message":"QSY?","sideband":"USB"})");
+
+    bool result = true;
+    result &= (got == std::vector<IReporter::Sideband>{
+        IReporter::Sideband::LSB, IReporter::Sideband::USB, IReporter::Sideband::UNKNOWN,
+        IReporter::Sideband::UNKNOWN, IReporter::Sideband::UNKNOWN, IReporter::Sideband::UNKNOWN });
+    result &= (gotFreq.size() == 6 && gotFreq[0] == 7100000ULL);
+    // Called instead of the plain QsyRequestFn.
+    result &= (plainCalls == 0);
 
     std::cout << (result ? "PASS" : "FAIL") << "\n";
     return result;
@@ -734,6 +866,9 @@ int main(int argc, char** argv)
     result &= testTxReportHandler();
     result &= testRxReportHandler();
     result &= testFreqChangeHandler();
+    result &= testSidebandHandler();
+    result &= testSidebandSavedAndSentWithFrequency();
+    result &= testQsyRequestWithSideband();
     result &= testMessageAndQsyHandlers();
     result &= testBulkUpdateToleratesMalformedEntries();
     result &= testStateSavedBeforeConnectionAndReplayedOnSuccess();
