@@ -44,6 +44,8 @@
 namespace
 {
 
+const char* CSV_HEADER = "date,time,callsign,mode,frequency_hz,snr_db,sideband";
+
 // Quotes a field (RFC 4180) if it contains a comma, quote or line break.
 // Callsigns come from over-the-air text, whose character set includes ','.
 std::string csvField(std::string const& value)
@@ -70,6 +72,8 @@ std::string csvField(std::string const& value)
 
 CsvReporter::CsvReporter(std::string const& filename)
     : file_(filename, std::ios::app)
+    , hasSidebandColumn_(true)
+    , sideband_(Sideband::UNKNOWN)
 {
     if (!file_.is_open())
     {
@@ -86,8 +90,26 @@ CsvReporter::CsvReporter(std::string const& filename)
     file_.seekp(0, std::ios::end);
     if (file_.tellp() == 0)
     {
-        file_ << "date,time,callsign,mode,frequency_hz,snr_db\n";
+        file_ << CSV_HEADER << "\n";
     }
+    else
+    {
+        // A file started before the sideband column was added has a header
+        // without it: records go on matching that header.
+        std::ifstream existing(filename);
+        std::string header;
+        std::getline(existing, header);
+        if (!header.empty() && header.back() == '\r')
+        {
+            header.pop_back();
+        }
+        hasSidebandColumn_ = (header == CSV_HEADER);
+    }
+}
+
+void CsvReporter::sidebandChange(Sideband sideband)
+{
+    sideband_.store(sideband, std::memory_order_relaxed);
 }
 
 void CsvReporter::freqChange(uint64_t) {}
@@ -127,6 +149,11 @@ void CsvReporter::addReceiveRecord(std::string callsign, std::string mode, uint6
           << csvField(callsign) << ","
           << csvField(mode) << ","
           << frequency << ","
-          << snrInt << "\n";
+          << snrInt;
+    if (hasSidebandColumn_)
+    {
+        file_ << "," << SidebandName(sideband_.load(std::memory_order_relaxed));
+    }
+    file_ << "\n";
     file_.flush();
 }

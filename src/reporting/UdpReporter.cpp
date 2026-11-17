@@ -46,6 +46,7 @@ UdpReporter::UdpReporter(std::string address, int port)
     : address_(std::move(address))
     , port_(port)
     , currentFrequency_(0)
+    , currentSideband_(Sideband::UNKNOWN)
 {
     // Open a send-only socket directed at the configured address/port.
     // Passing an empty bind host with the destination IP lets UdpHandler
@@ -64,6 +65,11 @@ UdpReporter::~UdpReporter()
 void UdpReporter::freqChange(uint64_t frequency)
 {
     currentFrequency_ = frequency;
+}
+
+void UdpReporter::sidebandChange(Sideband sideband)
+{
+    currentSideband_.store(sideband, std::memory_order_relaxed);
 }
 
 void UdpReporter::transmit(std::string /*mode*/, bool /*tx*/) {}
@@ -92,6 +98,10 @@ void UdpReporter::addReceiveRecord(std::string callsign, std::string mode,
     yyjson_mut_obj_add_str( doc, root, "mode",         mode.c_str());
     yyjson_mut_obj_add_int( doc, root, "snr",          snr);
     yyjson_mut_obj_add_uint(doc, root, "frequency_hz", frequency);
+    // The sideband the radio was on: "USB", "LSB", or "" if not known.
+    // (Added to version 1 records; listeners that don't know it ignore it.)
+    yyjson_mut_obj_add_str( doc, root, "sideband",
+                            SidebandName(currentSideband_.load(std::memory_order_relaxed)));
 
     size_t jsonLen = 0;
     char* jsonStr = yyjson_mut_write(doc, 0, &jsonLen);

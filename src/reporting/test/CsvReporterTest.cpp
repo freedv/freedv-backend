@@ -16,12 +16,15 @@ namespace {
 const std::string TEST_FILE_NEW_PATH = testMakeTempFile("csvnew");
 const std::string TEST_FILE_APPEND_PATH = testMakeTempFile("csvapp");
 const std::string TEST_FILE_QUOTED_PATH = testMakeTempFile("csvquo");
+const std::string TEST_FILE_SIDEBAND_PATH = testMakeTempFile("csvsb");
 const char* TEST_FILE_NEW = TEST_FILE_NEW_PATH.c_str();
 const char* TEST_FILE_APPEND = TEST_FILE_APPEND_PATH.c_str();
 const char* TEST_FILE_QUOTED = TEST_FILE_QUOTED_PATH.c_str();
 const char* TEST_FILE_BAD = "/definitely/not/a/valid/dir/csv_reporter_test_bad.csv";
 
-const char* CSV_HEADER = "date,time,callsign,mode,frequency_hz,snr_db";
+const char* CSV_HEADER = "date,time,callsign,mode,frequency_hz,snr_db,sideband";
+// As files were started before the sideband column was added.
+const char* CSV_HEADER_WITHOUT_SIDEBAND = "date,time,callsign,mode,frequency_hz,snr_db";
 
 std::vector<std::string> readFileLines(const char* path)
 {
@@ -137,8 +140,8 @@ bool testNewFileWritesHeaderOnce()
     if (lines.size() == 2)
     {
         auto fields = splitCsv(lines[1]);
-        result &= (fields.size() == 6);
-        if (fields.size() == 6)
+        result &= (fields.size() == 7);
+        if (fields.size() == 7)
         {
             result &= (fields[0] == todayUtc());
             result &= isValidTimeField(fields[1]);
@@ -146,6 +149,7 @@ bool testNewFileWritesHeaderOnce()
             result &= (fields[3] == "1600X");
             result &= (fields[4] == "14236000");
             result &= (fields[5] == "-5");
+            result &= (fields[6] == ""); // sideband not known
         }
     }
 
@@ -163,12 +167,15 @@ bool testAppendToExistingFileNoDuplicateHeader()
 
     {
         std::ofstream seed(TEST_FILE_APPEND);
-        seed << CSV_HEADER << "\n";
+        seed << CSV_HEADER_WITHOUT_SIDEBAND << "\n";
         seed << "2026-01-01,00:00:00,OLD001,1600X,14000000,1\n";
     }
 
     {
         CsvReporter reporter(TEST_FILE_APPEND);
+        // (A file without the sideband column keeps to its columns, even
+        // when the sideband's known.)
+        reporter.sidebandChange(IReporter::Sideband::USB);
         // Constructor alone must not modify the file.
         auto untouched = readFileLines(TEST_FILE_APPEND);
         result &= (untouched.size() == 2);
@@ -182,7 +189,7 @@ bool testAppendToExistingFileNoDuplicateHeader()
     int headerCount = 0;
     for (const auto& line : lines)
     {
-        if (line == CSV_HEADER) headerCount++;
+        if (line == CSV_HEADER || line == CSV_HEADER_WITHOUT_SIDEBAND) headerCount++;
     }
     result &= (headerCount == 1);
 
@@ -241,12 +248,49 @@ bool testFieldsWithSpecialCharactersAreQuoted()
     if (lines.size() == 3)
     {
         auto first = splitCsv(lines[1]);
-        result &= (first.size() == 6) && first[2] == "K6,AQ" && first[3] == "1600X" && first[4] == "14236000";
+        result &= (first.size() == 7) && first[2] == "K6,AQ" && first[3] == "1600X" && first[4] == "14236000";
         auto second = splitCsv(lines[2]);
-        result &= (second.size() == 6) && second[2] == "N1\"DQ" && second[3] == "RADE,V1" && second[5] == "-2";
+        result &= (second.size() == 7) && second[2] == "N1\"DQ" && second[3] == "RADE,V1" && second[5] == "-2";
     }
 
     std::remove(TEST_FILE_QUOTED);
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    return result;
+}
+
+bool testSidebandColumn()
+{
+    std::cout << "Test 5 (the radio's sideband in each record, in a file with the column): ";
+
+    std::remove(TEST_FILE_SIDEBAND_PATH.c_str());
+    {
+        CsvReporter reporter(TEST_FILE_SIDEBAND_PATH);
+        reporter.sidebandChange(IReporter::Sideband::LSB);
+        reporter.addReceiveRecord("VK3TPM", "RADEV1", 7177000, 4);
+        reporter.sidebandChange(IReporter::Sideband::USB);
+        reporter.addReceiveRecord("K6AQ", "RADEV1", 14236000, 9);
+    }
+    {
+        // Reopened: still the file with the column.
+        CsvReporter reporter(TEST_FILE_SIDEBAND_PATH);
+        reporter.sidebandChange(IReporter::Sideband::UNKNOWN);
+        reporter.addReceiveRecord("N1DQ", "RADEV1", 14236000, 2);
+    }
+
+    auto lines = readFileLines(TEST_FILE_SIDEBAND_PATH.c_str());
+    bool result = (lines.size() == 4);
+    if (lines.size() == 4)
+    {
+        result &= (lines[0] == CSV_HEADER);
+        auto first = splitCsv(lines[1]);
+        auto second = splitCsv(lines[2]);
+        auto third = splitCsv(lines[3]);
+        result &= (first.size() == 7) && first[2] == "VK3TPM" && first[6] == "LSB";
+        result &= (second.size() == 7) && second[2] == "K6AQ" && second[6] == "USB";
+        result &= (third.size() == 7) && third[2] == "N1DQ" && third[6] == "";
+    }
+
+    std::remove(TEST_FILE_SIDEBAND_PATH.c_str());
     std::cout << (result ? "PASS" : "FAIL") << "\n";
     return result;
 }
@@ -261,6 +305,7 @@ int main(int argc, char** argv)
     result &= testAppendToExistingFileNoDuplicateHeader();
     result &= testUnopenableFileIsNoOp();
     result &= testFieldsWithSpecialCharactersAreQuoted();
+    result &= testSidebandColumn();
 
     return result ? 0 : -1;
 }

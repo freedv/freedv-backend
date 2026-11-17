@@ -41,9 +41,36 @@
 class IReporter
 {
 public:
+    // The sideband the radio is on, where that's known (i.e. from rig
+    // control).
+    enum class Sideband
+    {
+        UNKNOWN,
+        USB,
+        LSB,
+    };
+
     virtual ~IReporter() = default;
 
     virtual void freqChange(uint64_t frequency) = 0;
+
+    // Reporters that don't report the sideband ignore it.
+    virtual void sidebandChange(Sideband) { }
+
+    // The sideband as the reporters write it: "USB", "LSB", or "" if not
+    // known.
+    static const char* SidebandName(Sideband sideband)
+    {
+        switch (sideband)
+        {
+            case Sideband::USB:
+                return "USB";
+            case Sideband::LSB:
+                return "LSB";
+            default:
+                return "";
+        }
+    }
     virtual void transmit(std::string mode, bool tx) = 0;
     
     virtual void inAnalogMode(bool inAnalog) = 0;

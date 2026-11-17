@@ -35,6 +35,7 @@
 //
 //=========================================================================
 
+#include <atomic>
 #include <string>
 #include "IReporter.h"
 #include "../util/UdpHandler.h"
@@ -48,6 +49,10 @@ public:
     virtual ~UdpReporter();
 
     virtual void freqChange(uint64_t frequency) override;
+
+    // The sideband the radio's on, included in each record sent from then
+    // on (as "sideband": "USB", "LSB" or "" if not known).
+    virtual void sidebandChange(Sideband sideband) override;
     virtual void transmit(std::string mode, bool tx) override;
     virtual void inAnalogMode(bool inAnalog) override;
 
@@ -65,6 +70,7 @@ private:
     std::string address_;
     int         port_;
     uint64_t    currentFrequency_;
+    std::atomic<Sideband> currentSideband_;
 
     static constexpr int JSON_MESSAGE_VERSION = 1;
 };
