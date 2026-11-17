@@ -44,6 +44,8 @@
 namespace
 {
 
+const char* CSV_HEADER = "date,time,callsign,mode,frequency_hz,snr_db,sideband";
+
 // Quotes a field (RFC 4180) if it contains a comma, quote or line break.
 // Callsigns come from over-the-air text, whose character set includes ','.
 std::string csvField(std::string const& value)
@@ -65,13 +67,6 @@ std::string csvField(std::string const& value)
     quoted += '"';
     return quoted;
 }
-
-} // namespace
-
-namespace
-{
-
-const char* CSV_HEADER = "date,time,callsign,mode,frequency_hz,snr_db,sideband";
 
 } // namespace
 

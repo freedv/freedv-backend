@@ -359,8 +359,10 @@ date,time,callsign,mode,frequency_hz,snr_db,sideband
 
 A file started before the `sideband` column was added has a header without it
 (`date,time,callsign,mode,frequency_hz,snr_db`), and records appended to it keep to those
-six columns, so that its header and records still match. A reader that wants to handle
-both should go by the header, or treat the seventh column as optional.
+six columns, so that its header and records still match. To have the column, move or
+rename the old log: `CsvReporter` then starts a new file, with the new header. A reader
+that wants to handle both should go by the header, or treat the seventh column as
+optional.
 
 Of `IReporter`'s other methods, `sidebandChange()` caches the sideband; `freqChange()`,
 `transmit()`, `inAnalogMode()`, and `send()` do nothing.
