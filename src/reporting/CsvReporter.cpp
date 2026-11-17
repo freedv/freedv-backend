@@ -36,12 +36,8 @@
 #include <cstdlib>
 #include <cinttypes>
 #include <ctime>
-#include <filesystem>
 #include <iomanip>
-#include <iterator>
 #include <sstream>
-#include <system_error>
-#include <vector>
 #include "CsvReporter.h"
 #include "../util/logging/ulog.h"
 
@@ -77,161 +73,13 @@ namespace
 
 const char* CSV_HEADER = "date,time,callsign,mode,frequency_hz,snr_db,sideband";
 
-// The header of files started before the sideband column was added.
-const char* CSV_HEADER_WITHOUT_SIDEBAND = "date,time,callsign,mode,frequency_hz,snr_db";
-
-// A file's first line, without a trailing '\r' (or "" if it can't be read).
-std::string readHeader(std::string const& filename)
-{
-    std::ifstream existing(filename);
-    std::string header;
-    std::getline(existing, header);
-    if (!header.empty() && header.back() == '\r')
-    {
-        header.pop_back();
-    }
-    return header;
-}
-
-// One record of a CSV file, and how many fields it has.
-struct CsvRecord
-{
-    std::string text;
-    int fields;
-};
-
-// Splits CSV text into its records (RFC 4180: a quoted field can hold
-// commas, quotes and line breaks, as callsigns heard over the air can),
-// without their line endings.
-std::vector<CsvRecord> splitRecords(std::string const& contents)
-{
-    std::vector<CsvRecord> records;
-    std::string current;
-    int fields = 1;
-    bool quoted = false;
-    for (char c : contents)
-    {
-        if (c == '"')
-        {
-            // ("" inside a quoted field toggles twice, staying quoted.)
-            quoted = !quoted;
-        }
-        else if (c == ',' && !quoted)
-        {
-            fields++;
-        }
-        else if (c == '\n' && !quoted)
-        {
-            if (!current.empty() && current.back() == '\r')
-            {
-                current.pop_back();
-            }
-            records.push_back({current, fields});
-            current.clear();
-            fields = 1;
-            continue;
-        }
-        current += c;
-    }
-    if (!current.empty())
-    {
-        // A last record without a line ending.
-        records.push_back({current, fields});
-    }
-    return records;
-}
-
 } // namespace
 
-bool CsvReporter::upgradeToSidebandColumn_(std::string const& filename)
-{
-    namespace fs = std::filesystem;
-    std::error_code ec;
-
-    std::string contents;
-    {
-        std::ifstream original(filename, std::ios::binary);
-        if (!original)
-        {
-            return false;
-        }
-        contents.assign(std::istreambuf_iterator<char>(original), std::istreambuf_iterator<char>());
-        if (original.bad())
-        {
-            return false;
-        }
-    }
-
-    auto records = splitRecords(contents);
-    if (records.empty() || records[0].text != CSV_HEADER_WITHOUT_SIDEBAND)
-    {
-        return false;
-    }
-
-    // The backup: a name not already in use, so as not to replace one kept
-    // from before.
-    std::string backup = filename + ".bak";
-    for (int index = 1; fs::exists(backup, ec) && index < 100; index++)
-    {
-        backup = filename + ".bak." + std::to_string(index);
-    }
-    if (fs::exists(backup, ec) || !fs::copy_file(filename, backup, ec))
-    {
-        log_warn("CsvReporter: could not back up %s to add the sideband column", filename.c_str());
-        return false;
-    }
-
-    // Written in full alongside, then put in place of the original, so that
-    // the log is never left half written.
-    std::string temp = filename + ".tmp";
-    bool written = false;
-    {
-        // (In text mode, as records are added to the file afterwards: on
-        // Windows, lines then end in CRLF throughout.)
-        std::ofstream upgraded(temp, std::ios::trunc);
-        if (upgraded)
-        {
-            upgraded << CSV_HEADER << "\n";
-            for (size_t index = 1; index < records.size(); index++)
-            {
-                // Records of the old six columns get an empty sideband; any
-                // other line (there shouldn't be any) is kept as it was
-                // rather than guessed at.
-                upgraded << records[index].text << (records[index].fields == 6 ? "," : "") << "\n";
-            }
-            upgraded.flush();
-            written = upgraded.good();
-        }
-    }
-
-    if (!written || (fs::rename(temp, filename, ec), ec))
-    {
-        // E.g. the folder can't be written to, or (on Windows) another
-        // program has the log open.
-        log_warn("CsvReporter: could not add the sideband column to %s: %s", filename.c_str(),
-                 written ? ec.message().c_str() : "the new copy couldn't be written");
-        fs::remove(temp, ec);
-        fs::remove(backup, ec);
-        return false;
-    }
-
-    log_info("CsvReporter: added the sideband column to %s (the original is kept as %s)",
-             filename.c_str(), backup.c_str());
-    return true;
-}
-
 CsvReporter::CsvReporter(std::string const& filename)
-    : hasSidebandColumn_(true)
+    : file_(filename, std::ios::app)
+    , hasSidebandColumn_(true)
     , sideband_(Sideband::UNKNOWN)
 {
-    // Before opening it to add to: a file from before the sideband column
-    // was added is given it, if it can be.
-    if (readHeader(filename) == CSV_HEADER_WITHOUT_SIDEBAND)
-    {
-        upgradeToSidebandColumn_(filename);
-    }
-
-    file_.open(filename, std::ios::app);
     if (!file_.is_open())
     {
         log_warn("CsvReporter: could not open log file %s", filename.c_str());
@@ -251,9 +99,16 @@ CsvReporter::CsvReporter(std::string const& filename)
     }
     else
     {
-        // A file without the sideband column that couldn't be given it (see
-        // above): records go on matching its header.
-        hasSidebandColumn_ = (readHeader(filename) == CSV_HEADER);
+        // A file started before the sideband column was added has a header
+        // without it: records go on matching that header.
+        std::ifstream existing(filename);
+        std::string header;
+        std::getline(existing, header);
+        if (!header.empty() && header.back() == '\r')
+        {
+            header.pop_back();
+        }
+        hasSidebandColumn_ = (header == CSV_HEADER);
     }
 }
 

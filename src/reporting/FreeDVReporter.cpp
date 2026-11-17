@@ -32,8 +32,6 @@
 //
 //=========================================================================
 
-#include <cstring>
-
 #include "FreeDVReporter.h"
 #include "../util/SocketIoClient.h"
 #include "../os/os_interface.h"
@@ -588,43 +586,42 @@ void FreeDVReporter::onFreeDVReporterReceiveReport_(yyjson_val* msgParams)
 void FreeDVReporter::onFreeDVReporterFrequencyChange_(yyjson_val* msgParams)
 {
     std::unique_lock<std::mutex> lk(objMutex_);
+    auto sid = yyjson_obj_get(msgParams, "sid");
+    auto lastUpdate = yyjson_obj_get(msgParams, "last_update");
+    auto callsign = yyjson_obj_get(msgParams, "callsign");
+    auto gridSquare = yyjson_obj_get(msgParams, "grid_square");
+    auto frequency = yyjson_obj_get(msgParams, "freq");
+    auto sidebandJson = yyjson_obj_get(msgParams, "sideband");
+
+    // Only call the event handlers if we received the correct data types
+    // for the items in the message: the sideband's handler, like the
+    // frequency's, only for a message that's whole, so that it never hears
+    // about a station the frequency's handler wasn't told of.
+    if (!yyjson_is_str(sid) ||
+        !yyjson_is_str(lastUpdate) ||
+        !yyjson_is_str(callsign) ||
+        !yyjson_is_str(gridSquare) ||
+        !yyjson_is_uint(frequency))
+    {
+        return;
+    }
+
     if (onFrequencyChangeFn_)
     {
-        auto sid = yyjson_obj_get(msgParams, "sid");
-        auto lastUpdate = yyjson_obj_get(msgParams, "last_update");
-        auto callsign = yyjson_obj_get(msgParams, "callsign");
-        auto gridSquare = yyjson_obj_get(msgParams, "grid_square");
-        auto frequency = yyjson_obj_get(msgParams, "freq");
-    
-        // Only call event handler if we received the correct data types
-        // for the items in the message.
-        if (yyjson_is_str(sid) &&
-            yyjson_is_str(lastUpdate) &&
-            yyjson_is_str(callsign) &&
-            yyjson_is_str(gridSquare) &&
-            yyjson_is_uint(frequency))
-        {
-            onFrequencyChangeFn_(
-                yyjson_get_str(sid),
-                yyjson_get_str(lastUpdate),
-                yyjson_get_str(callsign),
-                yyjson_get_str(gridSquare),
-                yyjson_get_uint(frequency)
-            );
-        }
+        onFrequencyChangeFn_(
+            yyjson_get_str(sid),
+            yyjson_get_str(lastUpdate),
+            yyjson_get_str(callsign),
+            yyjson_get_str(gridSquare),
+            yyjson_get_uint(frequency)
+        );
     }
 
     // Only from servers that report it: an older one leaves whatever the
     // station was last said to be on as it was.
-    if (onSidebandChangeFn_)
+    if (onSidebandChangeFn_ && yyjson_is_str(sidebandJson))
     {
-        auto sid = yyjson_obj_get(msgParams, "sid");
-        auto frequency = yyjson_obj_get(msgParams, "freq");
-        auto sidebandJson = yyjson_obj_get(msgParams, "sideband");
-        if (yyjson_is_str(sid) && yyjson_is_uint(frequency) && yyjson_is_str(sidebandJson))
-        {
-            onSidebandChangeFn_(yyjson_get_str(sid), sidebandFromJson_(sidebandJson));
-        }
+        onSidebandChangeFn_(yyjson_get_str(sid), sidebandFromJson_(sidebandJson));
     }
 }
 
@@ -731,12 +728,12 @@ IReporter::Sideband FreeDVReporter::sidebandFromJson_(yyjson_val* sideband)
 {
     // Anything but a string saying USB or LSB (including nothing at all,
     // from a server that doesn't pass it on) is not known.
-    const char* text = yyjson_get_str(sideband);
-    if (text != nullptr && strcmp(text, "USB") == 0)
+    // (yyjson_equals_str() is false for NULL or anything but a string.)
+    if (yyjson_equals_str(sideband, "USB"))
     {
         return Sideband::USB;
     }
-    if (text != nullptr && strcmp(text, "LSB") == 0)
+    if (yyjson_equals_str(sideband, "LSB"))
     {
         return Sideband::LSB;
     }

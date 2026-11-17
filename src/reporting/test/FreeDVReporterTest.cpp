@@ -332,6 +332,25 @@ bool testSidebandHandler()
     result &= (got.size() == 4);
     result &= (freqCalls == 6);
 
+    // Nor for a message the frequency's handler refuses for any other field:
+    // the sideband's never heard of without the frequency it's on.
+    fire(R"({"sid":"s1","last_update":"u","callsign":"K6AQ","freq":14236000,"sideband":"USB"})");
+    fire(R"({"sid":"s1","last_update":"u","grid_square":"DM12kw","freq":14236000,"sideband":"USB"})");
+    fire(R"({"sid":"s1","callsign":"K6AQ","grid_square":"DM12kw","freq":14236000,"sideband":"USB"})");
+    fire(R"({"last_update":"u","callsign":"K6AQ","grid_square":"DM12kw","freq":14236000,"sideband":"USB"})");
+    fire(R"({"sid":"s1","last_update":"u","callsign":"K6AQ","grid_square":5,"freq":14236000,"sideband":"USB"})");
+    fire(R"({"sid":"s1","last_update":"u","callsign":"K6AQ","grid_square":"DM12kw","sideband":"USB"})");
+    result &= (got.size() == 4);
+    result &= (freqCalls == 6);
+
+    // And with no frequency handler at all, the sideband's still only heard
+    // of for a whole message.
+    reporter.setOnFrequencyChangeFn(FreeDVReporter::FrequencyChangeFn());
+    fire(R"({"sid":"s5","last_update":"u","callsign":"K6AQ","freq":14236000,"sideband":"USB"})");
+    result &= (got.size() == 4);
+    fire(R"({"sid":"s5","last_update":"u","callsign":"K6AQ","grid_square":"DM12kw","freq":14236000,"sideband":"USB"})");
+    result &= (got.size() == 5 && got[4] == std::make_pair(std::string("s5"), IReporter::Sideband::USB));
+
     std::cout << (result ? "PASS" : "FAIL") << "\n";
     return result;
 }

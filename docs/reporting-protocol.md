@@ -53,7 +53,7 @@ WebSocket framing over an iostream-style transport; the actual bytes on the wire
 still TLS-wrapped when TLS is enabled.
 
 * Default port: 80, or 443 when `useSecureConnection_` is true and TLS support is
-  compiled in (`FreeDVReporter.cpp:362-379`).
+  compiled in (`FreeDVReporter.cpp:360-377`).
 * `hostname` may be `host` or `host:port`; an explicit port in the string overrides the
   default.
 * Default server: `qso.freedv.org` (`FREEDV_REPORTER_DEFAULT_HOSTNAME`,
@@ -100,12 +100,12 @@ So a client emitting `tx_report` sends the literal WebSocket text frame:
 
 Authentication happens as the payload of the Socket.IO `40` (namespace CONNECT) packet,
 sent immediately after the WebSocket opens (`SocketIoClient.cpp:157-162`,
-`FreeDVReporter::connect_()`, `FreeDVReporter.cpp:317-401`). There is no separate
+`FreeDVReporter::connect_()`, `FreeDVReporter.cpp:315-399`). There is no separate
 login step and no token — the "auth" is simply this JSON object, built once at
 `connect()` time:
 
 If the client has **no callsign or no grid square** configured
-(`isValidForReporting()` is false — `FreeDVReporter.cpp:312-315`), it authenticates
+(`isValidForReporting()` is false — `FreeDVReporter.cpp:310-313`), it authenticates
 read-only:
 ```json
 {
@@ -187,6 +187,13 @@ before invoking the registered callback; a malformed message is silently dropped
 | `message_update` | `{"sid", "last_update", "message"}` | Another station's free-text status message changed. |
 | `qsy_request` | `{"callsign", "frequency": <uint64>, "message", "sideband"}` | *This* client is being asked (by whoever sent `dest_sid` targeting it) to move to `frequency`, on the requester's `sideband` where given. No `sid` — it's addressed to the recipient directly. Delivered to the `QsyRequestWithSidebandFn` (`setOnQSYRequestWithSidebandFn()`, with the sideband as `IReporter::Sideband`; `UNKNOWN` if missing) if one is set, otherwise to the `QsyRequestFn` (`setOnQSYRequestFn()`). |
 | `bulk_update` | `[[eventName, eventArgs], ...]` | A batch of the above events (e.g. the initial roster snapshot right after connecting), replayed locally one at a time through the same handlers as if each had arrived individually. |
+
+`IReporter::Sideband::UNKNOWN` means only that no sideband is known: the station didn't
+say (e.g. it has no rig control, or runs an older version of FreeDV), or the server
+didn't pass it on — a `qsy_request` can't tell these apart. A client should take it as
+"no opinion", not as a sideband to go to: e.g. on accepting a `qsy_request`, keep to
+the sideband it would otherwise use on that frequency. The sideband handler is only
+called for a `freq_change` the frequency handler accepts too, after it.
 
 ### 1.6 Minimal client example
 
@@ -351,24 +358,9 @@ date,time,callsign,mode,frequency_hz,snr_db,sideband
 | `sideband` | The sideband the radio was on, as last given to `sidebandChange()`: `USB`, `LSB`, or empty if not known. |
 
 A file started before the `sideband` column was added has a header without it
-(`date,time,callsign,mode,frequency_hz,snr_db`). When `CsvReporter` opens such a file, it
-gives it the column (`CsvReporter::upgradeToSidebandColumn_()`):
-
-* The original is copied to `<file>.bak` first (or `<file>.bak.1`, `.bak.2`… if that name's
-  already taken, so an earlier backup is never replaced).
-* The new header, then each existing six-column record with an empty sideband added
-  (`…,-2,`), are written to `<file>.tmp`, which is then renamed over the original — so the
-  log is never left half-written. Records are read as RFC 4180 records, so a quoted comma
-  or line break in a callsign is kept intact; a record that doesn't have six fields is
-  copied as it is rather than guessed at. Line endings become those `CsvReporter` writes
-records with (the platform's own: CRLF on Windows).
-* If any of that can't be done (e.g. the folder can't be written to, or on Windows another
-  program has the file open), the temporary file and backup are removed, the file is left
-  exactly as it was, and records appended to it keep to its six columns so that its header
-  and records still match.
-
-A reader that wants to handle any file should go by the header, or treat the seventh column
-as optional.
+(`date,time,callsign,mode,frequency_hz,snr_db`), and records appended to it keep to those
+six columns, so that its header and records still match. A reader that wants to handle
+both should go by the header, or treat the seventh column as optional.
 
 Of `IReporter`'s other methods, `sidebandChange()` caches the sideband; `freqChange()`,
 `transmit()`, `inAnalogMode()`, and `send()` do nothing.
