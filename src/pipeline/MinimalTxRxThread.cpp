@@ -90,19 +90,27 @@ void MinimalTxRxThread::initializePipeline_()
     
     if (m_tx)
     {
-        auto txStep = new RADETransmitStep(rade_, encState_);
+        auto txStep = new RADETransmitStep(rade_, encState_, radeText_);
         txStep->setNarrowbandInput(inputSampleRate_ <= 8000);
-        auto agcStep = new AgcStep(txStep->getInputSampleRate());
-        auto rnnoiseStep = new RNNoiseStep();
-        pipeline_->appendPipelineStep(rnnoiseStep);
-        pipeline_->appendPipelineStep(agcStep);
+
+        if (!disableProcessing_)
+        {
+            auto agcStep = new AgcStep(txStep->getInputSampleRate());
+            auto rnnoiseStep = new RNNoiseStep();
+            pipeline_->appendPipelineStep(rnnoiseStep);
+            pipeline_->appendPipelineStep(agcStep);
+        }
+      
         pipeline_->appendPipelineStep(txStep);
         // Published once, before the pipeline that uses it can run: the UI
         // thread reads it through getTxNNomModemSamples().
         txStep_.store(txStep, std::memory_order_release);
         
-        auto levelAdjustStep = new LevelAdjustStep(outputSampleRate_, +[]() FREEDV_NONBLOCKING { return TxScaleFactor_; });
-        pipeline_->appendPipelineStep(levelAdjustStep);
+        if (!disableProcessing_)
+        {
+            auto levelAdjustStep = new LevelAdjustStep(outputSampleRate_, +[]() FREEDV_NONBLOCKING { return TxScaleFactor_; });
+            pipeline_->appendPipelineStep(levelAdjustStep);
+        }
     }
     else
     {
@@ -179,7 +187,7 @@ void* MinimalTxRxThread::Entry()
     
     // Return to normal scheduling
     helper->clearHelperRealTime();
-    
+
     return NULL;
 }
 

@@ -62,6 +62,8 @@ Total Test time (real) = 198.79 sec
 TLS support (mainly for FreeDV Reporter) is enabled by default, but can be disabled (i.e. for platforms that can't do TLS) by passing `-DDISABLE_TLS_SUPPORT=1` to `cmake`.
 Additionally, LibreSSL can be statically linked instead of the system's copy of OpenSSL by passing in `-DUSE_STATIC_LIBRESSL=1`.
 
+By default, `rade_c` is downloaded and built automatically as part of this project's build. To link against your own local build of `rade_c` instead, pass both `-DRADE_C_SOURCE_DIR=<path to rade_c checkout>` and `-DRADE_C_BINARY_DIR=<path to that checkout's build directory>` to `cmake`. The referenced build must have been produced using the same CMake options this project would otherwise pass to `rade_c` (see `cmake/BuildRADE.cmake`).
+
 ## Getting Support
 
 Please create a GitHub issue if you find a problem with this repository.

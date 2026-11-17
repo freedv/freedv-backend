@@ -40,42 +40,22 @@
 #include <cstring>
 #include <array>
 #include <random>
+#include <string>
 
-// Map codeword bits to QPSK symbols.
-static void bits_to_qpsk(const std::array<uint8_t,112>& bits, RADE_COMP syms[56])
+// Map codeword bits to BPSK symbols (bit 0 -> +1, bit 1 -> -1).
+static void bits_to_bpsk(const std::array<uint8_t,112>& bits, float syms[112])
 {
-    for (int k = 0; k < 56; k++) {
-        const uint8_t* ptr = &bits[2 * k];
-        if (*ptr == 0 && *(ptr + 1) == 0)
-        {
-            syms[k].real = 1;
-            syms[k].imag = 0;
-        }
-        else if (*ptr == 0 && *(ptr + 1) == 1)
-        {
-            syms[k].real = 0;
-            syms[k].imag = 1;
-        }
-        else if (*ptr == 1 && *(ptr + 1) == 0)
-        {
-            syms[k].real = 0;
-            syms[k].imag = -1;
-        }
-        else if (*ptr == 1 && *(ptr + 1) == 1)
-        {
-            syms[k].real = -1;
-            syms[k].imag = 0;
-        }
+    for (int k = 0; k < 112; k++) {
+        syms[k] = bits[k] ? -1.0f : 1.0f;
     }
 }
 
-// Add AWGN; return actual per-component noise variance used
-static float add_noise(RADE_COMP syms[56], float sigma, std::mt19937& rng)
+// Add AWGN; return actual per-symbol noise variance used
+static float add_noise(float syms[112], float sigma, std::mt19937& rng)
 {
     std::normal_distribution<float> nd(0.0f, sigma);
-    for (int k = 0; k < 56; k++) {
-        syms[k].real += nd(rng);
-        syms[k].imag += nd(rng);
+    for (int k = 0; k < 112; k++) {
+        syms[k] += nd(rng);
     }
     return sigma * sigma;
 }
@@ -96,17 +76,17 @@ int main()
         for (int b : cw) printf("%d", b);
         printf("\n");
 
-        // Map to QPSK
-        RADE_COMP syms[56];
-        bits_to_qpsk(cw, syms);
+        // Map to BPSK
+        float syms[112];
+        bits_to_bpsk(cw, syms);
 
         // Add very low noise (sigma=0.05, SNR ~26 dB)
         std::mt19937 rng(42);
         float sigma = 0.05f;
         add_noise(syms, sigma, rng);
 
-        float amplitudes[56];
-        for (int k = 0; k < 56; k++) amplitudes[k] = 1.0f;
+        float amplitudes[112];
+        for (int k = 0; k < 112; k++) amplitudes[k] = 1.0f;
 
         auto res = ldpc_decode(syms, amplitudes, sigma*sigma);
         printf("Converged: %s  iterations: %d\n", res.converged ? "YES" : "NO", res.iterations);
@@ -123,14 +103,22 @@ int main()
     }
 
     // --- Test 2: frame error rate sweep over Eb/N0 ---
+    //
+    // Swept down into negative Eb/N0 (i.e. lower SNR / higher noise than the
+    // code was originally characterized at) to find the actual waterfall
+    // floor for BPSK, so it can be compared against the QPSK-era floor.
     printf("=== Test 2: frame error rate vs Eb/N0 ===\n");
     printf("%6s  %6s  %6s  %6s  %6s\n", "Eb/N0", "FER", "iters", "conv", "conv_err");
 
     std::mt19937 rng(1234);
-    const int FRAMES = 200;
+    const int FRAMES = 500;
 
-    for (float ebn0_db : {0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f, 9.0f, 10.0f}) {
-        // Rate-1/2 QPSK: per-component noise variance sigma^2 = 1 / (2 * Eb/N0 * rate)
+    float waterfall_fer10 = NAN;  // lowest Eb/N0 with FER <= 0.10
+    float waterfall_fer01 = NAN;  // lowest Eb/N0 with FER <= 0.01
+
+    for (float ebn0_db : {-6.0f, -5.0f, -4.0f, -3.0f, -2.0f, -1.0f,
+                           0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f, 9.0f, 10.0f}) {
+        // Rate-1/2 BPSK: per-symbol noise variance sigma^2 = 1 / (2 * Eb/N0 * rate)
         float ebn0   = std::pow(10.0f, ebn0_db / 10.0f);
         float sigma2 = 1.0f / (2.0f * ebn0);
         float sigma  = std::sqrt(sigma2);
@@ -146,8 +134,8 @@ int main()
 
             auto cw = ldpc_encode(msg);
 
-            RADE_COMP syms[56];
-            bits_to_qpsk(cw, syms);
+            float syms[112];
+            bits_to_bpsk(cw, syms);
             add_noise(syms, sigma, rng);
 
             float amplitudes[112];
@@ -163,48 +151,49 @@ int main()
             }
         }
 
+        float fer = (float)frame_errors / FRAMES;
         printf("%6.1f  %6.3f    %4.1f   %5d  %8d\n",
-               ebn0_db,
-               (float)frame_errors / FRAMES,
-               total_iters / FRAMES,
-               conv, frame_errors_conv);
+               ebn0_db, fer, total_iters / FRAMES, conv, frame_errors_conv);
+
+        if (std::isnan(waterfall_fer10) && fer <= 0.10f) waterfall_fer10 = ebn0_db;
+        if (std::isnan(waterfall_fer01) && fer <= 0.01f) waterfall_fer01 = ebn0_db;
     }
 
-    // --- Test 3: LLR sign check for all four QPSK constellation points ---
+    printf("Lowest Eb/N0 with FER<=0.10: %s\n",
+           std::isnan(waterfall_fer10) ? "none in range" : (std::to_string(waterfall_fer10) + " dB").c_str());
+    printf("Lowest Eb/N0 with FER<=0.01: %s\n\n",
+           std::isnan(waterfall_fer01) ? "none in range" : (std::to_string(waterfall_fer01) + " dB").c_str());
+
+    // --- Test 3: LLR sign check for both BPSK constellation points ---
     //
-    // Constellation and expected bit (0 or 1) per component:
-    //   (1, 0)  -> bit0=0, bit1=0 -> LLR[0] > 0, LLR[1] > 0
-    //   (0, 1)  -> bit0=0, bit1=1 -> LLR[0] > 0, LLR[1] < 0
-    //   (0,-1)  -> bit0=1, bit1=0 -> LLR[0] < 0, LLR[1] > 0
-    //   (-1, 0) -> bit0=1, bit1=1 -> LLR[0] < 0, LLR[1] < 0
+    // Constellation and expected bit (0 or 1):
+    //   +1  -> bit=0 -> LLR > 0
+    //   -1  -> bit=1 -> LLR < 0
     printf("=== Test 3: LLR sign check ===\n");
     {
-        struct { float re, im; int b0, b1; } pts[] = {
-            { 1,  0, 0, 0},
-            { 0,  1, 0, 1},
-            { 0, -1, 1, 0},
-            {-1,  0, 1, 1},
+        struct { float amp; int bit; } pts[] = {
+            { 1,  0},
+            {-1,  1},
         };
 
         bool ok = true;
-        float amplitudes[56];
-        for (int k = 0; k < 56; k++) amplitudes[k] = 1.0f;
+        float amplitudes[112];
+        for (int k = 0; k < 112; k++) amplitudes[k] = 1.0f;
 
         for (auto& pt : pts) {
-            RADE_COMP syms[56];
-            for (int k = 0; k < 56; k++) { syms[k].real = pt.re; syms[k].imag = pt.im; }
+            float syms[112];
+            for (int k = 0; k < 112; k++) syms[k] = pt.amp;
 
             float llr[112];
             ldpc_linear_log_map(syms, amplitudes, 0.01f, llr);
 
-            // Check all 56 symbols: each pair (llr[2k], llr[2k+1]) should have the
-            // sign predicted by (b0, b1). Convention: positive LLR => bit more likely 0.
-            for (int k = 0; k < 56; k++) {
-                bool llr0_ok = (pt.b0 == 0) ? (llr[2*k]   > 0.0f) : (llr[2*k]   < 0.0f);
-                bool llr1_ok = (pt.b1 == 0) ? (llr[2*k+1] > 0.0f) : (llr[2*k+1] < 0.0f);
-                if (!llr0_ok || !llr1_ok) {
-                    printf("  FAIL sym=(%g,%g) k=%d llr0=%g llr1=%g (expected b0=%d b1=%d)\n",
-                           pt.re, pt.im, k, llr[2*k], llr[2*k+1], pt.b0, pt.b1);
+            // Check all 112 symbols: each llr[k] should have the sign predicted
+            // by bit. Convention: positive LLR => bit more likely 0.
+            for (int k = 0; k < 112; k++) {
+                bool llr_ok = (pt.bit == 0) ? (llr[k] > 0.0f) : (llr[k] < 0.0f);
+                if (!llr_ok) {
+                    printf("  FAIL sym=%g k=%d llr=%g (expected bit=%d)\n",
+                           pt.amp, k, llr[k], pt.bit);
                     ok = false;
                 }
             }
@@ -217,16 +206,16 @@ int main()
     printf("=== Test 4: noiseless decode (all-zeros and all-ones) ===\n");
     {
         bool ok = true;
-        float amplitudes[56];
-        for (int k = 0; k < 56; k++) amplitudes[k] = 1.0f;
+        float amplitudes[112];
+        for (int k = 0; k < 112; k++) amplitudes[k] = 1.0f;
 
         for (int fill : {0, 1}) {
             std::array<uint8_t,56> msg{};
             for (auto& b : msg) b = fill;
             auto cw = ldpc_encode(msg);
 
-            RADE_COMP syms[56];
-            bits_to_qpsk(cw, syms);
+            float syms[112];
+            bits_to_bpsk(cw, syms);
 
             auto res = ldpc_decode(syms, amplitudes, 1e-10f);
             bool match = true;
@@ -243,8 +232,7 @@ int main()
 
     // --- Test 5: Single-bit error correction in codeword ---
     //
-    // Corrupt exactly one codeword bit by replacing the transmitted QPSK symbol
-    // with the adjacent constellation point that differs in only ONE bit.
+    // Corrupt exactly one codeword bit by flipping the transmitted BPSK symbol.
     //
     // IMPORTANT: noise_var must be large enough that the per-symbol LLRs stay
     // below ~16 in magnitude.  For |LLR| > 16, single-precision exp(x) has
@@ -254,14 +242,6 @@ int main()
     // |LLR| ≈ 2 where phi is well-behaved.
     printf("=== Test 5: single codeword bit flip correction (noise_var=0.5) ===\n");
     {
-        // Map (b0,b1) to QPSK symbol.
-        auto to_sym = [](uint8_t b0, uint8_t b1, RADE_COMP& s) {
-            if (!b0 && !b1) { s.real =  1; s.imag =  0; }
-            else if (!b0)   { s.real =  0; s.imag =  1; }
-            else if (!b1)   { s.real =  0; s.imag = -1; }
-            else            { s.real = -1; s.imag =  0; }
-        };
-
         bool ok = true;
         std::mt19937 rng5(999);
 
@@ -270,14 +250,14 @@ int main()
             for (int j = 0; j < 56; j++) msg[j] = rng5() & 1;
             auto cw = ldpc_encode(msg);
 
-            RADE_COMP syms[56];
-            bits_to_qpsk(cw, syms);
+            float syms[112];
+            bits_to_bpsk(cw, syms);
 
-            // Replace symbol 0 with the adjacent point that flips bit-0 only.
-            to_sym(1 - cw[0], cw[1], syms[0]);
+            // Flip symbol 0 to the opposite constellation point.
+            syms[0] = -syms[0];
 
-            float amplitudes[56];
-            for (int k = 0; k < 56; k++) amplitudes[k] = 1.0f;
+            float amplitudes[112];
+            for (int k = 0; k < 112; k++) amplitudes[k] = 1.0f;
 
             // noise_var=0.5 keeps |LLR|≈1-2, well inside the range where phi is finite
             // and BP messages are nonzero.  At noise_var≪0.01, phi overflows to 0.
@@ -288,8 +268,8 @@ int main()
                 if (res.message[i] != msg[i]) { match = false; break; }
 
             if (!res.converged || !match) {
-                printf("  FAIL trial=%d converged=%s match=%s (cw[0]=%d cw[1]=%d)\n",
-                       trial, res.converged?"YES":"NO", match?"YES":"NO", cw[0], cw[1]);
+                printf("  FAIL trial=%d converged=%s match=%s (cw[0]=%d)\n",
+                       trial, res.converged?"YES":"NO", match?"YES":"NO", cw[0]);
                 ok = false;
             }
         }
@@ -313,13 +293,6 @@ int main()
     // Once the phi function is fixed this test will need to be updated or removed.
     printf("=== Test 5b: phi overflow diagnostic (DIAGNOSTIC, not in success) ===\n");
     {
-        auto to_sym = [](uint8_t b0, uint8_t b1, RADE_COMP& s) {
-            if (!b0 && !b1) { s.real =  1; s.imag =  0; }
-            else if (!b0)   { s.real =  0; s.imag =  1; }
-            else if (!b1)   { s.real =  0; s.imag = -1; }
-            else            { s.real = -1; s.imag =  0; }
-        };
-
         std::mt19937 rng5b(999);
         int failures = 0;
         const int TRIALS = 10;
@@ -329,12 +302,12 @@ int main()
             for (int j = 0; j < 56; j++) msg[j] = rng5b() & 1;
             auto cw = ldpc_encode(msg);
 
-            RADE_COMP syms[56];
-            bits_to_qpsk(cw, syms);
-            to_sym(1 - cw[0], cw[1], syms[0]);  // 1-bit error
+            float syms[112];
+            bits_to_bpsk(cw, syms);
+            syms[0] = -syms[0];  // 1-bit error
 
-            float amplitudes[56];
-            for (int k = 0; k < 56; k++) amplitudes[k] = 1.0f;
+            float amplitudes[112];
+            for (int k = 0; k < 112; k++) amplitudes[k] = 1.0f;
 
             // noise_var=0.01 → |LLR| ≈ 100, well above phi's numeric range.
             // BP messages will be 0; decoder cannot correct the 1-bit error.
@@ -360,9 +333,9 @@ int main()
             std::array<uint8_t,56> msg{};
             for (int i = 0; i < 56; i++) msg[i] = in_str[i] - '0';
             auto cw = ldpc_encode(msg);
-            RADE_COMP syms[56]; bits_to_qpsk(cw, syms);
-            float amplitudes[56];
-            for (int k = 0; k < 56; k++) amplitudes[k] = 1.0f;
+            float syms[112]; bits_to_bpsk(cw, syms);
+            float amplitudes[112];
+            for (int k = 0; k < 112; k++) amplitudes[k] = 1.0f;
 
             auto res = ldpc_decode(syms, amplitudes, 1e-10f, /*max_iter=*/1);
             printf("max_iter=1 noiseless: converged=%s iterations=%d\n",
@@ -374,11 +347,11 @@ int main()
         {
             std::array<uint8_t,56> msg{};
             auto cw = ldpc_encode(msg);
-            RADE_COMP syms[56]; bits_to_qpsk(cw, syms);
+            float syms[112]; bits_to_bpsk(cw, syms);
             std::mt19937 rng6(7);
             add_noise(syms, 5.0f, rng6);  // very high noise, unlikely to converge
-            float amplitudes[56];
-            for (int k = 0; k < 56; k++) amplitudes[k] = 1.0f;
+            float amplitudes[112];
+            for (int k = 0; k < 112; k++) amplitudes[k] = 1.0f;
 
             auto res = ldpc_decode(syms, amplitudes, 25.0f, /*max_iter=*/5);
             printf("max_iter=5 high-noise: converged=%s iterations=%d\n",
@@ -405,11 +378,11 @@ int main()
             std::array<uint8_t,56> msg{};
             for (int j = 0; j < 56; j++) msg[j] = rng7() & 1;
             auto cw = ldpc_encode(msg);
-            RADE_COMP syms[56]; bits_to_qpsk(cw, syms);
+            float syms[112]; bits_to_bpsk(cw, syms);
             add_noise(syms, 8.0f, rng7);
 
-            float amplitudes[56];
-            for (int k = 0; k < 56; k++) amplitudes[k] = 1.0f;
+            float amplitudes[112];
+            for (int k = 0; k < 112; k++) amplitudes[k] = 1.0f;
 
             auto res = ldpc_decode(syms, amplitudes, 64.0f);
             if (res.converged) false_conv++;
@@ -436,15 +409,14 @@ int main()
             for (int j = 0; j < 56; j++) msg[j] = rng8() & 1;
             auto cw = ldpc_encode(msg);
 
-            RADE_COMP syms[56];
-            bits_to_qpsk(cw, syms);
+            float syms[112];
+            bits_to_bpsk(cw, syms);
 
             // Apply per-symbol amplitude scaling.
-            float amplitudes[56];
-            for (int k = 0; k < 56; k++) {
+            float amplitudes[112];
+            for (int k = 0; k < 112; k++) {
                 float a = (k % 2 == 0) ? 0.5f : 2.0f;
-                syms[k].real *= a;
-                syms[k].imag *= a;
+                syms[k] *= a;
                 amplitudes[k] = a;
             }
 
@@ -453,11 +425,10 @@ int main()
             add_noise(syms, sigma, rng8);
 
             // Normalize to unit amplitude before decoding (as rade_text_rx does).
-            for (int k = 0; k < 56; k++) {
-                float amp = std::sqrt(syms[k].real*syms[k].real + syms[k].imag*syms[k].imag);
+            for (int k = 0; k < 112; k++) {
+                float amp = std::fabs(syms[k]);
                 if (amp > 1e-6f) {
-                    syms[k].real /= amp;
-                    syms[k].imag /= amp;
+                    syms[k] /= amp;
                     amplitudes[k] = amp;
                 }
             }
@@ -500,9 +471,9 @@ int main()
             }
 
             // Noiseless decode.
-            RADE_COMP syms[56]; bits_to_qpsk(cw, syms);
-            float amplitudes[56];
-            for (int k = 0; k < 56; k++) amplitudes[k] = 1.0f;
+            float syms[112]; bits_to_bpsk(cw, syms);
+            float amplitudes[112];
+            for (int k = 0; k < 112; k++) amplitudes[k] = 1.0f;
 
             auto res = ldpc_decode(syms, amplitudes, 1e-10f);
             for (int i = 0; i < 56; i++) {

@@ -1,21 +1,27 @@
 # Reporting Protocol Reference
 
-This document describes the "reporting" functionality implemented in this repository:
+This document describes four pieces of "reporting" functionality implemented in
+this repository:
 
-1. [**FreeDV Reporter client protocol**](#1-freedv-reporter-client-protocol) — how a client
+1. [**On-air callsign encoding**](#1-on-air-callsign-encoding-rade-reliable-text) — how a callsign (including compound
+   callsigns like `VE3/KG6AOV/MM`) is turned into bits that ride inside a RADE
+   transmission, and how a receiver recovers it.
+2. [**FreeDV Reporter client protocol**](#2-freedv-reporter-client-protocol) — how a client
    (e.g. `freedv-gui`) talks to the `qso.freedv.org` FreeDV Reporter server: connection,
    authentication, and the JSON messages exchanged in both directions.
-2. [**UDP callsign broadcast protocol**](#2-udp-callsign-broadcast-protocol) — how a
+3. [**UDP callsign broadcast protocol**](#3-udp-callsign-broadcast-protocol) — how a
    client broadcasts received-callsign records as JSON UDP datagrams on the local
    network/LAN, for consumption by other local software (e.g. logging applications).
-3. [**CSV callsign log**](#3-csv-callsign-log) — the file of received callsigns that
+4. [**CSV callsign log**](#4-csv-callsign-log) — the file of received callsigns that
    `CsvReporter` appends to.
 
-All three can report the **sideband** (USB or LSB) the station's radio is on, where the
+The last three can report the **sideband** (USB or LSB) the station's radio is on, where the
 application knows it (e.g. from rig control) and tells them through
 `IReporter::sidebandChange()`.
 
-Source of truth is the code in `src/reporting/IReporter.h`,
+Source of truth is the code in `src/pipeline/rade_text.{h,cpp}`,
+`src/pipeline/ldpc_encode.{h,cpp}`, `src/pipeline/ldpc_decode.{h,cpp}`,
+`src/reporting/IReporter.h`,
 `src/reporting/FreeDVReporter.{h,cpp}`, `src/util/SocketIoClient.{h,cpp}`,
 `src/reporting/UdpReporter.{h,cpp}`, `src/util/UdpHandler.{h,cpp}` and
 `src/reporting/CsvReporter.{h,cpp}`. Line
@@ -29,13 +35,219 @@ vendors this repo as its `backend` submodule).
 
 ---
 
-## 1. FreeDV Reporter client protocol
+## 1. On-air callsign encoding (RADE reliable text)
+
+Implemented in `src/pipeline/rade_text.cpp`. This is the mechanism RADE uses to send a
+station's callsign (or other short text) alongside voice, robustly enough to survive HF
+channel conditions, without needing a separate "end of over" gap.
+
+### 1.1 High-level shape
+
+* A string (typically a callsign, possibly compound, e.g. `VE3/KG6AOV/MM`) is converted
+  into 1–4 independent **LDPC(112,56)** codewords ("blocks"), 8 characters per block.
+* Each block is bit-interleaved and streamed out **one BPSK symbol per RADE modem
+  frame**, continuously and cyclically — there is no separate framing/sync marker
+  between codewords; the transmitter just free-runs through block 0, block 1, ...,
+  block N‑1, block 0, ... for as long as it is keying.
+* The receiver has no a-priori knowledge of where a codeword starts. It keeps a
+  112-symbol sliding window and performs LDPC decode attempts against rotations of that
+  window until one converges cleanly *and* passes an 8-bit CRC embedded in the payload.
+* Blocks carry a 2-bit index and a "last block" flag so a multi-block (>8 character)
+  message can be reassembled even if the receiver tunes in mid-cycle or blocks are
+  decoded out of order.
+
+### 1.2 Character alphabet (38 symbols)
+
+Only characters that can appear in a callsign are supported
+(`convert_string_to_ota_chars_()` / `convert_ota_chars_to_string_()`,
+`rade_text.cpp:244-308`):
+
+| OTA value | Meaning |
+|---|---|
+| 0 | null — terminator / padding (never a "real" character) |
+| 1–10 | `'0'`–`'9'` |
+| 11–36 | `'A'`–`'Z'` (lowercase input is upper-cased) |
+| 37 | `'/'` |
+
+Any other input character is silently dropped.
+
+### 1.3 Packing 8 characters into 42 bits
+
+`RADE_TEXT_CHARS_PER_BLOCK = 8` characters are packed as a single base-38 integer
+rather than 6 fixed bits/character (`pack_chars_base38_()` / `unpack_chars_base38_()`,
+`rade_text.cpp:310-334`):
+
+```
+acc = 0
+for each of the 8 chars (in order):
+    acc = acc * 38 + char
+```
+
+`log2(38) ≈ 5.25`, so 8 characters cost `ceil(log2(38^8)) = 42` bits instead of the 48
+bits fixed-width packing would need — the 6 bits saved is what pays for the framing
+overhead below while still fitting 8 characters in one block.
+
+### 1.4 56-bit LDPC message payload layout
+
+Each block's LDPC(112,56) **input** (the 56 systematic/message bits, before parity is
+computed) is laid out as (`rade_text.cpp:54-97`):
+
+| Field | Bits | Offset | Notes |
+|---|---|---|---|
+| CRC-8 | 8 | 0 | See §1.6 |
+| `last_block` | 1 | 8 | 1 if this is the final block of the message |
+| `block_index` | 2 | 9 | 0–3, cycles through up to `RADE_TEXT_MAX_BLOCKS = 4` blocks |
+| packed characters | 42 | 11 | base-38 packing of 8 OTA characters, see §1.3 |
+| reserved | 3 | 53 | always 0 |
+
+All multi-bit fields are packed **LSB-first** (`set_bits_lsb_first_()` /
+`get_bits_lsb_first_()`, `rade_text.cpp:336-358`): bit 0 of the field's value goes into
+the lowest bit offset.
+
+A message longer than 8 characters (e.g. a compound callsign) is split across up to 4
+blocks of 8 characters each, giving a hard cap of `RADE_TEXT_MAX_LENGTH = 32` characters
+per message. The 2-bit `block_index` "for free" supports 4 blocks even though a 1- or
+2-block message costs the same 2 bits as a 4-block one.
+
+### 1.5 LDPC(112,56) encode/decode
+
+Defined in `src/pipeline/ldpc_encode.{h,cpp}` and `src/pipeline/ldpc_decode.{h,cpp}`,
+using the `HRA_56_56` parity-check matrix, `H = [H_a | H_b]` (56×112) where `H_b` is
+lower-bidiagonal:
+
+* **Encode** (`ldpc_encode()`): systematic — the 112-bit codeword is `[s | p]` where `s`
+  is the 56 message bits verbatim, and parity `p` is solved by forward substitution:
+  `r = H_a * s (mod 2)`, then `p[0] = r[0]`, `p[i] = r[i] XOR p[i-1]` for `i = 1..55`.
+* **Decode** (`ldpc_decode()`): soft-decision sum-product belief propagation over BPSK
+  symbols. BPSK mapping: bit `0 → +amplitude`, bit `1 → -amplitude`; LLR = `2 · amplitude
+  · received_symbol / noise_var`. A decode is only accepted by `rade_text.cpp` if it
+  converges (all parity checks satisfied) within `MAX_CONFIDENT_ITERATIONS = 10`
+  iterations — a genuinely aligned codeword at workable SNR converges fast, so requiring
+  *fast* convergence (not just eventual convergence) is a second, independent filter
+  against false-positive rotation guesses, on top of the CRC check in §1.6.
+
+### 1.6 CRC-8 framing check
+
+`calculateBlockCRC_()` (`rade_text.cpp:360-393`) computes an 8-bit CRC over 9 bytes:
+
+```
+buf[0]   = block_index | (last_block ? 0x4 : 0)
+buf[1:9] = the 8 OTA-alphabet character bytes (0-37 each)
+```
+
+Algorithm: bit-by-bit, MSB-first, polynomial `0x1D`, initial CRC `0x00`, no input/output
+reflection, no final XOR:
+
+```
+crc = 0x00
+for each byte b in buf:
+    crc ^= b
+    repeat 8 times:
+        crc = (crc & 0x80) ? (crc << 1) ^ 0x1D : (crc << 1)
+```
+
+The CRC covers the framing bits (`block_index`/`last_block`) as well as the characters,
+so a bit error that flips the framing is caught rather than silently misfiling the block
+during reassembly. Note this fixed 9-byte buffer has **no** "stop at the first zero
+byte" convention — `block_index == 0` with `last_block == false` is a legitimate
+all-zero framing byte.
+
+### 1.7 Interleaving
+
+After LDPC encoding, the 112 codeword bits are bit-interleaved before transmission
+(`interleave_bits()` / `deinterleave_syms()`, `rade_text.cpp:395-412`), using a simple
+block interleaver with stride `INTERLEAVER_B = 37`:
+
+```
+newIndex = (37 * index) % 112
+out[newIndex] = in[index]        // TX: interleave_bits()
+out[index]    = in[newIndex]     // RX: deinterleave_syms()
+```
+
+This spreads a burst of bit errors (e.g. from fading) across the codeword rather than
+letting them cluster, which belief propagation handles much better.
+
+### 1.8 Transmit path
+
+`rade_text_generate_tx_string(ptr, str, strlength)` (`rade_text.cpp:761-835`):
+
+1. Converts `str` to OTA alphabet symbols (§1.2), splits into 1–4 blocks of 8 characters
+   each (dropping trailing zero-padding).
+2. For each block: computes the CRC (§1.6), assembles the 56-bit payload (§1.4), runs it
+   through `ldpc_encode()` (§1.5), then interleaves the 112-bit codeword (§1.7) into
+   `tx_text[block]`.
+3. Resets the streaming cursor to block 0, symbol 0.
+
+`rade_text_tx_next_symbol(ptr)` (`rade_text.cpp:837-852`) is called **once per RADE
+modem frame** by the caller (bit `1 → -1.0`, bit `0 → +1.0`) and advances one bit at a
+time through the current block's 112 interleaved bits, then cycles to the next block
+(wrapping modulo `tx_num_blocks`) — this repeats indefinitely for as long as the caller
+keeps pulling symbols, i.e. for as long as the station is transmitting.
+
+### 1.9 Receive path
+
+`rade_text_rx_symbol(ptr, sym)` (`rade_text.cpp:642-744`) is called once per successful
+demodulated symbol. It maintains a 112-symbol circular buffer of the most recent
+received soft symbols. Because the transmitter never pauses between codewords, this
+buffer is *always* some cyclic rotation of a true codeword — the receiver just doesn't
+know the rotation offset when it starts listening.
+
+* The first time the buffer fills, its contents are frozen as a snapshot and a
+  **rotation sweep** begins: up to 112 candidate rotations are tried a few at a time
+  (`ROTATIONS_PER_CALL = 8` per call, ~14 calls / ~560 ms to cover all 112) rather than
+  blocking the real-time callback by testing all of them in one call.
+* A rotation "wins" if its LDPC decode converges within the iteration budget (§1.5) *and*
+  its CRC checks out (§1.6). To guard against CRC's ~1/256 false-accept rate letting a
+  wrong rotation slip through when many hypotheses are tested against the same noisy
+  sample, the sweep only accepts a decode if there is a **unique** winner across all 112
+  rotations.
+* Once no sweep is pending, the receiver falls back to testing the naturally-sliding
+  window on every new symbol (this is also what handles resynchronization if noise
+  causes the initial sweep to fail).
+* A successfully decoded, CRC-valid block is folded into per-message reassembly state
+  (`rade_text_ingest_block_()`, `rade_text.cpp:573-628`): `block_index == 0` always
+  (re)starts a fresh reassembly (the only available signal that a new pass through the
+  transmitter's block cycle has begun, since a receiver may join mid-cycle). Once every
+  block up to the one flagged `last_block` has been seen, the full string is
+  reconstructed and delivered exactly once per cycle via the callback registered with
+  `rade_text_set_rx_callback()`.
+
+### 1.10 Wiring it up
+
+The per-frame streaming calls (`rade_text_tx_next_symbol()` / `rade_text_rx_symbol()`)
+already live inside this repo's own RADE pipeline steps, not in the application:
+`RADETransmitStep.cpp` calls `rade_tx_set_data_symbol(dv_,
+rade_text_tx_next_symbol(textPtr_))` once per TX frame, and `RADEReceiveStep.cpp` calls
+`rade_text_rx_symbol(textPtr_, dataSym)` once per successfully demodulated data symbol.
+An application built on top of this repo (e.g. `freedv-gui`) only needs to:
+
+```c
+rade_text_t rt = rade_text_create();
+rade_text_set_rx_callback(rt, my_on_text_rx, my_state);
+
+// Whenever the callsign to transmit changes (e.g. user edits it in settings):
+rade_text_generate_tx_string(rt, callsign, strlen(callsign));
+
+// -> my_on_text_rx(rt, decoded_str, len, my_state) is invoked automatically
+//    once the pipeline above reassembles a full message.
+```
+
+This is exactly what `freedv-gui` (`ms-rade-v2` branch) does in
+`FreeDVInterface::setReliableText()` (calls `rade_text_generate_tx_string(radeTextPtr_,
+callsign, strlen(callsign))`) and `FreeDVInterface::OnRadeTextRx_()` (the registered RX
+callback, which stashes the decoded string). That string is later surfaced through
+`getReliableText()` and handed to `FreeDVReporter::addReceiveRecord()` (§2.4) as the
+received callsign for a spot.
+
+---
+
+## 2. FreeDV Reporter client protocol
 
 Implemented in `src/reporting/FreeDVReporter.{h,cpp}` (application-level protocol) on
 top of `src/util/SocketIoClient.{h,cpp}` (Engine.IO/Socket.IO v4 transport) and
 `src/util/TcpConnectionHandler.{h,cpp}` (raw TCP + optional TLS).
 
-### 1.1 Transport
+### 2.1 Transport
 
 The client speaks **Socket.IO protocol v4 over Engine.IO protocol v4**, using the
 WebSocket transport directly — it does **not** perform the usual HTTP long-polling
@@ -68,7 +280,7 @@ still TLS-wrapped when TLS is enabled.
   the connection as dead and disconnects/reconnects (`SocketIoClient.cpp:38-45,
   223-313`).
 
-### 1.2 Engine.IO / Socket.IO packet framing
+### 2.2 Engine.IO / Socket.IO packet framing
 
 Every WebSocket text frame is one Engine.IO packet: a single ASCII digit packet-type
 prefix, optionally followed by a payload.
@@ -85,9 +297,9 @@ Inside an Engine.IO `message` (`4`), the next character is the Socket.IO packet 
 
 | Prefix | Socket.IO meaning |
 |---|---|
-| `40<json>` | `CONNECT` (client→server) — namespace connect + **auth payload** (§1.3) |
+| `40<json>` | `CONNECT` (client→server) — namespace connect + **auth payload** (§2.3) |
 | `40` | `CONNECT` ack (server→client) — connection to namespace accepted |
-| `42<json array>` | `EVENT` — `[eventName, ...args]`; used for every application message in both directions (§1.4/§1.5) |
+| `42<json array>` | `EVENT` — `[eventName, ...args]`; used for every application message in both directions (§2.4/§2.5) |
 | `44` | connect `ERROR` (server→client) — client disconnects and lets its reconnect timer retry |
 
 So a client emitting `tx_report` sends the literal WebSocket text frame:
@@ -96,7 +308,7 @@ So a client emitting `tx_report` sends the literal WebSocket text frame:
 ```
 (`SOCKET_IO_TX_PREFIX = "42"`, `SocketIoClient::emit()`, `SocketIoClient.cpp:90-129`).
 
-### 1.3 Authentication
+### 2.3 Authentication
 
 Authentication happens as the payload of the Socket.IO `40` (namespace CONNECT) packet,
 sent immediately after the WebSocket opens (`SocketIoClient.cpp:157-162`,
@@ -139,11 +351,11 @@ Field notes:
 | `protocol_version` | Currently `2` (`FREEDV_REPORTER_PROTOCOL_VERSION`, `FreeDVReporter.h:145-147`); always sent, regardless of role |
 
 The server acks the namespace connect (Socket.IO `40`), then emits its own
-`connection_successful` application event (§1.5) once it has fully accepted the client;
+`connection_successful` application event (§2.5) once it has fully accepted the client;
 `FreeDVReporter` treats *that* — not the transport-level connect — as "fully connected"
-and only then starts emitting queued state (§1.4).
+and only then starts emitting queued state (§2.4).
 
-### 1.4 Client → server events
+### 2.4 Client → server events
 
 All are Socket.IO `EVENT` (`42`) packets `[eventName, dataObject]`. Every one of these
 public methods is a no-op unless `isValidForReporting()` is true (i.e. a non-empty
@@ -171,14 +383,14 @@ re-sends its last known frequency and sideband, mode/tx state, and message (or r
 currently hidden) so the server-side view of this station doesn't go stale — see
 `FreeDVReporter::onFreeDVReporterConnectionSuccessful_()`.
 
-### 1.5 Server → client events
+### 2.5 Server → client events
 
 Also Socket.IO `EVENT` (`42`) packets. Each handler validates every field's JSON type
 before invoking the registered callback; a malformed message is silently dropped.
 
 | Event | Payload | Meaning |
 |---|---|---|
-| `connection_successful` | *(none required)* | Auth accepted; server considers this client fully joined. Triggers the client to (re)send its cached state (§1.4). |
+| `connection_successful` | *(none required)* | Auth accepted; server considers this client fully joined. Triggers the client to (re)send its cached state (§2.4). |
 | `new_connection` | `{"sid", "last_update", "callsign", "grid_square", "version", "rx_only": <bool>, "connect_time"}` (all others string) | Another station joined / is now visible. |
 | `remove_connection` | `{"sid", "last_update", "callsign", "grid_square", "version", "rx_only": <bool>}` | A station disconnected or hid itself. (No `connect_time` — always delivered to the app callback as `""`.) |
 | `tx_report` | `{"sid", "last_update", "callsign", "grid_square", "mode", "transmitting": <bool>, "last_tx": <string or null>}` | Another station's TX state changed. Same event *name* as the client→server report but a different shape/direction. |
@@ -195,7 +407,7 @@ didn't pass it on — a `qsy_request` can't tell these apart. A client should ta
 the sideband it would otherwise use on that frequency. The sideband handler is only
 called for a `freq_change` the frequency handler accepts too, after it.
 
-### 1.6 Minimal client example
+### 2.6 Minimal client example
 
 ```c++
 FreeDVReporter reporter(
@@ -230,28 +442,28 @@ This mirrors how `freedv-gui` wires things up in
 `FreeDVReporterDialog::FreeDVReporterDataModel` (`freedv_reporter.cpp`, binds all the
 `setOn*Fn` callbacks to populate its roster UI).
 
-### 1.7 Related, but out of scope here
+### 2.7 Related, but out of scope here
 
 `src/reporting/` also contains `pskreporter.{h,cpp}` (PSK Reporter's own UDP spot
 protocol) — another `IReporter` implementation, used for reporting spots to a service
 other than FreeDV Reporter. It doesn't share `FreeDVReporter`'s Socket.IO protocol, and
 isn't covered by this document (it ignores the sideband). `UdpReporter` and `CsvReporter`
 are also `IReporter` implementations, but their formats are defined by this repo
-(rather than a third party), so they're documented below (§2, §3).
+(rather than a third party), so they're documented below (§3, §4).
 
 ---
 
-## 2. UDP callsign broadcast protocol
+## 3. UDP callsign broadcast protocol
 
 Implemented in `src/reporting/UdpReporter.{h,cpp}` on top of the generic
-`src/util/UdpHandler.{h,cpp}`. Unlike the FreeDV Reporter client (§1), this is not a
+`src/util/UdpHandler.{h,cpp}`. Unlike the FreeDV Reporter client (§2), this is not a
 connection to a central server — it's a **local, send-only, fire-and-forget UDP
 broadcast/multicast** of each received callsign as a single JSON datagram, intended for
 other software on the same machine/LAN to pick up (e.g. logging applications), in the
 same spirit as WSJT-X's UDP broadcast (`UdpHandler.cpp:276` explicitly notes this: *"This
 class is mainly for WSJT-X style logging"*).
 
-### 2.1 Transport
+### 3.1 Transport
 
 * Plain UDP, one datagram per received callsign — no handshake, no acknowledgement, no
   session state, and nothing is ever read back (`UdpReporter::onReceive_()` is a no-op,
@@ -276,10 +488,10 @@ class is mainly for WSJT-X style logging"*).
 * Of `IReporter`'s methods, only `addReceiveRecord()` actually sends anything.
   `freqChange()` just caches the frequency on the object (currently unused elsewhere in
   the class); `sidebandChange()` caches the sideband, which goes in each record from then
-  on (§2.2); `transmit()`, `inAnalogMode()`, and `send()` are no-ops — they exist only
-  to satisfy the shared `IReporter` interface (§1.7 above / `IReporter.h`).
+  on (§3.2); `transmit()`, `inAnalogMode()`, and `send()` are no-ops — they exist only
+  to satisfy the shared `IReporter` interface (§2.7 above / `IReporter.h`).
 
-### 2.2 Datagram payload
+### 3.2 Datagram payload
 
 Each call to `addReceiveRecord(callsign, mode, frequency, snr)` serialises and sends
 exactly one JSON object as the UDP payload (`UdpReporter::addReceiveRecord()`,
@@ -303,16 +515,16 @@ exactly one JSON object as the UDP payload (`UdpReporter::addReceiveRecord()`,
 | `type` | string | Always the literal `"fdv_callsign"` — a receiver can use this to distinguish this payload from other UDP traffic that might land on the same port. |
 | `version` | int | Message schema version, currently always `1` (`JSON_MESSAGE_VERSION`, `UdpReporter.h:75`). Bump expected if the schema changes. |
 | `timestamp` | string | UTC timestamp of the report, ISO-8601 `YYYY-MM-DDTHH:MM:SSZ` (`std::gmtime`/`strftime`, `UdpReporter.cpp:82-87`). |
-| `callsign` | string | The received callsign, exactly as passed to `addReceiveRecord()` (e.g. as decoded from RADE's reliable-text channel). |
+| `callsign` | string | The received callsign, exactly as passed to `addReceiveRecord()` (e.g. as decoded via the RADE reliable-text channel in §1, or via another mode's equivalent). |
 | `mode` | string | The FreeDV mode string in use, e.g. `"RADEV1"`, `"700D"`, `"2020"`. |
 | `snr` | int | Signal-to-noise ratio in dB, as a signed byte widened to a JSON integer. |
-| `frequency_hz` | uint | Frequency in Hz, taken directly from the `frequency` argument passed to `addReceiveRecord()` (**not** from a previously-cached `freqChange()` value — see §2.1). |
+| `frequency_hz` | uint | Frequency in Hz, taken directly from the `frequency` argument passed to `addReceiveRecord()` (**not** from a previously-cached `freqChange()` value — see §3.1). |
 | `sideband` | string | The sideband the radio was on, as last given to `sidebandChange()`: `"USB"`, `"LSB"`, or `""` if not known. Added without changing `version`; listeners that don't know it ignore it, as they would any other field they don't know. |
 
 There is no equivalent "TX report" / "frequency change" / roster datagram — this
 protocol only ever announces received callsigns.
 
-### 2.3 Minimal listener example
+### 3.3 Minimal listener example
 
 Since this is one JSON object per UDP datagram on a well-known multicast group, a
 listener is trivial to write in any language, e.g. Python:
@@ -339,7 +551,7 @@ while True:
 
 ---
 
-## 3. CSV callsign log
+## 4. CSV callsign log
 
 Implemented in `src/reporting/CsvReporter.{h,cpp}`. Each received callsign is appended
 as one line to a CSV file (RFC 4180: a field containing a comma, quote or line break is
@@ -354,7 +566,7 @@ date,time,callsign,mode,frequency_hz,snr_db,sideband
 | Column | Notes |
 |---|---|
 | `date`, `time` | UTC, `YYYY-MM-DD` and `HH:MM:SS`. |
-| `callsign`, `mode`, `frequency_hz`, `snr_db` | As passed to `addReceiveRecord()`, as for the UDP datagram (§2.2). |
+| `callsign`, `mode`, `frequency_hz`, `snr_db` | As passed to `addReceiveRecord()`, as for the UDP datagram (§3.2). |
 | `sideband` | The sideband the radio was on, as last given to `sidebandChange()`: `USB`, `LSB`, or empty if not known. |
 
 A file started before the `sideband` column was added has a header without it
