@@ -78,6 +78,10 @@ public:
     
     // callsign, frequency, message
     using QsyRequestFn = std::function<void(std::string, uint64_t, std::string)>;
+
+    // callsign, frequency, message, sideband (the requester's; UNKNOWN if
+    // they or the server didn't say)
+    using QsyRequestWithSidebandFn = std::function<void(std::string, uint64_t, std::string, Sideband)>;
     
     // sid, last_update, message
     using MessageUpdateFn = std::function<void(std::string, std::string, std::string)>;
@@ -95,6 +99,9 @@ public:
     virtual ~FreeDVReporter();
 
     void connect();
+
+    // Asks a station to come to the given frequency, on the sideband we've
+    // reported (see sidebandChange()).
     void requestQSY(std::string const& sid, uint64_t frequencyHz, std::string const& message);
     void updateMessage(std::string const& message);
     
@@ -118,6 +125,10 @@ public:
     void setOnReceiveUpdateFn(RxUpdateFn fn);
     
     void setOnQSYRequestFn(QsyRequestFn fn);
+
+    // As setOnQSYRequestFn(), with the sideband to go to as well. Called
+    // instead of the QsyRequestFn when set.
+    void setOnQSYRequestWithSidebandFn(QsyRequestWithSidebandFn fn);
     void setMessageUpdateFn(MessageUpdateFn fn);
     void setConnectionSuccessfulFn(ConnectionSuccessfulFn fn);
     void setAboutToShowSelfFn(AboutToShowSelfFn fn);
@@ -167,6 +178,7 @@ private:
     RxUpdateFn onReceiveUpdateFn_;
     
     QsyRequestFn onQsyRequestFn_;
+    QsyRequestWithSidebandFn onQsyRequestWithSidebandFn_;
     MessageUpdateFn onMessageUpdateFn_;
     ConnectionSuccessfulFn onConnectionSuccessfulFn_;
     AboutToShowSelfFn onAboutToShowSelfFn_;
@@ -174,6 +186,10 @@ private:
     RecvEndFn onRecvEndFn_;
         
     void connect_();
+
+    // As the server sends and takes sidebands: "USB", "LSB" or "".
+    static const char* sidebandToString_(Sideband sideband);
+    static Sideband sidebandFromJson_(yyjson_val* sideband);
     
     void freqChangeImpl_(uint64_t frequency);
     void transmitImpl_(std::string const& mode, bool tx);

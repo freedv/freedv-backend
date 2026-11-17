@@ -363,6 +363,51 @@ bool testSidebandSavedAndSentWithFrequency()
     return result;
 }
 
+bool testQsyRequestWithSideband()
+{
+    std::cout << "Test 6c (qsy_request with the requester's sideband): ";
+
+    FreeDVReporter reporter("localhost", "N1DQ", "CN98", "FreeDV Test", false);
+
+    int plainCalls = 0;
+    reporter.setOnQSYRequestFn([&](std::string, uint64_t, std::string) { plainCalls++; });
+
+    std::vector<IReporter::Sideband> got;
+    std::vector<uint64_t> gotFreq;
+    reporter.setOnQSYRequestWithSidebandFn([&](std::string callsign, uint64_t freq, std::string message, IReporter::Sideband sideband) {
+        if (callsign == "K6AQ" && message == "QSY?")
+        {
+            got.push_back(sideband);
+            gotFreq.push_back(freq);
+        }
+    });
+
+    auto fire = [&](const char* json) {
+        withParsedJson(json, [&](yyjson_val* root) { FreeDVReporterTest::fireQsyRequest(reporter, root); });
+    };
+
+    fire(R"({"callsign":"K6AQ","frequency":7100000,"message":"QSY?","sideband":"LSB"})");
+    fire(R"({"callsign":"K6AQ","frequency":14236000,"message":"QSY?","sideband":"USB"})");
+    fire(R"({"callsign":"K6AQ","frequency":14236000,"message":"QSY?","sideband":""})");
+    fire(R"({"callsign":"K6AQ","frequency":14236000,"message":"QSY?","sideband":"AM"})");
+    fire(R"({"callsign":"K6AQ","frequency":14236000,"message":"QSY?","sideband":5})");
+    // From a server that doesn't pass the sideband on.
+    fire(R"({"callsign":"K6AQ","frequency":14236000,"message":"QSY?"})");
+    // Still refused when the rest isn't right.
+    fire(R"({"callsign":"K6AQ","frequency":-1,"message":"QSY?","sideband":"USB"})");
+
+    bool result = true;
+    result &= (got == std::vector<IReporter::Sideband>{
+        IReporter::Sideband::LSB, IReporter::Sideband::USB, IReporter::Sideband::UNKNOWN,
+        IReporter::Sideband::UNKNOWN, IReporter::Sideband::UNKNOWN, IReporter::Sideband::UNKNOWN });
+    result &= (gotFreq.size() == 6 && gotFreq[0] == 7100000ULL);
+    // Called instead of the plain QsyRequestFn.
+    result &= (plainCalls == 0);
+
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    return result;
+}
+
 bool testMessageAndQsyHandlers()
 {
     std::cout << "Test 7 (message_update and qsy_request dispatch): ";
@@ -804,6 +849,7 @@ int main(int argc, char** argv)
     result &= testFreqChangeHandler();
     result &= testSidebandHandler();
     result &= testSidebandSavedAndSentWithFrequency();
+    result &= testQsyRequestWithSideband();
     result &= testMessageAndQsyHandlers();
     result &= testBulkUpdateToleratesMalformedEntries();
     result &= testStateSavedBeforeConnectionAndReplayedOnSuccess();

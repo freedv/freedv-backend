@@ -644,6 +644,19 @@ bool testInboundEvents()
     result &= CHECK(log.waitFor("sideband s2 unknown"));
     result &= CHECK((log.count("sideband s2") == 2));
 
+    // With a QsyRequestWithSidebandFn, that's called instead, with the
+    // requester's sideband.
+    reporter.setOnQSYRequestWithSidebandFn([&](std::string callsign, uint64_t freq, std::string message,
+                                               IReporter::Sideband sideband) {
+        log.add("qsy_request_with_sideband " + callsign + " " + std::to_string(freq) + " " + message + " " +
+                (sideband == IReporter::Sideband::USB ? "USB" : sideband == IReporter::Sideband::LSB ? "LSB" : "unknown"));
+    });
+    result &= CHECK(server.sendEvent("qsy_request", R"({"callsign":"K6AQ","frequency":7177000,"message":"QSY?","sideband":"LSB"})"));
+    result &= CHECK(log.waitFor("qsy_request_with_sideband K6AQ 7177000 QSY? LSB"));
+    result &= CHECK(server.sendEvent("qsy_request", R"({"callsign":"K6AQ","frequency":7177000,"message":"QSY?"})"));
+    result &= CHECK(log.waitFor("qsy_request_with_sideband K6AQ 7177000 QSY? unknown"));
+    result &= CHECK((log.count("qsy_request ") == 1));
+
     // Junk the client should shrug off: unknown event, unparseable JSON,
     // non-string event name, and socket.io/engine.io packet types it ignores.
     result &= CHECK(server.sendEvent("no_such_event", "{}"));
@@ -711,6 +724,8 @@ bool testOutboundReports()
     result &= CHECK((getStr(args.root(), "dest_sid") == "sid-9"));
     result &= CHECK((getStr(args.root(), "message") == "meet me on 20m"));
     result &= CHECK((yyjson_get_uint(yyjson_obj_get(args.root(), "frequency")) == 14236000ULL));
+    // On the sideband we're on.
+    result &= CHECK((getStr(args.root(), "sideband") == "LSB"));
 
     // Analog mode hides us; going back to digital shows us and re-reports state.
     reporter.inAnalogMode(true);
