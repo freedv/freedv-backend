@@ -318,12 +318,14 @@ bool rxAppliesFrequencyOffset()
     }
 
     // A receiver configured with a non-zero frequency offset must shift the
-    // incoming stream instead of passing it through unmodified.
+    // incoming stream instead of passing it through unmodified. (An offset
+    // within the ±31 Hz V2 acquires over: from rade_c PR #31, a signal
+    // further off than that is rejected as a false sync, and gives nothing.)
     RadeSession session;
     std::unique_ptr<RADEReceiveStep> step(new RADEReceiveStep(
         session.dv, &session.fargan, nullptr,
         +[](RADEReceiveStep*) FREEDV_NONBLOCKING {},
-        +[]() FREEDV_NONBLOCKING { return 50.0f; }));
+        +[]() FREEDV_NONBLOCKING { return 20.0f; }));
     auto out = run(*step, modem);
     bool result = !out.empty();
     if (!result)
