@@ -59,9 +59,17 @@ public:
 private:
     std::ofstream file_;
 
-    // Whether the file has the sideband column: files started before it
-    // was added keep to the columns their header names.
+    // Whether the file has the sideband column. A file started before it
+    // was added is given it on opening (upgradeToSidebandColumn_()); if that
+    // can't be done, records keep to the columns its header names.
     bool hasSidebandColumn_;
+
+    // Gives a file whose header is the one from before the sideband column
+    // was added that column: the header, plus an empty sideband on each
+    // record. The original is kept alongside as <filename>.bak (or .bak.1,
+    // .bak.2... if that's taken). Returns whether it was done; if not, the
+    // file is as it was.
+    static bool upgradeToSidebandColumn_(std::string const& filename);
     std::atomic<Sideband> sideband_;
 };
 

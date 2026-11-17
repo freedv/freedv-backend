@@ -351,9 +351,23 @@ date,time,callsign,mode,frequency_hz,snr_db,sideband
 | `sideband` | The sideband the radio was on, as last given to `sidebandChange()`: `USB`, `LSB`, or empty if not known. |
 
 A file started before the `sideband` column was added has a header without it
-(`date,time,callsign,mode,frequency_hz,snr_db`), and records appended to it keep to those
-six columns, so that its header and records still match. A reader that wants to handle
-both should go by the header, or treat the seventh column as optional.
+(`date,time,callsign,mode,frequency_hz,snr_db`). When `CsvReporter` opens such a file, it
+gives it the column (`CsvReporter::upgradeToSidebandColumn_()`):
+
+* The original is copied to `<file>.bak` first (or `<file>.bak.1`, `.bak.2`… if that name's
+  already taken, so an earlier backup is never replaced).
+* The new header, then each existing six-column record with an empty sideband added
+  (`…,-2,`), are written to `<file>.tmp`, which is then renamed over the original — so the
+  log is never left half-written. Records are read as RFC 4180 records, so a quoted comma
+  or line break in a callsign is kept intact; a record that doesn't have six fields is
+  copied as it is rather than guessed at. Line endings become `\n`.
+* If any of that can't be done (e.g. the folder can't be written to, or on Windows another
+  program has the file open), the temporary file and backup are removed, the file is left
+  exactly as it was, and records appended to it keep to its six columns so that its header
+  and records still match.
+
+A reader that wants to handle any file should go by the header, or treat the seventh column
+as optional.
 
 Of `IReporter`'s other methods, `sidebandChange()` caches the sideband; `freqChange()`,
 `transmit()`, `inAnalogMode()`, and `send()` do nothing.

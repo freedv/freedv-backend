@@ -1,7 +1,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -17,6 +19,7 @@ const std::string TEST_FILE_NEW_PATH = testMakeTempFile("csvnew");
 const std::string TEST_FILE_APPEND_PATH = testMakeTempFile("csvapp");
 const std::string TEST_FILE_QUOTED_PATH = testMakeTempFile("csvquo");
 const std::string TEST_FILE_SIDEBAND_PATH = testMakeTempFile("csvsb");
+const std::string TEST_FILE_UPGRADE_PATH = testMakeTempFile("csvup");
 const char* TEST_FILE_NEW = TEST_FILE_NEW_PATH.c_str();
 const char* TEST_FILE_APPEND = TEST_FILE_APPEND_PATH.c_str();
 const char* TEST_FILE_QUOTED = TEST_FILE_QUOTED_PATH.c_str();
@@ -167,19 +170,19 @@ bool testAppendToExistingFileNoDuplicateHeader()
 
     {
         std::ofstream seed(TEST_FILE_APPEND);
-        seed << CSV_HEADER_WITHOUT_SIDEBAND << "\n";
-        seed << "2026-01-01,00:00:00,OLD001,1600X,14000000,1\n";
+        seed << CSV_HEADER << "\n";
+        seed << "2026-01-01,00:00:00,OLD001,1600X,14000000,1,LSB\n";
     }
 
     {
         CsvReporter reporter(TEST_FILE_APPEND);
-        // (A file without the sideband column keeps to its columns, even
-        // when the sideband's known.)
-        reporter.sidebandChange(IReporter::Sideband::USB);
-        // Constructor alone must not modify the file.
+        // Constructor alone must not modify the file (nor back it up: it
+        // already has the sideband column).
         auto untouched = readFileLines(TEST_FILE_APPEND);
         result &= (untouched.size() == 2);
+        result &= !std::filesystem::exists(TEST_FILE_APPEND_PATH + ".bak");
 
+        reporter.sidebandChange(IReporter::Sideband::USB);
         reporter.addReceiveRecord("K6AQ", "8PSK1250", 7100000, 12);
     }
 
@@ -196,8 +199,8 @@ bool testAppendToExistingFileNoDuplicateHeader()
     if (lines.size() == 3)
     {
         auto fields = splitCsv(lines[2]);
-        result &= (fields.size() == 6);
-        if (fields.size() == 6)
+        result &= (fields.size() == 7);
+        if (fields.size() == 7)
         {
             result &= (fields[0] == todayUtc());
             result &= isValidTimeField(fields[1]);
@@ -205,6 +208,7 @@ bool testAppendToExistingFileNoDuplicateHeader()
             result &= (fields[3] == "8PSK1250");
             result &= (fields[4] == "7100000");
             result &= (fields[5] == "12");
+            result &= (fields[6] == "USB");
         }
     }
 
@@ -295,6 +299,155 @@ bool testSidebandColumn()
     return result;
 }
 
+std::string readFile(std::string const& path)
+{
+    std::ifstream file(path, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+}
+
+void removeWithBackups(std::string const& path)
+{
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    std::filesystem::remove(path + ".bak", ec);
+    std::filesystem::remove(path + ".bak.1", ec);
+    std::filesystem::remove(path + ".tmp", ec);
+}
+
+// A log from before the sideband column was added: records of six columns,
+// one with a quoted comma, one with a quoted line break (over-the-air text
+// can have either), and one ending in CRLF.
+const std::string OLD_LOG =
+    std::string(CSV_HEADER_WITHOUT_SIDEBAND) + "\n"
+    "2026-01-01,00:00:00,OLD001,RADEV1,14236000,1\n"
+    "2026-01-02,00:00:00,\"K6,AQ\",RADEV1,7177000,-3\n"
+    "2026-01-03,00:00:00,\"N1\nDQ\",RADEV1,7177000,4\r\n";
+
+bool testOldFileGetsSidebandColumn()
+{
+    std::cout << "Test 6 (a file without the sideband column is given it, and backed up): ";
+
+    const std::string path = TEST_FILE_UPGRADE_PATH;
+    removeWithBackups(path);
+    {
+        std::ofstream seed(path, std::ios::binary);
+        seed << OLD_LOG;
+    }
+
+    {
+        CsvReporter reporter(path);
+        reporter.sidebandChange(IReporter::Sideband::LSB);
+        reporter.addReceiveRecord("VK3TPM", "RADEV1", 7177000, 5);
+    }
+
+    std::string expectedStart =
+        std::string(CSV_HEADER) + "\n"
+        "2026-01-01,00:00:00,OLD001,RADEV1,14236000,1,\n"
+        "2026-01-02,00:00:00,\"K6,AQ\",RADEV1,7177000,-3,\n"
+        "2026-01-03,00:00:00,\"N1\nDQ\",RADEV1,7177000,4,\n";
+    std::string upgraded = readFile(path);
+    bool result = upgraded.compare(0, expectedStart.size(), expectedStart) == 0;
+    std::string added = upgraded.substr(std::min(expectedStart.size(), upgraded.size()));
+    auto fields = splitCsv(added.substr(0, added.find('\n')));
+    result &= (fields.size() == 7) && fields[2] == "VK3TPM" && fields[6] == "LSB";
+
+    // The original is kept, as it was.
+    result &= (readFile(path + ".bak") == OLD_LOG);
+    result &= !std::filesystem::exists(path + ".tmp");
+
+    // Opened again: it has the column now, so nothing more is done to it.
+    {
+        CsvReporter reporter(path);
+        reporter.addReceiveRecord("N1DQ", "RADEV1", 14236000, 2);
+    }
+    result &= !std::filesystem::exists(path + ".bak.1");
+    result &= (readFile(path).compare(0, upgraded.size(), upgraded) == 0);
+    result &= (readFile(path + ".bak") == OLD_LOG);
+
+    removeWithBackups(path);
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    return result;
+}
+
+bool testExistingBackupIsKept()
+{
+    std::cout << "Test 7 (a backup already there isn't replaced): ";
+
+    const std::string path = TEST_FILE_UPGRADE_PATH;
+    removeWithBackups(path);
+    {
+        std::ofstream seed(path, std::ios::binary);
+        seed << OLD_LOG;
+        std::ofstream earlier(path + ".bak", std::ios::binary);
+        earlier << "someone else's backup\n";
+    }
+
+    {
+        CsvReporter reporter(path);
+    }
+
+    bool result = (readFile(path + ".bak") == "someone else's backup\n");
+    result &= (readFile(path + ".bak.1") == OLD_LOG);
+    result &= (readFile(path).rfind(CSV_HEADER, 0) == 0);
+
+    removeWithBackups(path);
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    return result;
+}
+
+bool testUpgradeThatCantBeDoneLeavesFileAsItWas()
+{
+    std::cout << "Test 8 (if the column can't be added, the file's kept as it was): ";
+
+#if defined(_WIN32)
+    // (A folder can't be made read-only this way on Windows.)
+    std::cout << "SKIPPED (Windows)\n";
+    return true;
+#else
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::path folder = fs::path(testMakeTempFile("csvro"));
+    fs::remove(folder, ec);
+    fs::create_directory(folder, ec);
+    std::string path = (folder / "heard.csv").string();
+    {
+        std::ofstream seed(path, std::ios::binary);
+        seed << OLD_LOG;
+    }
+
+    // A folder nothing new can be put in: no backup, and no new copy.
+    fs::permissions(folder, fs::perms::owner_read | fs::perms::owner_exec, ec);
+    bool canStillWrite = std::ofstream((folder / "probe").string()).is_open();
+    bool result = true;
+    if (canStillWrite)
+    {
+        // (E.g. running as root, which isn't stopped by the permissions.)
+        std::cout << "SKIPPED (folder permissions not enforced) ";
+    }
+    else
+    {
+        {
+            CsvReporter reporter(path);
+            reporter.sidebandChange(IReporter::Sideband::USB);
+            reporter.addReceiveRecord("W1AW", "RADEV1", 3625000, 7);
+        }
+
+        // Still the six columns its header names, with the record added.
+        std::string contents = readFile(path);
+        result &= (contents.compare(0, OLD_LOG.size(), OLD_LOG) == 0);
+        std::string added = contents.substr(std::min(OLD_LOG.size(), contents.size()));
+        auto fields = splitCsv(added.substr(0, added.find('\n')));
+        result &= (fields.size() == 6) && fields[2] == "W1AW";
+        result &= !fs::exists(path + ".bak") && !fs::exists(path + ".tmp");
+    }
+
+    fs::permissions(folder, fs::perms::owner_all, ec);
+    fs::remove_all(folder, ec);
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    return result;
+#endif // defined(_WIN32)
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -306,6 +459,9 @@ int main(int argc, char** argv)
     result &= testUnopenableFileIsNoOp();
     result &= testFieldsWithSpecialCharactersAreQuoted();
     result &= testSidebandColumn();
+    result &= testOldFileGetsSidebandColumn();
+    result &= testExistingBackupIsKept();
+    result &= testUpgradeThatCantBeDoneLeavesFileAsItWas();
 
     return result ? 0 : -1;
 }
