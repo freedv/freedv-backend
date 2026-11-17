@@ -187,8 +187,8 @@ private:
         
     void connect_();
 
-    // As the server sends and takes sidebands: "USB", "LSB" or "".
-    static const char* sidebandToString_(Sideband sideband);
+    // A sideband as the server sends it ("USB", "LSB" or ""; see
+    // IReporter::SidebandName()).
     static Sideband sidebandFromJson_(yyjson_val* sideband);
     
     void freqChangeImpl_(uint64_t frequency);

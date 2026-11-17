@@ -118,7 +118,7 @@ void FreeDVReporter::requestQSY(std::string const& sid, uint64_t frequencyHz, st
         yyjson_mut_obj_add_str(qsyDoc, qsyObj, "dest_sid", sid.c_str());
         yyjson_mut_obj_add_str(qsyDoc, qsyObj, "message", message.c_str());
         yyjson_mut_obj_add_uint(qsyDoc, qsyObj, "frequency", frequencyHz);
-        yyjson_mut_obj_add_str(qsyDoc, qsyObj, "sideband", sidebandToString_(sideband_));
+        yyjson_mut_obj_add_str(qsyDoc, qsyObj, "sideband", SidebandName(sideband_));
 
         sioClient_->emit("qsy_request", qsyObj);
         yyjson_mut_doc_free(qsyDoc);
@@ -717,7 +717,7 @@ void FreeDVReporter::freqChangeImpl_(uint64_t frequency)
         // Always sent, so that going back to not knowing (e.g. rig control
         // turned off) is passed on too. Servers from before the sideband
         // was reported ignore it.
-        yyjson_mut_obj_add_str(freqDoc, freqData, "sideband", sidebandToString_(sideband_));
+        yyjson_mut_obj_add_str(freqDoc, freqData, "sideband", SidebandName(sideband_));
         sioClient_->emit("freq_change", freqData);
 
         yyjson_mut_doc_free(freqDoc);
@@ -725,19 +725,6 @@ void FreeDVReporter::freqChangeImpl_(uint64_t frequency)
     
     // Save last frequency in case we need to reconnect.
     lastFrequency_ = frequency;
-}
-
-const char* FreeDVReporter::sidebandToString_(Sideband sideband)
-{
-    switch (sideband)
-    {
-        case Sideband::USB:
-            return "USB";
-        case Sideband::LSB:
-            return "LSB";
-        default:
-            return "";
-    }
 }
 
 IReporter::Sideband FreeDVReporter::sidebandFromJson_(yyjson_val* sideband)

@@ -72,7 +72,7 @@ bool isIso8601Utc(const std::string& value)
 
 // Receives one datagram and validates the full fdv_callsign JSON schema.
 bool receiveAndValidateRecord(int fd, const char* expectCallsign, const char* expectMode,
-                             int expectSnr, uint64_t expectFreqHz)
+                             int expectSnr, uint64_t expectFreqHz, const char* expectSideband = "")
 {
     char buf[4096];
     ssize_t len = recv(fd, buf, sizeof(buf) - 1, 0);
@@ -98,6 +98,7 @@ bool receiveAndValidateRecord(int fd, const char* expectCallsign, const char* ex
     auto mode = yyjson_obj_get(root, "mode");
     auto snr = yyjson_obj_get(root, "snr");
     auto freq = yyjson_obj_get(root, "frequency_hz");
+    auto sideband = yyjson_obj_get(root, "sideband");
 
     result &= yyjson_is_str(type) && std::strcmp(yyjson_get_str(type), "fdv_callsign") == 0;
     result &= yyjson_is_int(version) && yyjson_get_int(version) == 1;
@@ -106,6 +107,7 @@ bool receiveAndValidateRecord(int fd, const char* expectCallsign, const char* ex
     result &= yyjson_is_str(mode) && std::strcmp(yyjson_get_str(mode), expectMode) == 0;
     result &= yyjson_is_int(snr) && yyjson_get_int(snr) == expectSnr;
     result &= yyjson_is_uint(freq) && yyjson_get_uint(freq) == expectFreqHz;
+    result &= yyjson_is_str(sideband) && std::strcmp(yyjson_get_str(sideband), expectSideband) == 0;
 
     yyjson_doc_free(doc);
     return result;
@@ -136,7 +138,7 @@ bool testReceiveRecordProducesValidJson()
 
 bool testNonRecordMethodsSendNothing()
 {
-    std::cout << "Test 2 (freqChange/transmit/send/inAnalogMode send no datagrams): ";
+    std::cout << "Test 2 (freqChange/sidebandChange/transmit/send/inAnalogMode send no datagrams): ";
 
     int port = 0;
     int fd = makeLoopbackReceiver(port);
@@ -147,6 +149,7 @@ bool testNonRecordMethodsSendNothing()
         {
             UdpReporter reporter("127.0.0.1", port);
             reporter.freqChange(7100000);
+            reporter.sidebandChange(IReporter::Sideband::LSB);
             reporter.transmit("1600X", true);
             reporter.inAnalogMode(true);
             reporter.send();
@@ -223,6 +226,35 @@ bool testRecordWithInvalidUtf8IsNotSent()
 
 } // namespace
 
+bool testRecordIncludesSideband()
+{
+    std::cout << "Test 5 (records carry the sideband the radio's on): ";
+
+    int port = 0;
+    int fd = makeLoopbackReceiver(port);
+    bool result = (fd >= 0);
+
+    if (result)
+    {
+        {
+            UdpReporter reporter("127.0.0.1", port);
+            reporter.sidebandChange(IReporter::Sideband::LSB);
+            reporter.addReceiveRecord("VK3TPM", "RADEV1", 7177000, 4);
+            result &= receiveAndValidateRecord(fd, "VK3TPM", "RADEV1", 4, 7177000ULL, "LSB");
+            reporter.sidebandChange(IReporter::Sideband::USB);
+            reporter.addReceiveRecord("K6AQ", "RADEV1", 14236000, 9);
+            result &= receiveAndValidateRecord(fd, "K6AQ", "RADEV1", 9, 14236000ULL, "USB");
+            reporter.sidebandChange(IReporter::Sideband::UNKNOWN);
+            reporter.addReceiveRecord("N1DQ", "RADEV1", 14236000, 2);
+            result &= receiveAndValidateRecord(fd, "N1DQ", "RADEV1", 2, 14236000ULL, "");
+        }
+        testCloseSocket(fd);
+    }
+
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    return result;
+}
+
 int main(int argc, char** argv)
 {
     bool result = true;
@@ -231,6 +263,7 @@ int main(int argc, char** argv)
     result &= testNonRecordMethodsSendNothing();
     result &= testRecordFrequencyFollowsArgumentNotFreqChange();
     result &= testRecordWithInvalidUtf8IsNotSent();
+    result &= testRecordIncludesSideband();
 
     return result ? 0 : -1;
 }

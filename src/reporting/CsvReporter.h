@@ -35,6 +35,7 @@
 //
 //=========================================================================
 
+#include <atomic>
 #include <fstream>
 #include <string>
 #include "IReporter.h"
@@ -46,6 +47,10 @@ public:
     virtual ~CsvReporter() = default;
 
     virtual void freqChange(uint64_t frequency) override;
+
+    // The sideband the radio's on, written in the sideband column of each
+    // record from then on ("USB", "LSB", or empty if not known).
+    virtual void sidebandChange(Sideband sideband) override;
     virtual void transmit(std::string mode, bool tx) override;
     virtual void inAnalogMode(bool inAnalog) override;
     virtual void addReceiveRecord(std::string callsign, std::string mode, uint64_t frequency, signed char snr) override;
@@ -53,6 +58,11 @@ public:
 
 private:
     std::ofstream file_;
+
+    // Whether the file has the sideband column: files started before it
+    // was added keep to the columns their header names.
+    bool hasSidebandColumn_;
+    std::atomic<Sideband> sideband_;
 };
 
 #endif // CSV_REPORTER_H
