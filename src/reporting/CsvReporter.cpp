@@ -186,7 +186,9 @@ bool CsvReporter::upgradeToSidebandColumn_(std::string const& filename)
     std::string temp = filename + ".tmp";
     bool written = false;
     {
-        std::ofstream upgraded(temp, std::ios::binary | std::ios::trunc);
+        // (In text mode, as records are added to the file afterwards: on
+        // Windows, lines then end in CRLF throughout.)
+        std::ofstream upgraded(temp, std::ios::trunc);
         if (upgraded)
         {
             upgraded << CSV_HEADER << "\n";

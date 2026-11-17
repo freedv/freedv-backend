@@ -360,7 +360,8 @@ gives it the column (`CsvReporter::upgradeToSidebandColumn_()`):
   (`…,-2,`), are written to `<file>.tmp`, which is then renamed over the original — so the
   log is never left half-written. Records are read as RFC 4180 records, so a quoted comma
   or line break in a callsign is kept intact; a record that doesn't have six fields is
-  copied as it is rather than guessed at. Line endings become `\n`.
+  copied as it is rather than guessed at. Line endings become those `CsvReporter` writes
+records with (the platform's own: CRLF on Windows).
 * If any of that can't be done (e.g. the folder can't be written to, or on Windows another
   program has the file open), the temporary file and backup are removed, the file is left
   exactly as it was, and records appended to it keep to its six columns so that its header

@@ -299,9 +299,11 @@ bool testSidebandColumn()
     return result;
 }
 
-std::string readFile(std::string const& path)
+// A file's contents as they are (binary), or with the platform's line
+// endings read as '\n' (text: on Windows, CRLF), as CsvReporter writes them.
+std::string readFile(std::string const& path, bool binary = false)
 {
-    std::ifstream file(path, std::ios::binary);
+    std::ifstream file(path, binary ? std::ios::binary : std::ios::in);
     return std::string(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
 }
 
@@ -352,7 +354,7 @@ bool testOldFileGetsSidebandColumn()
     result &= (fields.size() == 7) && fields[2] == "VK3TPM" && fields[6] == "LSB";
 
     // The original is kept, as it was.
-    result &= (readFile(path + ".bak") == OLD_LOG);
+    result &= (readFile(path + ".bak", true) == OLD_LOG);
     result &= !std::filesystem::exists(path + ".tmp");
 
     // Opened again: it has the column now, so nothing more is done to it.
@@ -362,7 +364,7 @@ bool testOldFileGetsSidebandColumn()
     }
     result &= !std::filesystem::exists(path + ".bak.1");
     result &= (readFile(path).compare(0, upgraded.size(), upgraded) == 0);
-    result &= (readFile(path + ".bak") == OLD_LOG);
+    result &= (readFile(path + ".bak", true) == OLD_LOG);
 
     removeWithBackups(path);
     std::cout << (result ? "PASS" : "FAIL") << "\n";
@@ -387,7 +389,7 @@ bool testExistingBackupIsKept()
     }
 
     bool result = (readFile(path + ".bak") == "someone else's backup\n");
-    result &= (readFile(path + ".bak.1") == OLD_LOG);
+    result &= (readFile(path + ".bak.1", true) == OLD_LOG);
     result &= (readFile(path).rfind(CSV_HEADER, 0) == 0);
 
     removeWithBackups(path);
@@ -433,7 +435,7 @@ bool testUpgradeThatCantBeDoneLeavesFileAsItWas()
         }
 
         // Still the six columns its header names, with the record added.
-        std::string contents = readFile(path);
+        std::string contents = readFile(path, true);
         result &= (contents.compare(0, OLD_LOG.size(), OLD_LOG) == 0);
         std::string added = contents.substr(std::min(OLD_LOG.size(), contents.size()));
         auto fields = splitCsv(added.substr(0, added.find('\n')));
