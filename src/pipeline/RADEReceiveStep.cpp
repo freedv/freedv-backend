@@ -238,6 +238,9 @@ short* RADEReceiveStep::execute(short* inputSamples, int numInputSamples, int* n
 
         FREEDV_BEGIN_VERIFIED_SAFE
             nout = rade_rx(dv_, featuresOut_, &hasEooOut, nullptr, rxFdmOffset_);
+
+            // Store current mistune state (for use by clients to show tuning arrows).
+            currentMistuneState_.store(rade_mistune(dv_), std::memory_order_release);
         FREEDV_END_VERIFIED_SAFE
 
         if (nout > 0 && textPtr_ != nullptr)

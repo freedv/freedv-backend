@@ -78,6 +78,7 @@ public:
     
     int getSync() const { return syncState_.load(std::memory_order_acquire); }
     int getSnr() const { return snr_.load(std::memory_order_acquire); }
+    int getMistuneState() const { return currentMistuneState_.load(std::memory_order_acquire); }
     realtime_fp<std::atomic<int>*()> getRxStateFn() { return rxStateFn_; }
     void setRxStateFn(realtime_fp<std::atomic<int>*()> const& rxFn) { rxStateFn_ = rxFn; }
     void* getStateObj() const { return stateObj_; }
@@ -110,6 +111,8 @@ private:
     realtime_fp<float()> freqOffsetFn_;
     RADE_COMP rxFreqOffsetPhaseRectObjs_;
     RADE_COMP* rxFdmOffset_;
+
+    std::atomic<int> currentMistuneState_;
 
     void utFeatureThreadEntry_();
 };
